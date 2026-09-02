@@ -19,6 +19,9 @@ func TestEntitlementRefreshWithPostgreSQL(t *testing.T) {
 	seedMonthlyLicense(t, database, "lic_refresh", testLicenseKey, now.Add(14*24*time.Hour))
 
 	activated := activate(t, service, testLicenseKey, testInstallA, "fd46f9d4-3844-4c1d-a5dd-6616af362eef")
+	if activated.Status != http.StatusCreated {
+		t.Fatalf("activation status = %d, want %d: %s", activated.Status, http.StatusCreated, activated.Body)
+	}
 	activationBody := decodeSuccess(t, activated)
 	refreshTime := now.Add(24 * time.Hour)
 	renewedBillingPeriodEnd := now.Add(30 * 24 * time.Hour)
@@ -131,7 +134,10 @@ func TestDeactivateCurrentIsIdempotentAndReleasesSlotWithPostgreSQL(t *testing.T
 	seedPerpetualLicense(t, database, "lic_deactivate", testLicenseKey)
 	service := newTestService(t, database, localIssuer(t))
 	first := decodeSuccess(t, activate(t, service, testLicenseKey, testInstallA, "25c135f7-7641-40c9-b405-a7cd6baa406f"))
-	activate(t, service, testLicenseKey, testInstallB, "4a1680d2-4aeb-485c-a080-f32baf8a92ca")
+	second := activate(t, service, testLicenseKey, testInstallB, "4a1680d2-4aeb-485c-a080-f32baf8a92ca")
+	if second.Status != http.StatusCreated {
+		t.Fatalf("second activation status = %d, want %d: %s", second.Status, http.StatusCreated, second.Body)
+	}
 
 	for attempt := range 2 {
 		response, err := service.DeactivateCurrent(context.Background(), first.ActivationToken)
