@@ -105,8 +105,8 @@ func (a *api) rotateLicenseKey(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "The management token is invalid.", requestID)
 		return
 	}
-	idempotencyKeys := request.Header.Values("Idempotency-Key")
-	if len(idempotencyKeys) != 1 {
+	idempotencyKey, ok := singleHeader(request, "Idempotency-Key")
+	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid_request", "The license-key rotation request is invalid.", requestID)
 		return
 	}
@@ -115,7 +115,7 @@ func (a *api) rotateLicenseKey(w http.ResponseWriter, request *http.Request) {
 	defer cancel()
 	response, err := a.activations.RotateLicenseKey(ctx, activation.LicenseKeyRotationInput{
 		ManagementToken: token,
-		IdempotencyKey:  idempotencyKeys[0],
+		IdempotencyKey:  idempotencyKey,
 	})
 	if err != nil {
 		a.logger.ErrorContext(request.Context(), "rotate license key", "request_id", requestID, "error", err)
