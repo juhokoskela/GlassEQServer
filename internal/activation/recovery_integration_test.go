@@ -72,12 +72,14 @@ func TestRecoveryTokenExchangeIsSingleUseWithPostgreSQL(t *testing.T) {
 		response Response
 		err      error
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	start := make(chan struct{})
 	results := make(chan result, 2)
 	for range 2 {
 		go func() {
 			<-start
-			response, err := service.ExchangeRecoveryToken(context.Background(), recoveryToken)
+			response, err := service.ExchangeRecoveryToken(ctx, recoveryToken)
 			results <- result{response: response, err: err}
 		}()
 	}

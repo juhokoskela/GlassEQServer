@@ -38,6 +38,7 @@ type activationService interface {
 	ListManagedActivations(context.Context, string) (activation.Response, error)
 	DeactivateManaged(context.Context, activation.ManagedDeactivationInput) (activation.Response, error)
 	RotateLicenseKey(context.Context, activation.LicenseKeyRotationInput) (activation.Response, error)
+	ExchangeRecoveryToken(context.Context, string) (activation.Response, error)
 }
 
 type api struct {
@@ -58,6 +59,7 @@ func New(database databasePinger, activations activationService, logger *slog.Lo
 	mux.HandleFunc("GET /v1/management/activations", api.listManagedActivations)
 	mux.HandleFunc("DELETE /v1/management/activations/{activation_id}", api.deactivateManaged)
 	mux.HandleFunc("POST /v1/management/license-key-rotations", api.rotateLicenseKey)
+	mux.HandleFunc("POST /v1/recovery-sessions", api.createRecoverySession)
 	return mux
 }
 
