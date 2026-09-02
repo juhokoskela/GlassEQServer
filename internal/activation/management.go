@@ -48,21 +48,15 @@ func (s *Service) CreateManagementSession(ctx context.Context, input ManagementS
 		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
 	}
 
-	token, err := randomValue(s.random, managementTokenPrefix, 32)
+	session, err := s.mintManagementSession(now)
 	if err != nil {
-		return Response{}, fmt.Errorf("generate management token: %w", err)
-	}
-	tokenHash := sha256.Sum256([]byte(token))
-	expiresAt := now.Add(managementTokenLifetime)
-	body, err := json.Marshal(managementSessionBody{ManagementToken: token, ExpiresAt: expiresAt.Unix()})
-	if err != nil {
-		return Response{}, fmt.Errorf("encode management session response: %w", err)
+		return Response{}, err
 	}
 	result, err := s.database.ExecContext(ctx, `
 		INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
 		SELECT $1, license_id, 'management', $3, $4
 		FROM license_keys
-		WHERE secret_hash = $2 AND state = 'active'`, tokenHash[:], credentialHash[:], now, expiresAt)
+		WHERE secret_hash = $2 AND state = 'active'`, session.tokenHash[:], credentialHash[:], now, session.expiresAt)
 	if err != nil {
 		return Response{}, fmt.Errorf("save management session: %w", err)
 	}
@@ -73,7 +67,30 @@ func (s *Service) CreateManagementSession(ctx context.Context, input ManagementS
 	if created == 0 {
 		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
 	}
-	return Response{Status: http.StatusCreated, Body: body}, nil
+	return Response{Status: http.StatusCreated, Body: session.body}, nil
+}
+
+type mintedManagementSession struct {
+	tokenHash [sha256.Size]byte
+	expiresAt time.Time
+	body      []byte
+}
+
+func (s *Service) mintManagementSession(now time.Time) (mintedManagementSession, error) {
+	token, err := randomValue(s.random, managementTokenPrefix, 32)
+	if err != nil {
+		return mintedManagementSession{}, fmt.Errorf("generate management token: %w", err)
+	}
+	expiresAt := now.Add(managementTokenLifetime)
+	body, err := json.Marshal(managementSessionBody{ManagementToken: token, ExpiresAt: expiresAt.Unix()})
+	if err != nil {
+		return mintedManagementSession{}, fmt.Errorf("encode management session response: %w", err)
+	}
+	return mintedManagementSession{
+		tokenHash: sha256.Sum256([]byte(token)),
+		expiresAt: expiresAt,
+		body:      body,
+	}, nil
 }
 
 func (s *Service) ListManagedActivations(ctx context.Context, managementToken string) (Response, error) {
