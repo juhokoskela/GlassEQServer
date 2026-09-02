@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,8 @@ func TestLoad(t *testing.T) {
 		"GLASSEQ_DATABASE_URL":               "postgres://glasseq:secret@db.example.com/glasseq",
 		"GLASSEQ_ENTITLEMENT_KMS_KEY_ID":     "arn:aws:kms:eu-north-1:123456789012:key/example",
 		"GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID": "entitlement-2026-01",
+		"GLASSEQ_IDEMPOTENCY_KEY":            testSecretKey(1),
+		"GLASSEQ_RATE_LIMIT_HMAC_KEY":        testSecretKey(2),
 	}
 
 	got, err := load(mapLookup(values))
@@ -27,6 +30,12 @@ func TestLoad(t *testing.T) {
 	}
 	if got.EntitlementSigningKeyID != values["GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID"] {
 		t.Errorf("signing key ID = %q", got.EntitlementSigningKeyID)
+	}
+	if len(got.IdempotencyKey) != 32 {
+		t.Errorf("idempotency key length = %d", len(got.IdempotencyKey))
+	}
+	if len(got.RateLimitHMACKey) != 32 {
+		t.Errorf("rate-limit HMAC key length = %d", len(got.RateLimitHMACKey))
 	}
 }
 
@@ -63,6 +72,16 @@ func TestLoadRejectsInvalidConfigurationWithoutEchoingDatabaseURL(t *testing.T) 
 			},
 			wantMessage: "GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID",
 		},
+		{
+			name: "invalid idempotency key",
+			values: map[string]string{
+				"GLASSEQ_DATABASE_URL":               databaseURL,
+				"GLASSEQ_ENTITLEMENT_KMS_KEY_ID":     "kms-key",
+				"GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID": "entitlement-2026-01",
+				"GLASSEQ_IDEMPOTENCY_KEY":            "secret-value-that-must-not-be-echoed",
+			},
+			wantMessage: "GLASSEQ_IDEMPOTENCY_KEY",
+		},
 	}
 
 	for _, test := range tests {
@@ -79,6 +98,10 @@ func TestLoadRejectsInvalidConfigurationWithoutEchoingDatabaseURL(t *testing.T) 
 			}
 		})
 	}
+}
+
+func testSecretKey(value byte) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat(string(value), 32)))
 }
 
 func mapLookup(values map[string]string) func(string) (string, bool) {

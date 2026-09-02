@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -17,6 +18,8 @@ type Config struct {
 	DatabaseURL             string
 	EntitlementKMSKeyID     string
 	EntitlementSigningKeyID string
+	IdempotencyKey          []byte
+	RateLimitHMACKey        []byte
 }
 
 func Load() (Config, error) {
@@ -44,13 +47,35 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err := entitlement.ValidateKeyID(signingKeyID); err != nil {
 		return Config{}, fmt.Errorf("GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID %w", err)
 	}
+	idempotencyKey, err := secretKey(lookup, "GLASSEQ_IDEMPOTENCY_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	rateLimitHMACKey, err := secretKey(lookup, "GLASSEQ_RATE_LIMIT_HMAC_KEY")
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		HTTPAddress:             httpAddress,
 		DatabaseURL:             databaseURL,
 		EntitlementKMSKeyID:     kmsKeyID,
 		EntitlementSigningKeyID: signingKeyID,
+		IdempotencyKey:          idempotencyKey,
+		RateLimitHMACKey:        rateLimitHMACKey,
 	}, nil
+}
+
+func secretKey(lookup func(string) (string, bool), name string) ([]byte, error) {
+	encoded, err := required(lookup, name)
+	if err != nil {
+		return nil, err
+	}
+	key, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(key) != 32 || base64.RawURLEncoding.EncodeToString(key) != encoded {
+		return nil, fmt.Errorf("%s must be the unpadded Base64URL encoding of 32 bytes", name)
+	}
+	return key, nil
 }
 
 func required(lookup func(string) (string, bool), name string) (string, error) {
