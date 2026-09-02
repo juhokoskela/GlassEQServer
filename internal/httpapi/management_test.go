@@ -105,6 +105,68 @@ func TestDeactivateManagedPassesBearerTokenAndPath(t *testing.T) {
 	}
 }
 
+func TestRotateLicenseKeyPassesBearerTokenAndIdempotencyKey(t *testing.T) {
+	activations := &fakeActivationService{response: activation.Response{
+		Status: http.StatusCreated,
+		Body:   []byte(`{"license_key":"GEQ1-NEW"}`),
+	}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/management/license-key-rotations", nil)
+	request.Header.Set("Authorization", "Bearer gem_token")
+	request.Header.Set("Idempotency-Key", "80cbbaf8-a9a4-4920-80a7-3aa29d25b309")
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusCreated)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+	want := activation.LicenseKeyRotationInput{
+		ManagementToken: "gem_token",
+		IdempotencyKey:  "80cbbaf8-a9a4-4920-80a7-3aa29d25b309",
+	}
+	if activations.rotationInput != want {
+		t.Errorf("rotation input = %+v, want %+v", activations.rotationInput, want)
+	}
+	if activations.deadlineRemaining <= 0 || activations.deadlineRemaining > activationTimeout {
+		t.Errorf("rotation deadline remaining = %s", activations.deadlineRemaining)
+	}
+}
+
+func TestRotateLicenseKeyRejectsInvalidHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(*http.Request)
+		wantStatus int
+	}{
+		{name: "missing authorization", mutate: func(request *http.Request) { request.Header.Del("Authorization") }, wantStatus: http.StatusUnauthorized},
+		{name: "duplicate authorization", mutate: func(request *http.Request) { request.Header.Add("Authorization", "Bearer second") }, wantStatus: http.StatusUnauthorized},
+		{name: "missing idempotency key", mutate: func(request *http.Request) { request.Header.Del("Idempotency-Key") }, wantStatus: http.StatusBadRequest},
+		{name: "duplicate idempotency key", mutate: func(request *http.Request) { request.Header.Add("Idempotency-Key", "second") }, wantStatus: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			activations := &fakeActivationService{}
+			request := httptest.NewRequest(http.MethodPost, "/v1/management/license-key-rotations", nil)
+			request.Header.Set("Authorization", "Bearer gem_token")
+			request.Header.Set("Idempotency-Key", "80cbbaf8-a9a4-4920-80a7-3aa29d25b309")
+			test.mutate(request)
+			response := httptest.NewRecorder()
+
+			New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if activations.calls != 0 {
+				t.Errorf("service calls = %d, want 0", activations.calls)
+			}
+		})
+	}
+}
+
 func TestManagementEndpointsRejectMissingBearerToken(t *testing.T) {
 	for _, target := range []string{"/v1/management/activations", "/v1/management/activations/act_target"} {
 		t.Run(target, func(t *testing.T) {

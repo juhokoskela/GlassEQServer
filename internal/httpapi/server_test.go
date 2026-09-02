@@ -295,6 +295,7 @@ type fakeActivationService struct {
 	managementInput     activation.ManagementSessionInput
 	managementToken     string
 	managedDeactivation activation.ManagedDeactivationInput
+	rotationInput       activation.LicenseKeyRotationInput
 	calls               int
 	deadlineRemaining   time.Duration
 }
@@ -316,6 +317,13 @@ func (f *fakeActivationService) ListManagedActivations(ctx context.Context, toke
 func (f *fakeActivationService) DeactivateManaged(ctx context.Context, input activation.ManagedDeactivationInput) (activation.Response, error) {
 	f.calls++
 	f.managedDeactivation = input
+	f.recordDeadline(ctx)
+	return f.response, f.err
+}
+
+func (f *fakeActivationService) RotateLicenseKey(ctx context.Context, input activation.LicenseKeyRotationInput) (activation.Response, error) {
+	f.calls++
+	f.rotationInput = input
 	f.recordDeadline(ctx)
 	return f.response, f.err
 }
