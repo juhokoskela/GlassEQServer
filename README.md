@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, and current-installation deactivation endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery, remote activation management, and download endpoints are not implemented yet.
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, and activation management endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery, license-key rotation, and download endpoints are not implemented yet.
 
 ## Trust boundaries
 
@@ -55,10 +55,15 @@ The service exposes:
 - `POST /v1/activations` for creating or restoring one of a license's two activation slots.
 - `POST /v1/entitlements/refresh` for replacing an activation's signed entitlement from current license state.
 - `DELETE /v1/activations/current` for releasing the calling activation's slot.
+- `POST /v1/management-sessions` for creating a 15-minute management session from a license key.
+- `GET /v1/management/activations` for listing the license's active slots.
+- `DELETE /v1/management/activations/{activation_id}` for releasing one of those slots.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
 
-Refresh and deactivation authenticate with the activation token returned during activation. Deactivation retains the token hash so repeating that operation returns 204, while other uses of the deactivated token fail.
+Refresh and current-installation deactivation authenticate with the activation token returned during activation. Deactivation retains the token hash so repeating that operation returns 204, while other uses of the deactivated token fail.
+
+Management sessions authenticate with the license key and return a short-lived bearer token. The service stores only its SHA-256 hash. Slot listing exposes opaque activation IDs and timestamps, not device details. Remote release is idempotent and cannot affect another license's activation.
 
 ## Checks
 
