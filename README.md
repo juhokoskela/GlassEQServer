@@ -59,7 +59,7 @@ The service exposes:
 - `GET /v1/management/activations` for listing the license's active slots.
 - `DELETE /v1/management/activations/{activation_id}` for releasing one of those slots.
 - `POST /v1/management/license-key-rotations` for replacing the license key.
-- `POST /v1/recovery-sessions` for exchanging a one-time recovery token for a management session.
+- `POST /v1/recovery-sessions` for exchanging a one-time bearer recovery token for a management session. Requires an `Idempotency-Key` header.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
 
@@ -69,7 +69,7 @@ Management sessions authenticate with the license key and return a short-lived b
 
 License-key rotation requires a management session and an idempotency UUID. A license can rotate once every 24 hours. A successful rotation consumes the management session, retains only the previous revoked key, and leaves existing activations intact. The encrypted success response remains replayable for 24 hours, including after the management session expires, so a lost HTTP response does not lose the new key.
 
-Recovery tokens expire after 30 minutes and can be exchanged once. The exchange consumes the recovery token and creates a 15-minute management session in one database statement. Recovery-request generation and email delivery are not implemented yet.
+Recovery tokens expire after 30 minutes and can be exchanged once. The exchange consumes the recovery token, creates a 15-minute management session, and stores an encrypted response atomically. Successful exchanges can be replayed with the same idempotency key for 24 hours, including after the recovery token expires. Recovery-request generation and email delivery are not implemented yet.
 
 ## Checks
 
