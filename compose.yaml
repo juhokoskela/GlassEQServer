@@ -15,7 +15,7 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
 
   migrate:
     image: juhokoskela/goose:v3.27.3@sha256:db4be381f2173bfd8994b9ca03e2fa2f8d7692ac3cef4aa5e2059db3e760cc3d
