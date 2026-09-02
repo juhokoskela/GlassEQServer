@@ -151,11 +151,8 @@ func (s *Service) DeactivateManaged(ctx context.Context, input ManagedDeactivati
 		SET state = 'deactivated', deactivated_at = $3
 		FROM target
 		WHERE activation.id = target.id`, input.ActivationID, licenseID, now)
-	var databaseError interface{ SQLState() string }
-	if errors.As(err, &databaseError) && databaseError.SQLState() == "55P03" {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+	if databaseLockUnavailable(err) {
+		return databaseBusyResponse(), nil
 	}
 	if err != nil {
 		return Response{}, fmt.Errorf("deactivate managed activation: %w", err)

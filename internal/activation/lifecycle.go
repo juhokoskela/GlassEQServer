@@ -44,9 +44,7 @@ func (s *Service) RefreshEntitlement(ctx context.Context, input RefreshInput) (R
 		return Response{}, err
 	}
 	if !locked {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+		return databaseBusyResponse(), nil
 	}
 
 	licenseID, found, err := findActivationLicenseIDByToken(ctx, tx, tokenHash)
@@ -136,9 +134,7 @@ func (s *Service) DeactivateCurrent(ctx context.Context, activationToken string)
 		return Response{}, err
 	}
 	if !locked {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+		return databaseBusyResponse(), nil
 	}
 
 	licenseID, found, err := findActivationLicenseIDByToken(ctx, tx, tokenHash)

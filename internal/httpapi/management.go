@@ -92,6 +92,39 @@ func (a *api) deactivateManaged(w http.ResponseWriter, request *http.Request) {
 	writeServiceResponse(w, response, requestID)
 }
 
+func (a *api) rotateLicenseKey(w http.ResponseWriter, request *http.Request) {
+	requestID, err := randomRequestID()
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "generate request ID", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", "")
+		return
+	}
+
+	token, ok := bearerCredential(request)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "The management token is invalid.", requestID)
+		return
+	}
+	idempotencyKey, ok := singleHeader(request, "Idempotency-Key")
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "The license-key rotation request is invalid.", requestID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), activationTimeout)
+	defer cancel()
+	response, err := a.activations.RotateLicenseKey(ctx, activation.LicenseKeyRotationInput{
+		ManagementToken: token,
+		IdempotencyKey:  idempotencyKey,
+	})
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "rotate license key", "request_id", requestID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
+		return
+	}
+	writeServiceResponse(w, response, requestID)
+}
+
 type managementSessionRequest struct {
 	LicenseKey string `json:"license_key"`
 }

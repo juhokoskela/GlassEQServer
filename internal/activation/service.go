@@ -24,14 +24,14 @@ import (
 )
 
 const (
-	idempotencyScope       = "activation"
-	idempotencyLifetime    = 24 * time.Hour
-	rateLimitWindow        = time.Hour
-	licenseKeyAttemptLimit = 20
-	ipAttemptLimit         = 100
-	maximumActivations     = 2
-	monthlyRefreshInterval = 7 * 24 * time.Hour
-	monthlyGracePeriod     = 7 * 24 * time.Hour
+	activationIdempotencyScope = "activation"
+	idempotencyLifetime        = 24 * time.Hour
+	rateLimitWindow            = time.Hour
+	licenseKeyAttemptLimit     = 20
+	ipAttemptLimit             = 100
+	maximumActivations         = 2
+	monthlyRefreshInterval     = 7 * 24 * time.Hour
+	monthlyGracePeriod         = 7 * 24 * time.Hour
 )
 
 type entitlementIssuer interface {
@@ -94,7 +94,8 @@ func (s *Service) Activate(ctx context.Context, input Input) (Response, error) {
 	}
 
 	now := s.now().UTC().Truncate(time.Microsecond)
-	replayed, found, conflict, err := s.loadIdempotency(ctx, s.database, prepared, now)
+	idempotency := prepared.idempotency()
+	replayed, found, conflict, err := s.loadIdempotency(ctx, s.database, idempotency, now)
 	if err != nil {
 		return Response{}, err
 	}
@@ -129,11 +130,9 @@ func (s *Service) Activate(ctx context.Context, input Input) (Response, error) {
 		return Response{}, err
 	}
 	if !locked {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+		return databaseBusyResponse(), nil
 	}
-	replayed, found, conflict, err = s.loadIdempotency(ctx, tx, prepared, now)
+	replayed, found, conflict, err = s.loadIdempotency(ctx, tx, idempotency, now)
 	if err != nil {
 		return Response{}, err
 	}
@@ -234,7 +233,7 @@ func (s *Service) Activate(ctx context.Context, input Input) (Response, error) {
 	if err != nil {
 		return Response{}, fmt.Errorf("encode activation response: %w", err)
 	}
-	return s.storeAndCommit(ctx, tx, prepared, Response{Status: status, Body: body}, now)
+	return s.storeAndCommit(ctx, tx, idempotency, Response{Status: status, Body: body}, now)
 }
 
 type preparedInput struct {
@@ -246,6 +245,15 @@ type preparedInput struct {
 	clientIP         netip.Addr
 }
 
+func (p preparedInput) idempotency() idempotencyRequest {
+	return idempotencyRequest{
+		scope:          activationIdempotencyScope,
+		credentialHash: p.credentialHash,
+		key:            p.idempotencyKey,
+		requestHash:    p.installationHash,
+	}
+}
+
 func prepare(input Input) (preparedInput, string) {
 	normalizedKey, credentialValid := normalizeLicenseKey(input.LicenseKey)
 	credentialHash := sha256.Sum256([]byte(normalizedKey))
@@ -253,11 +261,8 @@ func prepare(input Input) (preparedInput, string) {
 	if !valid {
 		return preparedInput{}, "invalid_request"
 	}
-	if len(input.IdempotencyKey) != 36 {
-		return preparedInput{}, "invalid_request"
-	}
-	idempotencyKey, err := uuid.Parse(input.IdempotencyKey)
-	if err != nil {
+	idempotencyKey, valid := canonicalIdempotencyKey(input.IdempotencyKey)
+	if !valid {
 		return preparedInput{}, "invalid_request"
 	}
 	if !input.ClientIP.IsValid() {
@@ -269,9 +274,20 @@ func prepare(input Input) (preparedInput, string) {
 		credentialValid:  credentialValid,
 		installationID:   installationID,
 		installationHash: installationHash,
-		idempotencyKey:   idempotencyKey.String(),
+		idempotencyKey:   idempotencyKey,
 		clientIP:         input.ClientIP.Unmap(),
 	}, ""
+}
+
+func canonicalIdempotencyKey(value string) (string, bool) {
+	if len(value) != 36 {
+		return "", false
+	}
+	identifier, err := uuid.Parse(value)
+	if err != nil {
+		return "", false
+	}
+	return identifier.String(), true
 }
 
 func canonicalInstallation(value string) (string, [sha256.Size]byte, bool) {
@@ -284,34 +300,6 @@ func canonicalInstallation(value string) (string, [sha256.Size]byte, bool) {
 	}
 	canonical := strings.ToUpper(identifier.String())
 	return canonical, sha256.Sum256([]byte(canonical)), true
-}
-
-func normalizeLicenseKey(value string) (string, bool) {
-	if value == "" || len(value) > 128 {
-		return value, false
-	}
-	var normalized strings.Builder
-	normalized.Grow(len(value))
-	for i := range len(value) {
-		character := value[i]
-		if character == '-' {
-			continue
-		}
-		if character >= 'a' && character <= 'z' {
-			character -= 'a' - 'A'
-		}
-		normalized.WriteByte(character)
-	}
-	result := normalized.String()
-	if len(result) != 30 || !strings.HasPrefix(result, "GEQ1") {
-		return result, false
-	}
-	for i := 4; i < len(result); i++ {
-		if !strings.ContainsRune("0123456789ABCDEFGHJKMNPQRSTVWXYZ", rune(result[i])) {
-			return result, false
-		}
-	}
-	return result, true
 }
 
 func tryLockCredential(ctx context.Context, tx *sql.Tx, credentialHash [sha256.Size]byte) (bool, error) {
@@ -327,7 +315,14 @@ type rowQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func (s *Service) loadIdempotency(ctx context.Context, database rowQuerier, input preparedInput, now time.Time) (Response, bool, bool, error) {
+type idempotencyRequest struct {
+	scope          string
+	credentialHash [sha256.Size]byte
+	key            string
+	requestHash    [sha256.Size]byte
+}
+
+func (s *Service) loadIdempotency(ctx context.Context, database rowQuerier, input idempotencyRequest, now time.Time) (Response, bool, bool, error) {
 	var requestHash, ciphertext []byte
 	var status int
 	err := database.QueryRowContext(ctx, `
@@ -335,14 +330,14 @@ func (s *Service) loadIdempotency(ctx context.Context, database rowQuerier, inpu
 		FROM idempotency_records
 		WHERE scope = $1 AND credential_hash = $2 AND idempotency_key = $3
 		  AND expires_at > $4 AND status_code IN (200, 201)`,
-		idempotencyScope, input.credentialHash[:], input.idempotencyKey, now).Scan(&requestHash, &status, &ciphertext)
+		input.scope, input.credentialHash[:], input.key, now).Scan(&requestHash, &status, &ciphertext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Response{}, false, false, nil
 	}
 	if err != nil {
-		return Response{}, false, false, fmt.Errorf("load activation replay: %w", err)
+		return Response{}, false, false, fmt.Errorf("load idempotency replay: %w", err)
 	}
-	if len(requestHash) != sha256.Size || subtle.ConstantTimeCompare(requestHash, input.installationHash[:]) != 1 {
+	if len(requestHash) != sha256.Size || subtle.ConstantTimeCompare(requestHash, input.requestHash[:]) != 1 {
 		return Response{}, false, true, nil
 	}
 	response, err := s.openResponse(ciphertext, input, status)
@@ -569,11 +564,11 @@ func randomValueValid(value, prefix string, byteCount int) bool {
 	return err == nil && len(decoded) == byteCount
 }
 
-func (s *Service) storeAndCommit(ctx context.Context, tx *sql.Tx, input preparedInput, response Response, now time.Time) (Response, error) {
+func (s *Service) storeAndCommit(ctx context.Context, tx *sql.Tx, input idempotencyRequest, response Response, now time.Time) (Response, error) {
 	additionalData := idempotencyAdditionalData(input, response.Status)
 	ciphertext, err := s.responses.seal(response.Body, additionalData)
 	if err != nil {
-		return Response{}, fmt.Errorf("encrypt activation response: %w", err)
+		return Response{}, fmt.Errorf("encrypt idempotency response: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO idempotency_records (
@@ -588,44 +583,55 @@ func (s *Service) storeAndCommit(ctx context.Context, tx *sql.Tx, input prepared
 		              expires_at = EXCLUDED.expires_at
 		WHERE idempotency_records.expires_at <= EXCLUDED.created_at
 		   OR idempotency_records.status_code NOT IN (200, 201)`,
-		idempotencyScope, input.credentialHash[:], input.idempotencyKey, input.installationHash[:],
+		input.scope, input.credentialHash[:], input.key, input.requestHash[:],
 		response.Status, ciphertext, now, now.Add(idempotencyLifetime))
 	if err != nil {
-		return Response{}, fmt.Errorf("store activation replay: %w", err)
+		return Response{}, fmt.Errorf("store idempotency replay: %w", err)
 	}
 	stored, err := result.RowsAffected()
 	if err != nil {
-		return Response{}, fmt.Errorf("read activation replay result: %w", err)
+		return Response{}, fmt.Errorf("read idempotency replay result: %w", err)
 	}
 	if stored != 1 {
-		return Response{}, errors.New("activation replay changed while its credential was locked")
+		return Response{}, errors.New("idempotency replay changed while its resource was locked")
 	}
 	if err := tx.Commit(); err != nil {
-		return Response{}, fmt.Errorf("commit activation: %w", err)
+		return Response{}, fmt.Errorf("commit idempotent state change: %w", err)
 	}
 	return response, nil
 }
 
-func (s *Service) openResponse(ciphertext []byte, input preparedInput, status int) (Response, error) {
+func (s *Service) openResponse(ciphertext []byte, input idempotencyRequest, status int) (Response, error) {
 	body, err := s.responses.open(ciphertext, idempotencyAdditionalData(input, status))
 	if err != nil {
-		return Response{}, fmt.Errorf("decrypt activation replay: %w", err)
+		return Response{}, fmt.Errorf("decrypt idempotency replay: %w", err)
 	}
 	return Response{Status: status, Body: body}, nil
 }
 
-func idempotencyAdditionalData(input preparedInput, status int) []byte {
-	additionalData := make([]byte, 0, len(idempotencyScope)+1+sha256.Size+36+sha256.Size+2)
-	additionalData = append(additionalData, idempotencyScope...)
+func idempotencyAdditionalData(input idempotencyRequest, status int) []byte {
+	additionalData := make([]byte, 0, len(input.scope)+1+sha256.Size+36+sha256.Size+2)
+	additionalData = append(additionalData, input.scope...)
 	additionalData = append(additionalData, 0)
 	additionalData = append(additionalData, input.credentialHash[:]...)
-	additionalData = append(additionalData, input.idempotencyKey...)
-	additionalData = append(additionalData, input.installationHash[:]...)
+	additionalData = append(additionalData, input.key...)
+	additionalData = append(additionalData, input.requestHash[:]...)
 	return binary.BigEndian.AppendUint16(additionalData, uint16(status))
 }
 
 func responseError(status int, code, message string) Response {
 	return Response{Status: status, ErrorCode: code, ErrorMessage: message}
+}
+
+func databaseBusyResponse() Response {
+	response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
+	response.RetryAfterSeconds = 1
+	return response
+}
+
+func databaseLockUnavailable(err error) bool {
+	var databaseError interface{ SQLState() string }
+	return errors.As(err, &databaseError) && databaseError.SQLState() == "55P03"
 }
 
 type successBody struct {

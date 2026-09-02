@@ -37,6 +37,7 @@ type activationService interface {
 	CreateManagementSession(context.Context, activation.ManagementSessionInput) (activation.Response, error)
 	ListManagedActivations(context.Context, string) (activation.Response, error)
 	DeactivateManaged(context.Context, activation.ManagedDeactivationInput) (activation.Response, error)
+	RotateLicenseKey(context.Context, activation.LicenseKeyRotationInput) (activation.Response, error)
 }
 
 type api struct {
@@ -56,6 +57,7 @@ func New(database databasePinger, activations activationService, logger *slog.Lo
 	mux.HandleFunc("POST /v1/management-sessions", api.createManagementSession)
 	mux.HandleFunc("GET /v1/management/activations", api.listManagedActivations)
 	mux.HandleFunc("DELETE /v1/management/activations/{activation_id}", api.deactivateManaged)
+	mux.HandleFunc("POST /v1/management/license-key-rotations", api.rotateLicenseKey)
 	return mux
 }
 
@@ -104,8 +106,8 @@ func decodeActivationRequest(w http.ResponseWriter, request *http.Request) (acti
 	if err != nil || mediaType != "application/json" {
 		return activationRequest{}, http.StatusUnsupportedMediaType
 	}
-	idempotencyHeaders := request.Header.Values("Idempotency-Key")
-	if len(idempotencyHeaders) != 1 {
+	idempotencyKey, ok := singleHeader(request, "Idempotency-Key")
+	if !ok {
 		return activationRequest{}, http.StatusBadRequest
 	}
 
@@ -113,7 +115,7 @@ func decodeActivationRequest(w http.ResponseWriter, request *http.Request) (acti
 	if status := decodeJSONBody(w, request, &body); status != 0 {
 		return activationRequest{}, status
 	}
-	body.IdempotencyKey = idempotencyHeaders[0]
+	body.IdempotencyKey = idempotencyKey
 	return body, 0
 }
 
@@ -200,15 +202,23 @@ func decodeJSONBody(w http.ResponseWriter, request *http.Request, destination an
 }
 
 func bearerCredential(request *http.Request) (string, bool) {
-	values := request.Header.Values("Authorization")
-	if len(values) != 1 {
+	value, ok := singleHeader(request, "Authorization")
+	if !ok {
 		return "", false
 	}
-	scheme, credential, found := strings.Cut(values[0], " ")
+	scheme, credential, found := strings.Cut(value, " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") || credential == "" || strings.ContainsAny(credential, " \t") {
 		return "", false
 	}
 	return credential, true
+}
+
+func singleHeader(request *http.Request, name string) (string, bool) {
+	values := request.Header.Values(name)
+	if len(values) != 1 {
+		return "", false
+	}
+	return values[0], true
 }
 
 func rejectTrailingJSON(decoder *json.Decoder) error {

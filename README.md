@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, and activation management endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery, license-key rotation, and download endpoints are not implemented yet.
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, and license management endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery, and download endpoints are not implemented yet.
 
 ## Trust boundaries
 
@@ -58,12 +58,15 @@ The service exposes:
 - `POST /v1/management-sessions` for creating a 15-minute management session from a license key.
 - `GET /v1/management/activations` for listing the license's active slots.
 - `DELETE /v1/management/activations/{activation_id}` for releasing one of those slots.
+- `POST /v1/management/license-key-rotations` for replacing the license key.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
 
 Refresh and current-installation deactivation authenticate with the activation token returned during activation. Deactivation retains the token hash so repeating that operation returns 204, while other uses of the deactivated token fail.
 
 Management sessions authenticate with the license key and return a short-lived bearer token. The service stores only its SHA-256 hash. Slot listing exposes opaque activation IDs and timestamps, not device details. Remote release is idempotent and cannot affect another license's activation.
+
+License-key rotation requires a management session and an idempotency UUID. A license can rotate once every 24 hours. A successful rotation consumes the management session, retains only the previous revoked key, and leaves existing activations intact. The encrypted success response remains replayable for 24 hours, including after the management session expires, so a lost HTTP response does not lose the new key.
 
 ## Checks
 
