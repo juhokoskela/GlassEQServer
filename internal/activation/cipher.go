@@ -41,7 +41,7 @@ func (c *secretCipher) seal(plaintext, additionalData []byte) ([]byte, error) {
 func (c *secretCipher) open(ciphertext, additionalData []byte) ([]byte, error) {
 	nonceSize := c.aead.NonceSize()
 	if len(ciphertext) < nonceSize {
-		return nil, errors.New("idempotency response is truncated")
+		return nil, errors.New("ciphertext is truncated")
 	}
 	return c.aead.Open(nil, ciphertext[:nonceSize], ciphertext[nonceSize:], additionalData)
 }

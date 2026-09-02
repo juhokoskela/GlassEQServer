@@ -42,5 +42,7 @@ func TestSecretCipherRejectsInvalidConfigurationAndInput(t *testing.T) {
 	}
 	if _, err := cipher.open(make([]byte, 11), nil); err == nil {
 		t.Fatal("open truncated response succeeded")
+	} else if err.Error() != "ciphertext is truncated" {
+		t.Errorf("truncated ciphertext error = %q", err)
 	}
 }
