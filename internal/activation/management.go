@@ -171,17 +171,22 @@ func (s *Service) DeactivateManaged(ctx context.Context, input ManagedDeactivati
 	if !found {
 		return responseError(http.StatusUnauthorized, "invalid_credentials", "The management token is invalid."), nil
 	}
-	// Activation mutations lock the license before the activation row.
-	if _, found, err := findLicenseByID(ctx, tx, licenseID); err != nil {
+	found, busy, err := lockManagedActivation(ctx, tx, licenseID, input.ActivationID)
+	if err != nil {
 		return Response{}, err
-	} else if !found {
-		return Response{}, errors.New("management session license does not exist")
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE activations
-		SET state = 'deactivated', deactivated_at = COALESCE(deactivated_at, $1)
-		WHERE id = $2 AND license_id = $3`, now, input.ActivationID, licenseID); err != nil {
-		return Response{}, fmt.Errorf("deactivate managed activation: %w", err)
+	if busy {
+		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
+		response.RetryAfterSeconds = 1
+		return response, nil
+	}
+	if found {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE activations
+			SET state = 'deactivated', deactivated_at = COALESCE(deactivated_at, $1)
+			WHERE id = $2`, now, input.ActivationID); err != nil {
+			return Response{}, fmt.Errorf("deactivate managed activation: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Response{}, fmt.Errorf("commit managed deactivation: %w", err)
@@ -210,6 +215,26 @@ func findManagementLicenseID(ctx context.Context, database rowQuerier, tokenHash
 		return "", false, fmt.Errorf("find management session: %w", err)
 	}
 	return licenseID, true, nil
+}
+
+func lockManagedActivation(ctx context.Context, tx *sql.Tx, licenseID, activationID string) (bool, bool, error) {
+	var id string
+	err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM activations
+		WHERE id = $1 AND license_id = $2
+		FOR UPDATE NOWAIT`, activationID, licenseID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	var databaseError interface{ SQLState() string }
+	if errors.As(err, &databaseError) && databaseError.SQLState() == "55P03" {
+		return false, true, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("lock managed activation: %w", err)
+	}
+	return true, false, nil
 }
 
 type managementSessionBody struct {

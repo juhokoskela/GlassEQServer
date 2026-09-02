@@ -158,6 +158,37 @@ func TestManagedDeactivationCannotCrossLicensesWithPostgreSQL(t *testing.T) {
 		WHERE id = $1 AND state = 'active'`, firstID, 1)
 }
 
+func TestManagedDeactivationReturnsWhenActivationIsBusyWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_managed_busy", testLicenseKey)
+	service := newTestService(t, database, localIssuer(t))
+	activation := decodeSuccess(t, activate(t, service, testLicenseKey, testInstallA, "cefcaa68-5354-4b69-9672-98f449a6a439"))
+	activationID := decodeClaims(t, activation.Entitlement).ActivationID
+	session := decodeManagementSession(t, createManagementSession(t, service, testLicenseKey))
+
+	lock, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin activation lock: %v", err)
+	}
+	t.Cleanup(func() { lock.Rollback() })
+	if _, err := lock.ExecContext(context.Background(), "SELECT id FROM activations WHERE id = $1 FOR UPDATE", activationID); err != nil {
+		t.Fatalf("lock activation: %v", err)
+	}
+
+	response, err := service.DeactivateManaged(context.Background(), ManagedDeactivationInput{
+		ManagementToken: session.ManagementToken,
+		ActivationID:    activationID,
+	})
+	if err != nil {
+		t.Fatalf("deactivate busy activation: %v", err)
+	}
+	assertErrorCode(t, response, http.StatusServiceUnavailable, "temporarily_unavailable")
+	if response.RetryAfterSeconds != 1 {
+		t.Errorf("Retry-After = %d, want 1", response.RetryAfterSeconds)
+	}
+}
+
 func TestExpiredManagementSessionIsRejectedWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
