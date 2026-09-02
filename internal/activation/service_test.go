@@ -2,6 +2,7 @@ package activation
 
 import (
 	"database/sql"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func TestPrepareCanonicalizesIdentifiersAndIP(t *testing.T) {
 		LicenseKey:     "geq1-01234-56789-abcde-fghjk-mnpqr-s",
 		InstallationID: "4e70638a-a75b-4bfb-b4b0-15e959a91465",
 		IdempotencyKey: "2B1BC1BA-407A-49F2-AD2E-A260A56BCF23",
-		ClientIP:       "::ffff:192.0.2.1",
+		ClientIP:       netip.MustParseAddr("::ffff:192.0.2.1"),
 	})
 	if invalidCode != "" {
 		t.Fatalf("prepare invalid code = %q", invalidCode)
@@ -51,7 +52,7 @@ func TestPrepareCanonicalizesIdentifiersAndIP(t *testing.T) {
 	if prepared.idempotencyKey != "2b1bc1ba-407a-49f2-ad2e-a260a56bcf23" {
 		t.Errorf("idempotency key = %q", prepared.idempotencyKey)
 	}
-	if prepared.clientIP != "192.0.2.1" {
+	if prepared.clientIP != netip.MustParseAddr("192.0.2.1") {
 		t.Errorf("client IP = %q", prepared.clientIP)
 	}
 }

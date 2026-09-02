@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -83,27 +84,28 @@ func TestActivationPassesBoundedRequestToService(t *testing.T) {
 	if activations.calls != 1 {
 		t.Fatalf("activation calls = %d, want 1", activations.calls)
 	}
-	if activations.input.ClientIP != "198.51.100.4" {
+	if activations.input.ClientIP != netip.MustParseAddr("198.51.100.4") {
 		t.Errorf("client IP = %q", activations.input.ClientIP)
 	}
-	if !strings.HasPrefix(activations.input.RequestID, "req_") {
-		t.Errorf("request ID = %q", activations.input.RequestID)
+	if activations.deadlineRemaining <= 0 || activations.deadlineRemaining > activationTimeout {
+		t.Errorf("activation deadline remaining = %s", activations.deadlineRemaining)
 	}
 }
 
 func TestActivationRejectsInvalidHTTPRequests(t *testing.T) {
 	largeBody := `{"license_key":"` + strings.Repeat("A", maximumBodySize) + `","installation_id":"id"}`
 	tests := []struct {
-		name   string
-		body   string
-		mutate func(*http.Request)
+		name       string
+		body       string
+		mutate     func(*http.Request)
+		wantStatus int
 	}{
-		{name: "missing content type", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Content-Type") }},
-		{name: "missing idempotency key", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Idempotency-Key") }},
-		{name: "duplicate idempotency key", body: `{}`, mutate: func(request *http.Request) { request.Header.Add("Idempotency-Key", "second") }},
-		{name: "unknown field", body: `{"license_key":"key","installation_id":"id","extra":true}`},
-		{name: "trailing JSON", body: `{} {}`},
-		{name: "oversized", body: largeBody},
+		{name: "missing content type", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Content-Type") }, wantStatus: http.StatusUnsupportedMediaType},
+		{name: "missing idempotency key", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Idempotency-Key") }, wantStatus: http.StatusBadRequest},
+		{name: "duplicate idempotency key", body: `{}`, mutate: func(request *http.Request) { request.Header.Add("Idempotency-Key", "second") }, wantStatus: http.StatusBadRequest},
+		{name: "unknown field", body: `{"license_key":"key","installation_id":"id","extra":true}`, wantStatus: http.StatusBadRequest},
+		{name: "trailing JSON", body: `{} {}`, wantStatus: http.StatusBadRequest},
+		{name: "oversized", body: largeBody, wantStatus: http.StatusRequestEntityTooLarge},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -116,8 +118,8 @@ func TestActivationRejectsInvalidHTTPRequests(t *testing.T) {
 
 			New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
 
-			if response.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
 			}
 			if !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
 				t.Errorf("body = %q", response.Body.String())
@@ -152,7 +154,8 @@ func TestActivationHidesServiceErrorAndCredentials(t *testing.T) {
 func TestActivationWritesRetryAfter(t *testing.T) {
 	activations := &fakeActivationService{response: activation.Response{
 		Status:            http.StatusTooManyRequests,
-		Body:              []byte(`{"error":{"code":"rate_limited"}}`),
+		ErrorCode:         "rate_limited",
+		ErrorMessage:      "Too many activation attempts. Try again later.",
 		RetryAfterSeconds: 42,
 	}}
 	response := httptest.NewRecorder()
@@ -161,6 +164,9 @@ func TestActivationWritesRetryAfter(t *testing.T) {
 
 	if response.Header().Get("Retry-After") != "42" {
 		t.Errorf("Retry-After = %q, want 42", response.Header().Get("Retry-After"))
+	}
+	if !strings.Contains(response.Body.String(), `"request_id":"req_`) {
+		t.Errorf("body has no generated request ID: %q", response.Body.String())
 	}
 }
 
@@ -172,15 +178,19 @@ func activationHTTPRequest(body string) *http.Request {
 }
 
 type fakeActivationService struct {
-	response activation.Response
-	err      error
-	input    activation.Input
-	calls    int
+	response          activation.Response
+	err               error
+	input             activation.Input
+	calls             int
+	deadlineRemaining time.Duration
 }
 
-func (f *fakeActivationService) Activate(_ context.Context, input activation.Input) (activation.Response, error) {
+func (f *fakeActivationService) Activate(ctx context.Context, input activation.Input) (activation.Response, error) {
 	f.calls++
 	f.input = input
+	if deadline, ok := ctx.Deadline(); ok {
+		f.deadlineRemaining = time.Until(deadline)
+	}
 	return f.response, f.err
 }
 

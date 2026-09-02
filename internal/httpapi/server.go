@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	readinessTimeout = time.Second
-	maximumBodySize  = 16 * 1024
+	readinessTimeout  = time.Second
+	activationTimeout = 20 * time.Second
+	maximumBodySize   = 16 * 1024
 )
 
 type databasePinger interface {
@@ -60,26 +61,9 @@ func (a *api) activate(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "The activation request is invalid.", requestID)
-		return
-	}
-	idempotencyHeaders := request.Header.Values("Idempotency-Key")
-	if len(idempotencyHeaders) != 1 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "The activation request is invalid.", requestID)
-		return
-	}
-
-	var body activationRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, request.Body, maximumBodySize))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "The activation request is invalid.", requestID)
-		return
-	}
-	if err := rejectTrailingJSON(decoder); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "The activation request is invalid.", requestID)
+	body, invalidStatus := decodeActivationRequest(w, request)
+	if invalidStatus != 0 {
+		writeError(w, invalidStatus, "invalid_request", "The activation request is invalid.", requestID)
 		return
 	}
 
@@ -89,12 +73,13 @@ func (a *api) activate(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
 		return
 	}
-	response, err := a.activations.Activate(request.Context(), activation.Input{
+	ctx, cancel := context.WithTimeout(request.Context(), activationTimeout)
+	defer cancel()
+	response, err := a.activations.Activate(ctx, activation.Input{
 		LicenseKey:     body.LicenseKey,
 		InstallationID: body.InstallationID,
-		IdempotencyKey: idempotencyHeaders[0],
+		IdempotencyKey: body.IdempotencyKey,
 		ClientIP:       clientIP,
-		RequestID:      requestID,
 	})
 	if err != nil {
 		a.logger.ErrorContext(request.Context(), "activate license", "request_id", requestID, "error", err)
@@ -104,7 +89,39 @@ func (a *api) activate(w http.ResponseWriter, request *http.Request) {
 	if response.RetryAfterSeconds > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(response.RetryAfterSeconds))
 	}
+	if response.ErrorCode != "" {
+		writeError(w, response.Status, response.ErrorCode, response.ErrorMessage, requestID)
+		return
+	}
 	writeRawJSON(w, response.Status, response.Body)
+}
+
+func decodeActivationRequest(w http.ResponseWriter, request *http.Request) (activationRequest, int) {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return activationRequest{}, http.StatusUnsupportedMediaType
+	}
+	idempotencyHeaders := request.Header.Values("Idempotency-Key")
+	if len(idempotencyHeaders) != 1 {
+		return activationRequest{}, http.StatusBadRequest
+	}
+
+	var body activationRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, request.Body, maximumBodySize))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&body)
+	if err == nil {
+		err = rejectTrailingJSON(decoder)
+	}
+	if err != nil {
+		var maximumBytesError *http.MaxBytesError
+		if errors.As(err, &maximumBytesError) {
+			return activationRequest{}, http.StatusRequestEntityTooLarge
+		}
+		return activationRequest{}, http.StatusBadRequest
+	}
+	body.IdempotencyKey = idempotencyHeaders[0]
+	return body, 0
 }
 
 func rejectTrailingJSON(decoder *json.Decoder) error {
@@ -119,7 +136,7 @@ func rejectTrailingJSON(decoder *json.Decoder) error {
 	return errors.New("request contains multiple JSON values")
 }
 
-func requestClientIP(request *http.Request) (string, error) {
+func requestClientIP(request *http.Request) (netip.Addr, error) {
 	forwarded := request.Header.Values("X-Forwarded-For")
 	if len(forwarded) > 0 {
 		addresses := strings.Split(forwarded[len(forwarded)-1], ",")
@@ -127,17 +144,17 @@ func requestClientIP(request *http.Request) (string, error) {
 	}
 	host, _, err := net.SplitHostPort(request.RemoteAddr)
 	if err != nil {
-		return "", fmt.Errorf("split remote address: %w", err)
+		return netip.Addr{}, fmt.Errorf("split remote address: %w", err)
 	}
 	return canonicalIP(host)
 }
 
-func canonicalIP(value string) (string, error) {
+func canonicalIP(value string) (netip.Addr, error) {
 	address, err := netip.ParseAddr(value)
 	if err != nil {
-		return "", fmt.Errorf("parse IP address: %w", err)
+		return netip.Addr{}, fmt.Errorf("parse IP address: %w", err)
 	}
-	return address.Unmap().String(), nil
+	return address.Unmap(), nil
 }
 
 func randomRequestID() (string, error) {
@@ -151,6 +168,7 @@ func randomRequestID() (string, error) {
 type activationRequest struct {
 	LicenseKey     string `json:"license_key"`
 	InstallationID string `json:"installation_id"`
+	IdempotencyKey string `json:"-"`
 }
 
 func (a *api) ready(w http.ResponseWriter, request *http.Request) {

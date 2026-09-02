@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -22,10 +24,11 @@ import (
 )
 
 const (
-	testLicenseKey = "GEQ1-01234-56789-ABCDE-FGHJK-MNPQR-S"
-	testInstallA   = "4E70638A-A75B-4BFB-B4B0-15E959A91465"
-	testInstallB   = "9184CDB7-1EB1-43E5-97F3-EC269111171F"
-	testInstallC   = "D45AB9E0-606C-4873-A285-14F3339D026D"
+	testLicenseKey  = "GEQ1-01234-56789-ABCDE-FGHJK-MNPQR-S"
+	testLicenseKeyB = "GEQ1-01234-56789-ABCDE-FGHJK-MNPQR-T"
+	testInstallA    = "4E70638A-A75B-4BFB-B4B0-15E959A91465"
+	testInstallB    = "9184CDB7-1EB1-43E5-97F3-EC269111171F"
+	testInstallC    = "D45AB9E0-606C-4873-A285-14F3339D026D"
 )
 
 func TestActivationLifecycleWithPostgreSQL(t *testing.T) {
@@ -63,6 +66,18 @@ func TestActivationLifecycleWithPostgreSQL(t *testing.T) {
 	}
 	if claims := decodeClaims(t, reactivatedBody.Entitlement); claims.Revision != 2 {
 		t.Errorf("reactivation revision = %d, want 2", claims.Revision)
+	}
+	service.now = func() time.Time { return time.Unix(1_800_000_000, 0).UTC().Add(idempotencyLifetime + time.Hour) }
+	afterExpiry := activate(t, service, testLicenseKey, testInstallA, "2b1bc1ba-407a-49f2-ad2e-a260a56bcf23")
+	if afterExpiry.Status != http.StatusOK {
+		t.Fatalf("status after replay expiry = %d, want %d: %s", afterExpiry.Status, http.StatusOK, afterExpiry.Body)
+	}
+	afterExpiryBody := decodeSuccess(t, afterExpiry)
+	if afterExpiryBody.ActivationToken == firstBody.ActivationToken {
+		t.Error("expired replay returned the original activation token")
+	}
+	if claims := decodeClaims(t, afterExpiryBody.Entitlement); claims.Revision != 3 {
+		t.Errorf("revision after replay expiry = %d, want 3", claims.Revision)
 	}
 	assertActivationCount(t, database, "lic_lifecycle", 1)
 }
@@ -137,13 +152,87 @@ func TestActivationRollsBackSigningFailureWithPostgreSQL(t *testing.T) {
 	}
 }
 
+func TestActivationReturnsWhenCredentialIsBusyWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_busy", testLicenseKey)
+	service := newTestService(t, database, localIssuer(t))
+	input := activationInput(testLicenseKey, testInstallA, "5992d0c4-d8d3-4fc3-a4d2-520f3278c71a")
+	prepared, invalidCode := prepare(input)
+	if invalidCode != "" {
+		t.Fatalf("prepare test input: %s", invalidCode)
+	}
+
+	lock, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin lock transaction: %v", err)
+	}
+	t.Cleanup(func() { lock.Rollback() })
+	lockKey := int64(binary.BigEndian.Uint64(prepared.credentialHash[:8]))
+	if _, err := lock.ExecContext(context.Background(), "SELECT pg_advisory_xact_lock($1)", lockKey); err != nil {
+		t.Fatalf("hold credential lock: %v", err)
+	}
+
+	response := activate(t, service, testLicenseKey, testInstallA, input.IdempotencyKey)
+	assertErrorCode(t, response, http.StatusServiceUnavailable, "temporarily_unavailable")
+	if response.RetryAfterSeconds != 1 {
+		t.Errorf("Retry-After = %d, want 1", response.RetryAfterSeconds)
+	}
+}
+
+func TestSharedIPDoesNotHoldRateLimitLockDuringSigningWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_nat_a", testLicenseKey)
+	seedPerpetualLicense(t, database, "lic_nat_b", testLicenseKeyB)
+	issuer := &blockingIssuer{entered: make(chan struct{}, 2), release: make(chan struct{})}
+	service := newTestService(t, database, issuer)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	results := make(chan error, 2)
+
+	go func() {
+		_, err := service.Activate(ctx, activationInput(testLicenseKey, testInstallA, "29687cd6-607e-4bb2-aa8a-75ab69e164bd"))
+		results <- err
+	}()
+	select {
+	case <-issuer.entered:
+	case err := <-results:
+		t.Fatalf("first activation returned before signing: %v", err)
+	case <-ctx.Done():
+		t.Fatal("first activation did not reach signing")
+	}
+
+	go func() {
+		_, err := service.Activate(ctx, activationInput(testLicenseKeyB, testInstallB, "0485aa72-a17d-48f7-afbe-8abdd89c19b8"))
+		results <- err
+	}()
+	secondReachedSigning := false
+	select {
+	case <-issuer.entered:
+		secondReachedSigning = true
+	case <-time.After(time.Second):
+	}
+	close(issuer.release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Errorf("activation failed: %v", err)
+		}
+	}
+	if !secondReachedSigning {
+		t.Error("second activation remained blocked on the shared IP rate-limit row")
+	}
+}
+
 func TestActivationRateLimitWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
 	service := newTestService(t, database, localIssuer(t))
 
+	var limitedIdempotencyKey string
 	for attempt := 1; attempt <= licenseKeyAttemptLimit+1; attempt++ {
-		response := activate(t, service, testLicenseKey, testInstallA, fmt.Sprintf("00000000-0000-4000-8000-%012d", attempt))
+		limitedIdempotencyKey = fmt.Sprintf("00000000-0000-4000-8000-%012d", attempt)
+		response := activate(t, service, testLicenseKey, testInstallA, limitedIdempotencyKey)
 		if attempt <= licenseKeyAttemptLimit {
 			assertErrorCode(t, response, http.StatusUnauthorized, "invalid_credentials")
 			continue
@@ -153,6 +242,64 @@ func TestActivationRateLimitWithPostgreSQL(t *testing.T) {
 			t.Errorf("Retry-After = %d", response.RetryAfterSeconds)
 		}
 	}
+	service.now = func() time.Time { return time.Unix(1_800_000_000, 0).UTC().Add(rateLimitWindow) }
+	recovered := activate(t, service, testLicenseKey, testInstallA, limitedIdempotencyKey)
+	assertErrorCode(t, recovered, http.StatusUnauthorized, "invalid_credentials")
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records", nil, 0)
+}
+
+func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	service := newTestService(t, database, localIssuer(t))
+	now := time.Unix(1_800_000_000, 0).UTC()
+
+	for index, expiresAt := range []time.Time{now.Add(-2 * time.Hour), now.Add(-time.Hour), now.Add(24 * time.Hour)} {
+		credentialHash := sha256.Sum256([]byte(fmt.Sprintf("credential-%d", index)))
+		requestHash := sha256.Sum256([]byte(fmt.Sprintf("request-%d", index)))
+		_, err := database.ExecContext(context.Background(), `
+			INSERT INTO idempotency_records (
+			    scope, credential_hash, idempotency_key, request_hash, status_code,
+			    response_ciphertext, created_at, expires_at
+			) VALUES ('activation', $1, $2, $3, 201, $4, $5, $6)`,
+			credentialHash[:], fmt.Sprintf("00000000-0000-4000-8000-%012d", index+1), requestHash[:],
+			[]byte("ciphertext"), expiresAt.Add(-24*time.Hour), expiresAt)
+		if err != nil {
+			t.Fatalf("insert idempotency record %d: %v", index, err)
+		}
+
+		subjectHash := sha256.Sum256([]byte(fmt.Sprintf("subject-%d", index)))
+		windowStart := now.Truncate(rateLimitWindow)
+		if index < 2 {
+			windowStart = windowStart.Add(-time.Duration(index+1) * rateLimitWindow)
+		}
+		_, err = database.ExecContext(context.Background(), `
+			INSERT INTO activation_rate_limits (kind, subject_hash, window_start, attempts)
+			VALUES ('ip', $1, $2, 1)`, subjectHash[:], windowStart)
+		if err != nil {
+			t.Fatalf("insert rate limit %d: %v", index, err)
+		}
+	}
+
+	deleted, err := service.cleanupExpired(context.Background(), now, 1)
+	if err != nil {
+		t.Fatalf("clean one batch: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("deleted rows = %d, want 2", deleted)
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE expires_at <= $1", now, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits WHERE window_start < $1", now.Truncate(rateLimitWindow), 1)
+
+	deleted, err = service.CleanupExpired(context.Background(), now)
+	if err != nil {
+		t.Fatalf("clean remaining rows: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("remaining deleted rows = %d, want 2", deleted)
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits", nil, 1)
 }
 
 func openTestDatabase(t *testing.T) *sql.DB {
@@ -246,6 +393,25 @@ func (errorIssuer) IssueMonthly(context.Context, entitlement.MonthlyClaims) (str
 	return "", errors.New("signing unavailable")
 }
 
+type blockingIssuer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (i *blockingIssuer) IssuePerpetual(ctx context.Context, _ entitlement.Claims) (string, error) {
+	i.entered <- struct{}{}
+	select {
+	case <-i.release:
+		return "signed", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (i *blockingIssuer) IssueMonthly(ctx context.Context, _ entitlement.MonthlyClaims) (string, error) {
+	return i.IssuePerpetual(ctx, entitlement.Claims{})
+}
+
 func activate(t *testing.T, service *Service, licenseKey, installationID, idempotencyKey string) Response {
 	t.Helper()
 	response, err := service.Activate(context.Background(), activationInput(licenseKey, installationID, idempotencyKey))
@@ -260,8 +426,7 @@ func activationInput(licenseKey, installationID, idempotencyKey string) Input {
 		LicenseKey:     licenseKey,
 		InstallationID: installationID,
 		IdempotencyKey: idempotencyKey,
-		ClientIP:       "192.0.2.42",
-		RequestID:      "req_test",
+		ClientIP:       netip.MustParseAddr("192.0.2.42"),
 	}
 }
 
@@ -319,17 +484,30 @@ func assertActivationCount(t *testing.T, database *sql.DB, licenseID string, wan
 	}
 }
 
+func assertRowCount(t *testing.T, database *sql.DB, query string, argument any, want int) {
+	t.Helper()
+	var row *sql.Row
+	if argument == nil {
+		row = database.QueryRowContext(context.Background(), query)
+	} else {
+		row = database.QueryRowContext(context.Background(), query, argument)
+	}
+	var count int
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != want {
+		t.Errorf("row count = %d, want %d", count, want)
+	}
+}
+
 func assertErrorCode(t *testing.T, response Response, wantStatus int, wantCode string) {
 	t.Helper()
 	if response.Status != wantStatus {
 		t.Fatalf("status = %d, want %d: %s", response.Status, wantStatus, response.Body)
 	}
-	var body errorEnvelope
-	if err := json.Unmarshal(response.Body, &body); err != nil {
-		t.Fatalf("decode error response: %v", err)
-	}
-	if body.Error.Code != wantCode {
-		t.Errorf("error code = %q, want %q", body.Error.Code, wantCode)
+	if response.ErrorCode != wantCode {
+		t.Errorf("error code = %q, want %q", response.ErrorCode, wantCode)
 	}
 }
 
