@@ -13,24 +13,23 @@ import (
 const (
 	recoveryDatabaseTimeout         = 3 * time.Second
 	recoveryQueueTimeout            = 10 * time.Second
-	recoveryDispatchRetryDelay      = time.Minute
+	recoveryRetryDelay              = time.Minute
 	recoveryMinimumDeliveryLifetime = 5 * time.Minute
 )
 
 func (s *Service) DispatchRecoveryEmail(ctx context.Context, now time.Time) (bool, error) {
 	now = now.UTC().Truncate(time.Microsecond)
-	prepared, err := s.prepareRecoveryRequest(ctx, now)
-	if err != nil {
-		return false, err
-	}
-	dispatched, err := s.dispatchRecoveryEmail(ctx, now)
-	if err != nil {
-		return false, err
-	}
-	return prepared || dispatched, nil
+	prepared, prepareErr := s.prepareRecoveryRequest(ctx, now)
+	dispatched, dispatchErr := s.dispatchRecoveryEmail(ctx, now)
+	return prepared || dispatched, errors.Join(prepareErr, dispatchErr)
 }
 
 func (s *Service) prepareRecoveryRequest(ctx context.Context, now time.Time) (bool, error) {
+	requestID, found, err := s.claimRecoveryRequest(ctx, now)
+	if err != nil || !found {
+		return false, err
+	}
+
 	prepareCtx, cancel := context.WithTimeout(ctx, recoveryDatabaseTimeout)
 	defer cancel()
 	tx, err := s.database.BeginTx(prepareCtx, nil)
@@ -39,20 +38,17 @@ func (s *Service) prepareRecoveryRequest(ctx context.Context, now time.Time) (bo
 	}
 	defer tx.Rollback()
 
-	var requestID string
 	var lookupHash []byte
 	err = tx.QueryRowContext(prepareCtx, `
-		SELECT id, email_lookup
+		SELECT email_lookup
 		FROM recovery_request_jobs
-		WHERE expires_at > $1
-		ORDER BY created_at, id
-		LIMIT 1
-		FOR UPDATE SKIP LOCKED`, now).Scan(&requestID, &lookupHash)
+		WHERE id = $1
+		FOR UPDATE`, requestID).Scan(&lookupHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("claim recovery request: %w", err)
+		return false, fmt.Errorf("lock recovery request: %w", err)
 	}
 	licenseIDs, err := findRecoveryLicenses(prepareCtx, tx, lookupHash)
 	if err != nil {
@@ -72,6 +68,34 @@ func (s *Service) prepareRecoveryRequest(ctx context.Context, now time.Time) (bo
 		return false, fmt.Errorf("commit recovery request preparation: %w", err)
 	}
 	return true, nil
+}
+
+func (s *Service) claimRecoveryRequest(ctx context.Context, now time.Time) (string, bool, error) {
+	claimCtx, cancel := context.WithTimeout(ctx, recoveryDatabaseTimeout)
+	defer cancel()
+
+	var requestID string
+	err := s.database.QueryRowContext(claimCtx, `
+		WITH candidate AS (
+			SELECT id
+			FROM recovery_request_jobs
+			WHERE next_attempt_at <= $1 AND expires_at > $1
+			ORDER BY next_attempt_at, created_at, id
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE recovery_request_jobs AS jobs
+		SET next_attempt_at = $2
+		FROM candidate
+		WHERE jobs.id = candidate.id
+		RETURNING jobs.id`, now, now.Add(recoveryRetryDelay)).Scan(&requestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("claim recovery request: %w", err)
+	}
+	return requestID, true, nil
 }
 
 func findRecoveryLicenses(ctx context.Context, tx *sql.Tx, lookupHash []byte) ([]string, error) {
@@ -151,7 +175,7 @@ func (s *Service) dispatchRecoveryEmail(ctx context.Context, now time.Time) (boo
 		WHERE outbox.id = candidate.id AND license.id = outbox.license_id
 		RETURNING outbox.id, outbox.license_id, outbox.token_ciphertext,
 		          outbox.expires_at, license.recovery_email_ciphertext`,
-		now, now.Add(recoveryDispatchRetryDelay), now.Add(recoveryMinimumDeliveryLifetime)).Scan(
+		now, now.Add(recoveryRetryDelay), now.Add(recoveryMinimumDeliveryLifetime)).Scan(
 		&deliveryID, &licenseID, &tokenCiphertext, &expiresAt, &emailCiphertext,
 	)
 	cancel()

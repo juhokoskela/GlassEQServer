@@ -312,8 +312,8 @@ func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
 
 		requestLookup := sha256.Sum256([]byte(fmt.Sprintf("recovery-request-%d", index)))
 		_, err = database.ExecContext(context.Background(), `
-			INSERT INTO recovery_request_jobs (id, email_lookup, created_at, expires_at)
-			VALUES ($1, $2, $3, $4)`,
+			INSERT INTO recovery_request_jobs (id, email_lookup, created_at, expires_at, next_attempt_at)
+			VALUES ($1, $2, $3, $4, $3)`,
 			fmt.Sprintf("rrq_cleanup_%d", index), requestLookup[:],
 			expiresAt.Add(-recoveryRequestLifetime), expiresAt)
 		if err != nil {

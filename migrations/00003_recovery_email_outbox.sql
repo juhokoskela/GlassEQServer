@@ -14,11 +14,13 @@ CREATE TABLE recovery_request_jobs (
     email_lookup bytea NOT NULL CHECK (octet_length(email_lookup) = 32),
     created_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
-    CHECK (expires_at = created_at + interval '30 minutes')
+    next_attempt_at timestamptz NOT NULL,
+    CHECK (expires_at = created_at + interval '30 minutes'),
+    CHECK (next_attempt_at >= created_at)
 );
 
 CREATE INDEX recovery_request_jobs_pending
-    ON recovery_request_jobs (created_at, id);
+    ON recovery_request_jobs (next_attempt_at, created_at, id);
 
 CREATE INDEX recovery_request_jobs_expiry
     ON recovery_request_jobs (expires_at);

@@ -103,8 +103,8 @@ func (s *Service) enqueueRecoveryRequest(ctx context.Context, tx *sql.Tx, normal
 	}
 	lookupHash := hmacSHA256(s.emailLookupHMACKey, normalizedEmail)
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO recovery_request_jobs (id, email_lookup, created_at, expires_at)
-		VALUES ($1, $2, $3, $4)`,
+		INSERT INTO recovery_request_jobs (id, email_lookup, created_at, expires_at, next_attempt_at)
+		VALUES ($1, $2, $3, $4, $3)`,
 		requestID, lookupHash[:], now, now.Add(recoveryRequestLifetime)); err != nil {
 		return fmt.Errorf("save recovery request: %w", err)
 	}

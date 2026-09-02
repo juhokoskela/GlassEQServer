@@ -363,20 +363,71 @@ func TestRecoveryRequestRollsBackWhenReplayEncryptionFailsWithPostgreSQL(t *test
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 }
 
-func TestRecoveryRequestPreparationRollsBackTokenFailureWithPostgreSQL(t *testing.T) {
+func TestFailedRecoveryRequestPreparationDoesNotStarveDeliveriesWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	service := newTestService(t, database, localIssuer(t))
+	queue := &recordingRecoveryEmailQueue{}
+	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
 	seedRecoverableLicense(t, service, "lic_recovery_prepare_rollback", testLicenseKey, testRecoveryEmail)
+	now := service.now()
+
 	requestRecovery(t, service, testRecoveryEmail, "192.0.2.63")
+	if prepared, err := service.prepareRecoveryRequest(context.Background(), now); err != nil {
+		t.Fatalf("prepare first recovery request: %v", err)
+	} else if !prepared {
+		t.Fatal("first recovery request was not prepared")
+	}
+	response, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
+		Email:          testRecoveryEmail,
+		IdempotencyKey: testRecoveryIdempotencyKey(6),
+		ClientIP:       netip.MustParseAddr("192.0.2.64"),
+	})
+	if err != nil {
+		t.Fatalf("request second recovery: %v", err)
+	}
+	assertRecoveryAccepted(t, response)
+	originalRandom := service.random
 	service.random = bytes.NewReader(nil)
 
-	if _, err := service.DispatchRecoveryEmail(context.Background(), service.now()); err == nil {
+	worked, err := service.DispatchRecoveryEmail(context.Background(), now)
+	if err == nil {
 		t.Fatal("prepared recovery request with failed token generation")
 	}
+	if !worked {
+		t.Error("existing recovery email was not dispatched after preparation failed")
+	}
+	if len(queue.snapshot()) != 1 {
+		t.Errorf("queued messages = %d, want 1", len(queue.snapshot()))
+	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
-	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 0)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
+
+	var nextAttemptAt time.Time
+	if err := database.QueryRowContext(context.Background(), `
+		SELECT next_attempt_at
+		FROM recovery_request_jobs`).Scan(&nextAttemptAt); err != nil {
+		t.Fatalf("read recovery preparation retry time: %v", err)
+	}
+	if want := now.Add(recoveryRetryDelay); !nextAttemptAt.Equal(want) {
+		t.Errorf("next preparation attempt = %s, want %s", nextAttemptAt, want)
+	}
+
+	service.random = originalRandom
+	if worked, err := service.DispatchRecoveryEmail(context.Background(), now.Add(30*time.Second)); err != nil {
+		t.Fatalf("dispatch before preparation retry: %v", err)
+	} else if worked {
+		t.Error("failed recovery request retried before its delay")
+	}
+	if worked, err := service.DispatchRecoveryEmail(context.Background(), now.Add(recoveryRetryDelay)); err != nil {
+		t.Fatalf("retry recovery preparation: %v", err)
+	} else if !worked {
+		t.Error("failed recovery request was not retried")
+	}
+	if len(queue.snapshot()) != 2 {
+		t.Errorf("queued messages = %d, want 2", len(queue.snapshot()))
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 0)
 }
 
 func TestRecoveryEmailDispatchRetriesAfterQueueFailureWithPostgreSQL(t *testing.T) {
@@ -397,7 +448,7 @@ func TestRecoveryEmailDispatchRetriesAfterQueueFailureWithPostgreSQL(t *testing.
 		t.Error("recovery email retried before its delay")
 	}
 	queue.setError(nil)
-	if dispatched, err := service.DispatchRecoveryEmail(context.Background(), now.Add(recoveryDispatchRetryDelay)); err != nil {
+	if dispatched, err := service.DispatchRecoveryEmail(context.Background(), now.Add(recoveryRetryDelay)); err != nil {
 		t.Fatalf("retry recovery email: %v", err)
 	} else if !dispatched {
 		t.Error("recovery email was not retried")
