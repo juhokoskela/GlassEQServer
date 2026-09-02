@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -10,12 +11,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/juhokoskela/GlassEQServer/internal/activation"
 )
 
 func TestHealthDoesNotDependOnDatabase(t *testing.T) {
 	database := &fakeDatabase{err: errors.New("database unavailable")}
 	response := httptest.NewRecorder()
-	New(database, discardLogger()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	New(database, nil, discardLogger()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
@@ -31,7 +34,7 @@ func TestHealthDoesNotDependOnDatabase(t *testing.T) {
 func TestReadinessChecksDatabaseWithDeadline(t *testing.T) {
 	database := &fakeDatabase{}
 	response := httptest.NewRecorder()
-	New(database, discardLogger()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	New(database, nil, discardLogger()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
@@ -47,7 +50,7 @@ func TestReadinessChecksDatabaseWithDeadline(t *testing.T) {
 func TestReadinessHidesDatabaseError(t *testing.T) {
 	database := &fakeDatabase{err: errors.New("password authentication failed for secret-user")}
 	response := httptest.NewRecorder()
-	New(database, discardLogger()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	New(database, nil, discardLogger()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
@@ -58,6 +61,127 @@ func TestReadinessHidesDatabaseError(t *testing.T) {
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Errorf("Cache-Control = %q", response.Header().Get("Cache-Control"))
 	}
+}
+
+func TestActivationPassesBoundedRequestToService(t *testing.T) {
+	activations := &fakeActivationService{response: activation.Response{
+		Status: http.StatusCreated,
+		Body:   []byte(`{"activation_token":"gea_token","entitlement":"signed"}`),
+	}}
+	request := activationHTTPRequest(`{"license_key":"GEQ1-KEY","installation_id":"4E70638A-A75B-4BFB-B4B0-15E959A91465"}`)
+	request.Header.Set("X-Forwarded-For", "203.0.113.8, 198.51.100.4")
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusCreated)
+	}
+	if response.Body.String() != `{"activation_token":"gea_token","entitlement":"signed"}` {
+		t.Errorf("body = %q", response.Body.String())
+	}
+	if activations.calls != 1 {
+		t.Fatalf("activation calls = %d, want 1", activations.calls)
+	}
+	if activations.input.ClientIP != "198.51.100.4" {
+		t.Errorf("client IP = %q", activations.input.ClientIP)
+	}
+	if !strings.HasPrefix(activations.input.RequestID, "req_") {
+		t.Errorf("request ID = %q", activations.input.RequestID)
+	}
+}
+
+func TestActivationRejectsInvalidHTTPRequests(t *testing.T) {
+	largeBody := `{"license_key":"` + strings.Repeat("A", maximumBodySize) + `","installation_id":"id"}`
+	tests := []struct {
+		name   string
+		body   string
+		mutate func(*http.Request)
+	}{
+		{name: "missing content type", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Content-Type") }},
+		{name: "missing idempotency key", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Idempotency-Key") }},
+		{name: "duplicate idempotency key", body: `{}`, mutate: func(request *http.Request) { request.Header.Add("Idempotency-Key", "second") }},
+		{name: "unknown field", body: `{"license_key":"key","installation_id":"id","extra":true}`},
+		{name: "trailing JSON", body: `{} {}`},
+		{name: "oversized", body: largeBody},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			activations := &fakeActivationService{}
+			request := activationHTTPRequest(test.body)
+			if test.mutate != nil {
+				test.mutate(request)
+			}
+			response := httptest.NewRecorder()
+
+			New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+			}
+			if !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+				t.Errorf("body = %q", response.Body.String())
+			}
+			if activations.calls != 0 {
+				t.Errorf("activation calls = %d, want 0", activations.calls)
+			}
+		})
+	}
+}
+
+func TestActivationHidesServiceErrorAndCredentials(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	activations := &fakeActivationService{err: errors.New("database unavailable")}
+	request := activationHTTPRequest(`{"license_key":"GEQ1-SECRET","installation_id":"4E70638A-A75B-4BFB-B4B0-15E959A91465"}`)
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, logger).ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(response.Body.String(), `"code":"temporarily_unavailable"`) {
+		t.Errorf("body = %q", response.Body.String())
+	}
+	if strings.Contains(logs.String(), "GEQ1-SECRET") {
+		t.Fatalf("log disclosed license key: %s", logs.String())
+	}
+}
+
+func TestActivationWritesRetryAfter(t *testing.T) {
+	activations := &fakeActivationService{response: activation.Response{
+		Status:            http.StatusTooManyRequests,
+		Body:              []byte(`{"error":{"code":"rate_limited"}}`),
+		RetryAfterSeconds: 42,
+	}}
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, activationHTTPRequest(`{}`))
+
+	if response.Header().Get("Retry-After") != "42" {
+		t.Errorf("Retry-After = %q, want 42", response.Header().Get("Retry-After"))
+	}
+}
+
+func activationHTTPRequest(body string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/v1/activations", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "2b1bc1ba-407a-49f2-ad2e-a260a56bcf23")
+	return request
+}
+
+type fakeActivationService struct {
+	response activation.Response
+	err      error
+	input    activation.Input
+	calls    int
+}
+
+func (f *fakeActivationService) Activate(_ context.Context, input activation.Input) (activation.Response, error) {
+	f.calls++
+	f.input = input
+	return f.response, f.err
 }
 
 type fakeDatabase struct {
