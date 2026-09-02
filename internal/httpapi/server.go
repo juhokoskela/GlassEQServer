@@ -38,7 +38,7 @@ type activationService interface {
 	ListManagedActivations(context.Context, string) (activation.Response, error)
 	DeactivateManaged(context.Context, activation.ManagedDeactivationInput) (activation.Response, error)
 	RotateLicenseKey(context.Context, activation.LicenseKeyRotationInput) (activation.Response, error)
-	ExchangeRecoveryToken(context.Context, string) (activation.Response, error)
+	ExchangeRecoveryToken(context.Context, activation.RecoverySessionInput) (activation.Response, error)
 }
 
 type api struct {

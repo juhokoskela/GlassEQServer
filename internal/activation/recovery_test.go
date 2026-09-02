@@ -1,7 +1,9 @@
 package activation
 
 import (
+	"context"
 	"encoding/base64"
+	"net/http"
 	"testing"
 )
 
@@ -27,4 +29,16 @@ func TestRecoveryTokenHash(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRecoveryTokenExchangeRejectsInvalidIdempotencyKey(t *testing.T) {
+	validToken := recoveryTokenPrefix + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	response, err := (&Service{}).ExchangeRecoveryToken(context.Background(), RecoverySessionInput{
+		RecoveryToken:  validToken,
+		IdempotencyKey: "not-a-uuid",
+	})
+	if err != nil {
+		t.Fatalf("exchange recovery token: %v", err)
+	}
+	assertErrorCode(t, response, http.StatusBadRequest, "invalid_request")
 }

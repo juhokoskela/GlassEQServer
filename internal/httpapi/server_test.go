@@ -296,7 +296,7 @@ type fakeActivationService struct {
 	managementToken     string
 	managedDeactivation activation.ManagedDeactivationInput
 	rotationInput       activation.LicenseKeyRotationInput
-	recoveryToken       string
+	recoveryInput       activation.RecoverySessionInput
 	calls               int
 	deadlineRemaining   time.Duration
 }
