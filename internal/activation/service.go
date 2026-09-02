@@ -42,7 +42,7 @@ type entitlementIssuer interface {
 type Service struct {
 	database         *sql.DB
 	issuer           entitlementIssuer
-	responses        *responseCipher
+	responses        *secretCipher
 	rateLimitHMACKey []byte
 	random           io.Reader
 	now              func() time.Time
@@ -70,7 +70,7 @@ func NewService(database *sql.DB, issuer entitlementIssuer, idempotencyKey, rate
 	if issuer == nil {
 		return nil, errors.New("entitlement issuer is required")
 	}
-	responses, err := newResponseCipher(idempotencyKey, rand.Reader)
+	responses, err := newSecretCipher(idempotencyKey, rand.Reader)
 	if err != nil {
 		return nil, err
 	}
