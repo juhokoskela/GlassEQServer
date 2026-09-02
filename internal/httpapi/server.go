@@ -32,6 +32,8 @@ type databasePinger interface {
 
 type activationService interface {
 	Activate(context.Context, activation.Input) (activation.Response, error)
+	RefreshEntitlement(context.Context, activation.RefreshInput) (activation.Response, error)
+	DeactivateCurrent(context.Context, string) (activation.Response, error)
 }
 
 type api struct {
@@ -46,6 +48,8 @@ func New(database databasePinger, activations activationService, logger *slog.Lo
 	mux.HandleFunc("GET /healthz", api.health)
 	mux.HandleFunc("GET /readyz", api.ready)
 	mux.HandleFunc("POST /v1/activations", api.activate)
+	mux.HandleFunc("POST /v1/entitlements/refresh", api.refreshEntitlement)
+	mux.HandleFunc("DELETE /v1/activations/current", api.deactivateCurrent)
 	return mux
 }
 
@@ -86,14 +90,7 @@ func (a *api) activate(w http.ResponseWriter, request *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
 		return
 	}
-	if response.RetryAfterSeconds > 0 {
-		w.Header().Set("Retry-After", strconv.Itoa(response.RetryAfterSeconds))
-	}
-	if response.ErrorCode != "" {
-		writeError(w, response.Status, response.ErrorCode, response.ErrorMessage, requestID)
-		return
-	}
-	writeRawJSON(w, response.Status, response.Body)
+	writeServiceResponse(w, response, requestID)
 }
 
 func decodeActivationRequest(w http.ResponseWriter, request *http.Request) (activationRequest, int) {
@@ -107,21 +104,105 @@ func decodeActivationRequest(w http.ResponseWriter, request *http.Request) (acti
 	}
 
 	var body activationRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, request.Body, maximumBodySize))
-	decoder.DisallowUnknownFields()
-	err = decoder.Decode(&body)
-	if err == nil {
-		err = rejectTrailingJSON(decoder)
-	}
-	if err != nil {
-		var maximumBytesError *http.MaxBytesError
-		if errors.As(err, &maximumBytesError) {
-			return activationRequest{}, http.StatusRequestEntityTooLarge
-		}
-		return activationRequest{}, http.StatusBadRequest
+	if status := decodeJSONBody(w, request, &body); status != 0 {
+		return activationRequest{}, status
 	}
 	body.IdempotencyKey = idempotencyHeaders[0]
 	return body, 0
+}
+
+func (a *api) refreshEntitlement(w http.ResponseWriter, request *http.Request) {
+	requestID, err := randomRequestID()
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "generate request ID", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", "")
+		return
+	}
+
+	token, ok := bearerCredential(request)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "The activation token is invalid.", requestID)
+		return
+	}
+	var body refreshRequest
+	if status := decodeJSONRequest(w, request, &body); status != 0 {
+		writeError(w, status, "invalid_request", "The entitlement refresh request is invalid.", requestID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), activationTimeout)
+	defer cancel()
+	response, err := a.activations.RefreshEntitlement(ctx, activation.RefreshInput{
+		ActivationToken: token,
+		InstallationID:  body.InstallationID,
+	})
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "refresh entitlement", "request_id", requestID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
+		return
+	}
+	writeServiceResponse(w, response, requestID)
+}
+
+func (a *api) deactivateCurrent(w http.ResponseWriter, request *http.Request) {
+	requestID, err := randomRequestID()
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "generate request ID", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", "")
+		return
+	}
+
+	token, ok := bearerCredential(request)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "The activation token is invalid.", requestID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), activationTimeout)
+	defer cancel()
+	response, err := a.activations.DeactivateCurrent(ctx, token)
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "deactivate current activation", "request_id", requestID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
+		return
+	}
+	writeServiceResponse(w, response, requestID)
+}
+
+func decodeJSONRequest(w http.ResponseWriter, request *http.Request, destination any) int {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return http.StatusUnsupportedMediaType
+	}
+	return decodeJSONBody(w, request, destination)
+}
+
+func decodeJSONBody(w http.ResponseWriter, request *http.Request, destination any) int {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, request.Body, maximumBodySize))
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(destination)
+	if err == nil {
+		err = rejectTrailingJSON(decoder)
+	}
+	if err == nil {
+		return 0
+	}
+	var maximumBytesError *http.MaxBytesError
+	if errors.As(err, &maximumBytesError) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
+func bearerCredential(request *http.Request) (string, bool) {
+	values := request.Header.Values("Authorization")
+	if len(values) != 1 {
+		return "", false
+	}
+	scheme, credential, found := strings.Cut(values[0], " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") || credential == "" || strings.ContainsAny(credential, " \t") {
+		return "", false
+	}
+	return credential, true
 }
 
 func rejectTrailingJSON(decoder *json.Decoder) error {
@@ -171,6 +252,10 @@ type activationRequest struct {
 	IdempotencyKey string `json:"-"`
 }
 
+type refreshRequest struct {
+	InstallationID string `json:"installation_id"`
+}
+
 func (a *api) ready(w http.ResponseWriter, request *http.Request) {
 	ctx, cancel := context.WithTimeout(request.Context(), readinessTimeout)
 	defer cancel()
@@ -199,6 +284,23 @@ func writeError(w http.ResponseWriter, status int, code, message, requestID stri
 	writeJSON(w, status, errorEnvelope{Error: errorResponse{
 		Code: code, Message: message, Retryable: status == http.StatusTooManyRequests || status >= 500, RequestID: requestID,
 	}})
+}
+
+func writeServiceResponse(w http.ResponseWriter, response activation.Response, requestID string) {
+	if response.RetryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(response.RetryAfterSeconds))
+	}
+	if response.ErrorCode != "" {
+		writeError(w, response.Status, response.ErrorCode, response.ErrorMessage, requestID)
+		return
+	}
+	if response.Status == http.StatusNoContent {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(response.Status)
+		return
+	}
+	writeRawJSON(w, response.Status, response.Body)
 }
 
 func writeRawJSON(w http.ResponseWriter, status int, body []byte) {
