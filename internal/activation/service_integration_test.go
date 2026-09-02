@@ -375,6 +375,41 @@ func seedPerpetualLicense(t *testing.T, database *sql.DB, licenseID, licenseKey 
 	}
 }
 
+func seedMonthlyLicense(t *testing.T, database *sql.DB, licenseID, licenseKey string, recoveryUntil time.Time) {
+	t.Helper()
+	now := time.Now().UTC()
+	credential, valid := normalizeLicenseKey(licenseKey)
+	if !valid {
+		t.Fatalf("test license key %q is invalid", licenseKey)
+	}
+	credentialHash := sha256.Sum256([]byte(credential))
+	lookupHash := sha256.Sum256([]byte("test@example.com"))
+	_, err := database.ExecContext(context.Background(), `
+		INSERT INTO licenses (
+		    id, plan, state, policy_version, recovery_email_ciphertext,
+		    recovery_email_lookup, created_at, updated_at
+		) VALUES ($1, 'monthly', 'active', 'v1', $2, $3, $4, $4)`,
+		licenseID, []byte("encrypted"), lookupHash[:], now)
+	if err != nil {
+		t.Fatalf("seed monthly license: %v", err)
+	}
+	_, err = database.ExecContext(context.Background(), `
+		INSERT INTO subscriptions (
+		    license_id, state, billing_period_end, recovery_until,
+		    last_reconciled_at, updated_at
+		) VALUES ($1, 'active', $2, $3, $4, $4)`,
+		licenseID, recoveryUntil.Add(-14*24*time.Hour), recoveryUntil, now)
+	if err != nil {
+		t.Fatalf("seed monthly subscription: %v", err)
+	}
+	_, err = database.ExecContext(context.Background(), `
+		INSERT INTO license_keys (id, license_id, secret_hash, state, created_at)
+		VALUES ($1, $2, $3, 'active', $4)`, "key_"+licenseID, licenseID, credentialHash[:], now)
+	if err != nil {
+		t.Fatalf("seed monthly license key: %v", err)
+	}
+}
+
 func newTestService(t *testing.T, database *sql.DB, issuer entitlementIssuer) *Service {
 	t.Helper()
 	service, err := NewService(database, issuer, make([]byte, 32), bytesOf(1, 32))
@@ -460,9 +495,11 @@ func decodeSuccess(t *testing.T, response Response) successBody {
 }
 
 type entitlementClaims struct {
-	Plan           string `json:"plan"`
-	InstallationID string `json:"installation_id"`
-	Revision       int64  `json:"revision"`
+	Plan             string `json:"plan"`
+	InstallationID   string `json:"installation_id"`
+	Revision         int64  `json:"revision"`
+	BillingPeriodEnd int64  `json:"billing_period_end"`
+	ExpiresAt        int64  `json:"exp"`
 }
 
 func decodeClaims(t *testing.T, compactJWS string) entitlementClaims {

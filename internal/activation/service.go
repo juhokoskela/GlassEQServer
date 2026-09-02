@@ -249,11 +249,8 @@ type preparedInput struct {
 func prepare(input Input) (preparedInput, string) {
 	normalizedKey, credentialValid := normalizeLicenseKey(input.LicenseKey)
 	credentialHash := sha256.Sum256([]byte(normalizedKey))
-	if len(input.InstallationID) != 36 {
-		return preparedInput{}, "invalid_request"
-	}
-	installationID, err := uuid.Parse(input.InstallationID)
-	if err != nil {
+	installationID, installationHash, valid := canonicalInstallation(input.InstallationID)
+	if !valid {
 		return preparedInput{}, "invalid_request"
 	}
 	if len(input.IdempotencyKey) != 36 {
@@ -267,15 +264,26 @@ func prepare(input Input) (preparedInput, string) {
 		return preparedInput{}, "invalid_request"
 	}
 
-	canonicalInstallationID := strings.ToUpper(installationID.String())
 	return preparedInput{
 		credentialHash:   credentialHash,
 		credentialValid:  credentialValid,
-		installationID:   canonicalInstallationID,
-		installationHash: sha256.Sum256([]byte(canonicalInstallationID)),
+		installationID:   installationID,
+		installationHash: installationHash,
 		idempotencyKey:   idempotencyKey.String(),
 		clientIP:         input.ClientIP.Unmap(),
 	}, ""
+}
+
+func canonicalInstallation(value string) (string, [sha256.Size]byte, bool) {
+	if len(value) != 36 {
+		return "", [sha256.Size]byte{}, false
+	}
+	identifier, err := uuid.Parse(value)
+	if err != nil {
+		return "", [sha256.Size]byte{}, false
+	}
+	canonical := strings.ToUpper(identifier.String())
+	return canonical, sha256.Sum256([]byte(canonical)), true
 }
 
 func normalizeLicenseKey(value string) (string, bool) {

@@ -2,12 +2,36 @@ package activation
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/juhokoskela/GlassEQServer/internal/entitlement"
 )
+
+func TestActivationTokenHash(t *testing.T) {
+	validToken := activationTokenPrefix + base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	tests := []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{name: "valid", value: validToken, valid: true},
+		{name: "wrong prefix", value: "gem_" + validToken[len(activationTokenPrefix):]},
+		{name: "short secret", value: activationTokenPrefix + base64.RawURLEncoding.EncodeToString(make([]byte, 31))},
+		{name: "padded", value: validToken + "="},
+		{name: "invalid base64", value: activationTokenPrefix + "!"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, valid := activationTokenHash(test.value)
+			if valid != test.valid {
+				t.Errorf("activationTokenHash(%q) valid = %t, want %t", test.value, valid, test.valid)
+			}
+		})
+	}
+}
 
 func TestNormalizeLicenseKey(t *testing.T) {
 	tests := []struct {
