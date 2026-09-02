@@ -5,6 +5,10 @@ ALTER TABLE activation_rate_limits
     ADD CONSTRAINT activation_rate_limits_kind_check
         CHECK (kind IN ('ip', 'license_key', 'recovery_ip', 'recovery_email'));
 
+CREATE INDEX licenses_active_recovery_email_lookup
+    ON licenses (recovery_email_lookup)
+    WHERE state = 'active';
+
 CREATE TABLE recovery_email_outbox (
     id text PRIMARY KEY,
     license_id text NOT NULL REFERENCES licenses (id),
@@ -26,6 +30,7 @@ CREATE INDEX recovery_email_outbox_pending
 -- +goose Down
 
 DROP TABLE recovery_email_outbox;
+DROP INDEX licenses_active_recovery_email_lookup;
 
 DELETE FROM activation_rate_limits
 WHERE kind IN ('recovery_ip', 'recovery_email');
