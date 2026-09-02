@@ -183,6 +183,49 @@ func TestLicenseKeyRotationReturnsWhenLicenseIsBusyWithPostgreSQL(t *testing.T) 
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'license_key_rotation'", nil, 0)
 }
 
+func TestLicenseKeyRotationLocksManagementSessionAgainstCleanupWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_rotation_session_lock", testLicenseKey)
+	service := newTestService(t, database, localIssuer(t))
+	session := decodeManagementSession(t, createManagementSession(t, service, testLicenseKey))
+	tokenHash, valid := managementTokenHash(session.ManagementToken)
+	if !valid {
+		t.Fatal("generated management token is invalid")
+	}
+
+	tx, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin rotation transaction: %v", err)
+	}
+	t.Cleanup(func() { tx.Rollback() })
+
+	expiresAt := time.Unix(session.ExpiresAt, 0).UTC()
+	if _, found, err := lockManagementLicense(
+		context.Background(),
+		tx,
+		tokenHash,
+		expiresAt.Add(-time.Second),
+	); err != nil {
+		t.Fatalf("lock management session: %v", err)
+	} else if !found {
+		t.Fatal("management session was not found")
+	}
+
+	if _, err := service.CleanupExpired(context.Background(), expiresAt); err != nil {
+		t.Fatalf("clean expired records during rotation: %v", err)
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE token_hash = $1", tokenHash[:], 1)
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("roll back rotation transaction: %v", err)
+	}
+	if _, err := service.CleanupExpired(context.Background(), expiresAt); err != nil {
+		t.Fatalf("clean expired records after rotation: %v", err)
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE token_hash = $1", tokenHash[:], 0)
+}
+
 func rotateLicenseKey(t *testing.T, service *Service, input LicenseKeyRotationInput) Response {
 	t.Helper()
 	response, err := service.RotateLicenseKey(context.Background(), input)

@@ -155,7 +155,7 @@ func lockManagementLicense(ctx context.Context, tx *sql.Tx, tokenHash [sha256.Si
 		FROM access_tokens AS token
 		JOIN licenses AS license ON license.id = token.license_id
 		WHERE token.token_hash = $1 AND token.purpose = 'management' AND token.expires_at > $2
-		FOR NO KEY UPDATE OF license NOWAIT`, tokenHash[:], now).Scan(&licenseID)
+		FOR NO KEY UPDATE OF token, license NOWAIT`, tokenHash[:], now).Scan(&licenseID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
