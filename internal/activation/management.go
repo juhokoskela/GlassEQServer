@@ -1,0 +1,202 @@
+package activation
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/netip"
+	"time"
+)
+
+const (
+	managementTokenPrefix   = "gem_"
+	managementTokenLifetime = 15 * time.Minute
+)
+
+type ManagementSessionInput struct {
+	LicenseKey string
+	ClientIP   netip.Addr
+}
+
+type ManagedDeactivationInput struct {
+	ManagementToken string
+	ActivationID    string
+}
+
+func (s *Service) CreateManagementSession(ctx context.Context, input ManagementSessionInput) (Response, error) {
+	normalizedKey, credentialValid := normalizeLicenseKey(input.LicenseKey)
+	credentialHash := sha256.Sum256([]byte(normalizedKey))
+	if !input.ClientIP.IsValid() {
+		return responseError(http.StatusBadRequest, "invalid_request", "The management session request is invalid."), nil
+	}
+
+	now := s.now().UTC().Truncate(time.Microsecond)
+	retryAfter, err := s.consumeRateLimits(ctx, credentialHash, input.ClientIP.Unmap(), now)
+	if err != nil {
+		return Response{}, err
+	}
+	if retryAfter > 0 {
+		response := responseError(http.StatusTooManyRequests, "rate_limited", "Too many management session attempts. Try again later.")
+		response.RetryAfterSeconds = retryAfter
+		return response, nil
+	}
+	if !credentialValid {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
+	}
+
+	token, err := randomValue(s.random, managementTokenPrefix, 32)
+	if err != nil {
+		return Response{}, fmt.Errorf("generate management token: %w", err)
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	expiresAt := now.Add(managementTokenLifetime)
+	body, err := json.Marshal(managementSessionBody{ManagementToken: token, ExpiresAt: expiresAt.Unix()})
+	if err != nil {
+		return Response{}, fmt.Errorf("encode management session response: %w", err)
+	}
+	result, err := s.database.ExecContext(ctx, `
+		INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
+		SELECT $1, license_id, 'management', $3, $4
+		FROM license_keys
+		WHERE secret_hash = $2 AND state = 'active'`, tokenHash[:], credentialHash[:], now, expiresAt)
+	if err != nil {
+		return Response{}, fmt.Errorf("save management session: %w", err)
+	}
+	created, err := result.RowsAffected()
+	if err != nil {
+		return Response{}, fmt.Errorf("read management session result: %w", err)
+	}
+	if created == 0 {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
+	}
+	return Response{Status: http.StatusCreated, Body: body}, nil
+}
+
+func (s *Service) ListManagedActivations(ctx context.Context, managementToken string) (Response, error) {
+	tokenHash, valid := managementTokenHash(managementToken)
+	if !valid {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The management token is invalid."), nil
+	}
+	now := s.now().UTC().Truncate(time.Microsecond)
+	licenseID, found, err := findManagementLicenseID(ctx, s.database, tokenHash, now)
+	if err != nil {
+		return Response{}, err
+	}
+	if !found {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The management token is invalid."), nil
+	}
+
+	rows, err := s.database.QueryContext(ctx, `
+		SELECT id, activated_at, last_refreshed_at
+		FROM activations
+		WHERE license_id = $1 AND state = 'active'
+		ORDER BY activated_at, id`, licenseID)
+	if err != nil {
+		return Response{}, fmt.Errorf("list managed activations: %w", err)
+	}
+	defer rows.Close()
+
+	activations := make([]managedActivation, 0, maximumActivations)
+	for rows.Next() {
+		var id string
+		var activatedAt, lastRefreshedAt time.Time
+		if err := rows.Scan(&id, &activatedAt, &lastRefreshedAt); err != nil {
+			return Response{}, fmt.Errorf("scan managed activation: %w", err)
+		}
+		activations = append(activations, managedActivation{
+			ID:              id,
+			ActivatedAt:     activatedAt.Unix(),
+			LastRefreshedAt: lastRefreshedAt.Unix(),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return Response{}, fmt.Errorf("list managed activations: %w", err)
+	}
+	body, err := json.Marshal(managedActivationsBody{Activations: activations})
+	if err != nil {
+		return Response{}, fmt.Errorf("encode managed activations response: %w", err)
+	}
+	return Response{Status: http.StatusOK, Body: body}, nil
+}
+
+func (s *Service) DeactivateManaged(ctx context.Context, input ManagedDeactivationInput) (Response, error) {
+	tokenHash, valid := managementTokenHash(input.ManagementToken)
+	if !valid {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The management token is invalid."), nil
+	}
+	if !activationIDValid(input.ActivationID) {
+		return responseError(http.StatusBadRequest, "invalid_request", "The managed deactivation request is invalid."), nil
+	}
+
+	now := s.now().UTC().Truncate(time.Microsecond)
+	licenseID, found, err := findManagementLicenseID(ctx, s.database, tokenHash, now)
+	if err != nil {
+		return Response{}, err
+	}
+	if !found {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The management token is invalid."), nil
+	}
+	_, err = s.database.ExecContext(ctx, `
+		WITH target AS (
+			SELECT id
+			FROM activations
+			WHERE id = $1 AND license_id = $2 AND state = 'active'
+			FOR UPDATE NOWAIT
+		)
+		UPDATE activations AS activation
+		SET state = 'deactivated', deactivated_at = $3
+		FROM target
+		WHERE activation.id = target.id`, input.ActivationID, licenseID, now)
+	var databaseError interface{ SQLState() string }
+	if errors.As(err, &databaseError) && databaseError.SQLState() == "55P03" {
+		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
+		response.RetryAfterSeconds = 1
+		return response, nil
+	}
+	if err != nil {
+		return Response{}, fmt.Errorf("deactivate managed activation: %w", err)
+	}
+	return Response{Status: http.StatusNoContent}, nil
+}
+
+func managementTokenHash(value string) ([sha256.Size]byte, bool) {
+	return randomValueHash(value, managementTokenPrefix, 32)
+}
+
+func activationIDValid(value string) bool {
+	return randomValueValid(value, "act_", 16)
+}
+
+func findManagementLicenseID(ctx context.Context, database rowQuerier, tokenHash [sha256.Size]byte, now time.Time) (string, bool, error) {
+	var licenseID string
+	err := database.QueryRowContext(ctx, `
+		SELECT license_id
+		FROM access_tokens
+		WHERE token_hash = $1 AND purpose = 'management' AND expires_at > $2`, tokenHash[:], now).Scan(&licenseID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("find management session: %w", err)
+	}
+	return licenseID, true, nil
+}
+
+type managementSessionBody struct {
+	ManagementToken string `json:"management_token"`
+	ExpiresAt       int64  `json:"expires_at"`
+}
+
+type managedActivationsBody struct {
+	Activations []managedActivation `json:"activations"`
+}
+
+type managedActivation struct {
+	ID              string `json:"id"`
+	ActivatedAt     int64  `json:"activated_at"`
+	LastRefreshedAt int64  `json:"last_refreshed_at"`
+}

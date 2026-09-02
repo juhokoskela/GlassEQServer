@@ -5,13 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/juhokoskela/GlassEQServer/internal/entitlement"
@@ -178,15 +176,7 @@ func (s *Service) DeactivateCurrent(ctx context.Context, activationToken string)
 }
 
 func activationTokenHash(value string) ([sha256.Size]byte, bool) {
-	if !strings.HasPrefix(value, activationTokenPrefix) {
-		return [sha256.Size]byte{}, false
-	}
-	encoded := strings.TrimPrefix(value, activationTokenPrefix)
-	secret, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || len(secret) != 32 || base64.RawURLEncoding.EncodeToString(secret) != encoded {
-		return [sha256.Size]byte{}, false
-	}
-	return sha256.Sum256([]byte(value)), true
+	return randomValueHash(value, activationTokenPrefix, 32)
 }
 
 type tokenActivationRecord struct {
@@ -238,7 +228,7 @@ func findLicenseByID(ctx context.Context, tx *sql.Tx, licenseID string) (license
 		FROM licenses AS l
 		LEFT JOIN subscriptions AS s ON s.license_id = l.id
 		WHERE l.id = $1
-		FOR UPDATE OF l`, licenseID).Scan(
+		FOR NO KEY UPDATE OF l`, licenseID).Scan(
 		&license.id, &license.plan, &license.state, &license.subscriptionState,
 		&license.billingPeriodEnd, &license.recoveryUntil, &license.terminalAt,
 	)

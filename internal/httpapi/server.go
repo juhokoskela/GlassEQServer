@@ -34,6 +34,9 @@ type activationService interface {
 	Activate(context.Context, activation.Input) (activation.Response, error)
 	RefreshEntitlement(context.Context, activation.RefreshInput) (activation.Response, error)
 	DeactivateCurrent(context.Context, string) (activation.Response, error)
+	CreateManagementSession(context.Context, activation.ManagementSessionInput) (activation.Response, error)
+	ListManagedActivations(context.Context, string) (activation.Response, error)
+	DeactivateManaged(context.Context, activation.ManagedDeactivationInput) (activation.Response, error)
 }
 
 type api struct {
@@ -50,6 +53,9 @@ func New(database databasePinger, activations activationService, logger *slog.Lo
 	mux.HandleFunc("POST /v1/activations", api.activate)
 	mux.HandleFunc("POST /v1/entitlements/refresh", api.refreshEntitlement)
 	mux.HandleFunc("DELETE /v1/activations/current", api.deactivateCurrent)
+	mux.HandleFunc("POST /v1/management-sessions", api.createManagementSession)
+	mux.HandleFunc("GET /v1/management/activations", api.listManagedActivations)
+	mux.HandleFunc("DELETE /v1/management/activations/{activation_id}", api.deactivateManaged)
 	return mux
 }
 

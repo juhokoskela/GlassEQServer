@@ -105,7 +105,7 @@ func (s *Service) Activate(ctx context.Context, input Input) (Response, error) {
 		return replayed, nil
 	}
 
-	retryAfter, err := s.consumeRateLimits(ctx, prepared, now)
+	retryAfter, err := s.consumeRateLimits(ctx, prepared.credentialHash, prepared.clientIP, now)
 	if err != nil {
 		return Response{}, err
 	}
@@ -352,29 +352,29 @@ func (s *Service) loadIdempotency(ctx context.Context, database rowQuerier, inpu
 	return response, true, false, nil
 }
 
-func (s *Service) consumeRateLimits(ctx context.Context, input preparedInput, now time.Time) (int, error) {
+func (s *Service) consumeRateLimits(ctx context.Context, credentialHash [sha256.Size]byte, clientIP netip.Addr, now time.Time) (int, error) {
 	tx, err := s.database.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("begin activation rate limit: %w", err)
+		return 0, fmt.Errorf("begin credential rate limit: %w", err)
 	}
 	defer tx.Rollback()
 
 	windowStart := now.Truncate(rateLimitWindow)
-	ipHash := hmacSHA256(s.rateLimitHMACKey, input.clientIP.String())
+	ipHash := hmacSHA256(s.rateLimitHMACKey, clientIP.String())
 	ipAttempts, err := incrementRateLimit(ctx, tx, "ip", ipHash, windowStart)
 	if err != nil {
 		return 0, err
 	}
 	limited := ipAttempts > ipAttemptLimit
 	if !limited {
-		licenseAttempts, err := incrementRateLimit(ctx, tx, "license_key", input.credentialHash, windowStart)
+		licenseAttempts, err := incrementRateLimit(ctx, tx, "license_key", credentialHash, windowStart)
 		if err != nil {
 			return 0, err
 		}
 		limited = licenseAttempts > licenseKeyAttemptLimit
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit activation rate limit: %w", err)
+		return 0, fmt.Errorf("commit credential rate limit: %w", err)
 	}
 	if !limited {
 		return 0, nil
@@ -392,7 +392,7 @@ func incrementRateLimit(ctx context.Context, tx *sql.Tx, kind string, subjectHas
 		DO UPDATE SET attempts = activation_rate_limits.attempts + 1
 		RETURNING attempts`, kind, subjectHash[:], windowStart).Scan(&attempts)
 	if err != nil {
-		return 0, fmt.Errorf("update activation %s rate limit: %w", kind, err)
+		return 0, fmt.Errorf("update credential %s rate limit: %w", kind, err)
 	}
 	return attempts, nil
 }
@@ -423,7 +423,7 @@ func findLicense(ctx context.Context, tx *sql.Tx, credentialHash [sha256.Size]by
 		JOIN licenses AS l ON l.id = k.license_id
 		LEFT JOIN subscriptions AS s ON s.license_id = l.id
 		WHERE k.secret_hash = $1 AND k.state = 'active'
-		FOR UPDATE OF l`, credentialHash[:]).Scan(
+		FOR NO KEY UPDATE OF l`, credentialHash[:]).Scan(
 		&license.id, &license.plan, &license.state, &license.subscriptionState,
 		&license.billingPeriodEnd, &license.recoveryUntil, &license.terminalAt,
 	)
@@ -550,6 +550,23 @@ func randomValue(random io.Reader, prefix string, byteCount int) (string, error)
 		return "", err
 	}
 	return prefix + base64.RawURLEncoding.EncodeToString(value), nil
+}
+
+func randomValueHash(value, prefix string, byteCount int) ([sha256.Size]byte, bool) {
+	if !randomValueValid(value, prefix, byteCount) {
+		return [sha256.Size]byte{}, false
+	}
+	return sha256.Sum256([]byte(value)), true
+}
+
+func randomValueValid(value, prefix string, byteCount int) bool {
+	encodedLength := base64.RawURLEncoding.EncodedLen(byteCount)
+	if len(value) != len(prefix)+encodedLength || !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	encoded := value[len(prefix):]
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	return err == nil && len(decoded) == byteCount
 }
 
 func (s *Service) storeAndCommit(ctx context.Context, tx *sql.Tx, input preparedInput, response Response, now time.Time) (Response, error) {

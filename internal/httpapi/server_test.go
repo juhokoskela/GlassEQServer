@@ -287,39 +287,63 @@ func activationHTTPRequest(body string) *http.Request {
 }
 
 type fakeActivationService struct {
-	response          activation.Response
-	err               error
-	input             activation.Input
-	refreshInput      activation.RefreshInput
-	deactivationToken string
-	calls             int
-	deadlineRemaining time.Duration
+	response            activation.Response
+	err                 error
+	input               activation.Input
+	refreshInput        activation.RefreshInput
+	deactivationToken   string
+	managementInput     activation.ManagementSessionInput
+	managementToken     string
+	managedDeactivation activation.ManagedDeactivationInput
+	calls               int
+	deadlineRemaining   time.Duration
+}
+
+func (f *fakeActivationService) CreateManagementSession(ctx context.Context, input activation.ManagementSessionInput) (activation.Response, error) {
+	f.calls++
+	f.managementInput = input
+	f.recordDeadline(ctx)
+	return f.response, f.err
+}
+
+func (f *fakeActivationService) ListManagedActivations(ctx context.Context, token string) (activation.Response, error) {
+	f.calls++
+	f.managementToken = token
+	f.recordDeadline(ctx)
+	return f.response, f.err
+}
+
+func (f *fakeActivationService) DeactivateManaged(ctx context.Context, input activation.ManagedDeactivationInput) (activation.Response, error) {
+	f.calls++
+	f.managedDeactivation = input
+	f.recordDeadline(ctx)
+	return f.response, f.err
+}
+
+func (f *fakeActivationService) recordDeadline(ctx context.Context) {
+	if deadline, ok := ctx.Deadline(); ok {
+		f.deadlineRemaining = time.Until(deadline)
+	}
 }
 
 func (f *fakeActivationService) RefreshEntitlement(ctx context.Context, input activation.RefreshInput) (activation.Response, error) {
 	f.calls++
 	f.refreshInput = input
-	if deadline, ok := ctx.Deadline(); ok {
-		f.deadlineRemaining = time.Until(deadline)
-	}
+	f.recordDeadline(ctx)
 	return f.response, f.err
 }
 
 func (f *fakeActivationService) DeactivateCurrent(ctx context.Context, token string) (activation.Response, error) {
 	f.calls++
 	f.deactivationToken = token
-	if deadline, ok := ctx.Deadline(); ok {
-		f.deadlineRemaining = time.Until(deadline)
-	}
+	f.recordDeadline(ctx)
 	return f.response, f.err
 }
 
 func (f *fakeActivationService) Activate(ctx context.Context, input activation.Input) (activation.Response, error) {
 	f.calls++
 	f.input = input
-	if deadline, ok := ctx.Deadline(); ok {
-		f.deadlineRemaining = time.Until(deadline)
-	}
+	f.recordDeadline(ctx)
 	return f.response, f.err
 }
 
