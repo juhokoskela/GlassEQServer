@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, and license activation endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery, activation management, and download endpoints are not implemented yet.
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, and current-installation deactivation endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery, remote activation management, and download endpoints are not implemented yet.
 
 ## Trust boundaries
 
@@ -53,8 +53,12 @@ The service exposes:
 - `GET /healthz` for process liveness.
 - `GET /readyz` for PostgreSQL readiness.
 - `POST /v1/activations` for creating or restoring one of a license's two activation slots.
+- `POST /v1/entitlements/refresh` for replacing an activation's signed entitlement from current license state.
+- `DELETE /v1/activations/current` for releasing the calling activation's slot.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
+
+Refresh and deactivation authenticate with the activation token returned during activation. Deactivation retains the token hash so repeating that operation returns 204, while other uses of the deactivated token fail.
 
 ## Checks
 

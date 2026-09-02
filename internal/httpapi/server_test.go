@@ -170,6 +170,115 @@ func TestActivationWritesRetryAfter(t *testing.T) {
 	}
 }
 
+func TestEntitlementRefreshPassesBearerTokenAndDeadline(t *testing.T) {
+	activations := &fakeActivationService{response: activation.Response{
+		Status: http.StatusOK,
+		Body:   []byte(`{"entitlement":"signed"}`),
+	}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/entitlements/refresh", strings.NewReader(`{"installation_id":"4E70638A-A75B-4BFB-B4B0-15E959A91465"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer gea_token")
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if response.Body.String() != `{"entitlement":"signed"}` {
+		t.Errorf("body = %q", response.Body.String())
+	}
+	if activations.refreshInput.ActivationToken != "gea_token" || activations.refreshInput.InstallationID != testInstallationID {
+		t.Errorf("refresh input = %+v", activations.refreshInput)
+	}
+	if activations.deadlineRemaining <= 0 || activations.deadlineRemaining > activationTimeout {
+		t.Errorf("refresh deadline remaining = %s", activations.deadlineRemaining)
+	}
+}
+
+func TestEntitlementRefreshRejectsInvalidHTTPRequests(t *testing.T) {
+	largeBody := `{"installation_id":"` + strings.Repeat("A", maximumBodySize) + `"}`
+	tests := []struct {
+		name       string
+		body       string
+		mutate     func(*http.Request)
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "missing authorization", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Authorization") }, wantStatus: http.StatusUnauthorized, wantCode: "invalid_credentials"},
+		{name: "duplicate authorization", body: `{}`, mutate: func(request *http.Request) { request.Header.Add("Authorization", "Bearer second") }, wantStatus: http.StatusUnauthorized, wantCode: "invalid_credentials"},
+		{name: "malformed authorization", body: `{}`, mutate: func(request *http.Request) { request.Header.Set("Authorization", "Bearer  gea_token") }, wantStatus: http.StatusUnauthorized, wantCode: "invalid_credentials"},
+		{name: "missing content type", body: `{}`, mutate: func(request *http.Request) { request.Header.Del("Content-Type") }, wantStatus: http.StatusUnsupportedMediaType, wantCode: "invalid_request"},
+		{name: "unknown field", body: `{"installation_id":"id","extra":true}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
+		{name: "oversized", body: largeBody, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "invalid_request"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			activations := &fakeActivationService{}
+			request := httptest.NewRequest(http.MethodPost, "/v1/entitlements/refresh", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer gea_token")
+			if test.mutate != nil {
+				test.mutate(request)
+			}
+			response := httptest.NewRecorder()
+
+			New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if !strings.Contains(response.Body.String(), `"code":"`+test.wantCode+`"`) {
+				t.Errorf("body = %q", response.Body.String())
+			}
+			if activations.calls != 0 {
+				t.Errorf("activation calls = %d, want 0", activations.calls)
+			}
+		})
+	}
+}
+
+func TestDeactivateCurrentReturnsNoContent(t *testing.T) {
+	activations := &fakeActivationService{response: activation.Response{Status: http.StatusNoContent}}
+	request := httptest.NewRequest(http.MethodDelete, "/v1/activations/current", nil)
+	request.Header.Set("Authorization", "Bearer gea_token")
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, discardLogger()).ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	if response.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty", response.Body.String())
+	}
+	if activations.deactivationToken != "gea_token" {
+		t.Errorf("deactivation token = %q", activations.deactivationToken)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+}
+
+func TestEntitlementRefreshHidesServiceErrorAndToken(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	activations := &fakeActivationService{err: errors.New("database unavailable")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/entitlements/refresh", strings.NewReader(`{"installation_id":"id"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer gea_secret")
+	response := httptest.NewRecorder()
+
+	New(&fakeDatabase{}, activations, logger).ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(logs.String(), "gea_secret") {
+		t.Fatalf("log disclosed activation token: %s", logs.String())
+	}
+}
+
 func activationHTTPRequest(body string) *http.Request {
 	request := httptest.NewRequest(http.MethodPost, "/v1/activations", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -181,8 +290,28 @@ type fakeActivationService struct {
 	response          activation.Response
 	err               error
 	input             activation.Input
+	refreshInput      activation.RefreshInput
+	deactivationToken string
 	calls             int
 	deadlineRemaining time.Duration
+}
+
+func (f *fakeActivationService) RefreshEntitlement(ctx context.Context, input activation.RefreshInput) (activation.Response, error) {
+	f.calls++
+	f.refreshInput = input
+	if deadline, ok := ctx.Deadline(); ok {
+		f.deadlineRemaining = time.Until(deadline)
+	}
+	return f.response, f.err
+}
+
+func (f *fakeActivationService) DeactivateCurrent(ctx context.Context, token string) (activation.Response, error) {
+	f.calls++
+	f.deactivationToken = token
+	if deadline, ok := ctx.Deadline(); ok {
+		f.deadlineRemaining = time.Until(deadline)
+	}
+	return f.response, f.err
 }
 
 func (f *fakeActivationService) Activate(ctx context.Context, input activation.Input) (activation.Response, error) {
@@ -211,3 +340,5 @@ func (f *fakeDatabase) PingContext(ctx context.Context) error {
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+const testInstallationID = "4E70638A-A75B-4BFB-B4B0-15E959A91465"
