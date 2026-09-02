@@ -48,46 +48,30 @@ func (s *Service) CreateManagementSession(ctx context.Context, input ManagementS
 		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
 	}
 
-	tx, err := s.database.BeginTx(ctx, nil)
-	if err != nil {
-		return Response{}, fmt.Errorf("begin management session: %w", err)
-	}
-	defer tx.Rollback()
-
-	locked, err := tryLockCredential(ctx, tx, credentialHash)
-	if err != nil {
-		return Response{}, err
-	}
-	if !locked {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
-	}
-	license, found, err := findLicense(ctx, tx, credentialHash)
-	if err != nil {
-		return Response{}, err
-	}
-	if !found {
-		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
-	}
-
 	token, err := randomValue(s.random, managementTokenPrefix, 32)
 	if err != nil {
 		return Response{}, fmt.Errorf("generate management token: %w", err)
 	}
 	tokenHash := sha256.Sum256([]byte(token))
 	expiresAt := now.Add(managementTokenLifetime)
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
-		VALUES ($1, $2, 'management', $3, $4)`, tokenHash[:], license.id, now, expiresAt); err != nil {
-		return Response{}, fmt.Errorf("save management session: %w", err)
-	}
 	body, err := json.Marshal(managementSessionBody{ManagementToken: token, ExpiresAt: expiresAt.Unix()})
 	if err != nil {
 		return Response{}, fmt.Errorf("encode management session response: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return Response{}, fmt.Errorf("commit management session: %w", err)
+	result, err := s.database.ExecContext(ctx, `
+		INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
+		SELECT $1, license_id, 'management', $3, $4
+		FROM license_keys
+		WHERE secret_hash = $2 AND state = 'active'`, tokenHash[:], credentialHash[:], now, expiresAt)
+	if err != nil {
+		return Response{}, fmt.Errorf("save management session: %w", err)
+	}
+	created, err := result.RowsAffected()
+	if err != nil {
+		return Response{}, fmt.Errorf("read management session result: %w", err)
+	}
+	if created == 0 {
+		return responseError(http.StatusUnauthorized, "invalid_credentials", "The license key is invalid."), nil
 	}
 	return Response{Status: http.StatusCreated, Body: body}, nil
 }
@@ -149,47 +133,32 @@ func (s *Service) DeactivateManaged(ctx context.Context, input ManagedDeactivati
 	}
 
 	now := s.now().UTC().Truncate(time.Microsecond)
-	tx, err := s.database.BeginTx(ctx, nil)
-	if err != nil {
-		return Response{}, fmt.Errorf("begin managed deactivation: %w", err)
-	}
-	defer tx.Rollback()
-
-	locked, err := tryLockCredential(ctx, tx, tokenHash)
-	if err != nil {
-		return Response{}, err
-	}
-	if !locked {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
-	}
-	licenseID, found, err := findManagementLicenseID(ctx, tx, tokenHash, now)
+	licenseID, found, err := findManagementLicenseID(ctx, s.database, tokenHash, now)
 	if err != nil {
 		return Response{}, err
 	}
 	if !found {
 		return responseError(http.StatusUnauthorized, "invalid_credentials", "The management token is invalid."), nil
 	}
-	found, busy, err := lockManagedActivation(ctx, tx, licenseID, input.ActivationID)
-	if err != nil {
-		return Response{}, err
-	}
-	if busy {
+	_, err = s.database.ExecContext(ctx, `
+		WITH target AS (
+			SELECT id
+			FROM activations
+			WHERE id = $1 AND license_id = $2 AND state = 'active'
+			FOR UPDATE NOWAIT
+		)
+		UPDATE activations AS activation
+		SET state = 'deactivated', deactivated_at = $3
+		FROM target
+		WHERE activation.id = target.id`, input.ActivationID, licenseID, now)
+	var databaseError interface{ SQLState() string }
+	if errors.As(err, &databaseError) && databaseError.SQLState() == "55P03" {
 		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
 		response.RetryAfterSeconds = 1
 		return response, nil
 	}
-	if found {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE activations
-			SET state = 'deactivated', deactivated_at = COALESCE(deactivated_at, $1)
-			WHERE id = $2`, now, input.ActivationID); err != nil {
-			return Response{}, fmt.Errorf("deactivate managed activation: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return Response{}, fmt.Errorf("commit managed deactivation: %w", err)
+	if err != nil {
+		return Response{}, fmt.Errorf("deactivate managed activation: %w", err)
 	}
 	return Response{Status: http.StatusNoContent}, nil
 }
@@ -215,26 +184,6 @@ func findManagementLicenseID(ctx context.Context, database rowQuerier, tokenHash
 		return "", false, fmt.Errorf("find management session: %w", err)
 	}
 	return licenseID, true, nil
-}
-
-func lockManagedActivation(ctx context.Context, tx *sql.Tx, licenseID, activationID string) (bool, bool, error) {
-	var id string
-	err := tx.QueryRowContext(ctx, `
-		SELECT id
-		FROM activations
-		WHERE id = $1 AND license_id = $2
-		FOR UPDATE NOWAIT`, activationID, licenseID).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, false, nil
-	}
-	var databaseError interface{ SQLState() string }
-	if errors.As(err, &databaseError) && databaseError.SQLState() == "55P03" {
-		return false, true, nil
-	}
-	if err != nil {
-		return false, false, fmt.Errorf("lock managed activation: %w", err)
-	}
-	return true, false, nil
 }
 
 type managementSessionBody struct {

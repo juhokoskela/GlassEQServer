@@ -423,7 +423,7 @@ func findLicense(ctx context.Context, tx *sql.Tx, credentialHash [sha256.Size]by
 		JOIN licenses AS l ON l.id = k.license_id
 		LEFT JOIN subscriptions AS s ON s.license_id = l.id
 		WHERE k.secret_hash = $1 AND k.state = 'active'
-		FOR UPDATE OF l`, credentialHash[:]).Scan(
+		FOR NO KEY UPDATE OF l`, credentialHash[:]).Scan(
 		&license.id, &license.plan, &license.state, &license.subscriptionState,
 		&license.billingPeriodEnd, &license.recoveryUntil, &license.terminalAt,
 	)
@@ -560,12 +560,13 @@ func randomValueHash(value, prefix string, byteCount int) ([sha256.Size]byte, bo
 }
 
 func randomValueValid(value, prefix string, byteCount int) bool {
-	if !strings.HasPrefix(value, prefix) {
+	encodedLength := base64.RawURLEncoding.EncodedLen(byteCount)
+	if len(value) != len(prefix)+encodedLength || !strings.HasPrefix(value, prefix) {
 		return false
 	}
 	encoded := value[len(prefix):]
-	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
-	return err == nil && len(decoded) == byteCount && base64.RawURLEncoding.EncodeToString(decoded) == encoded
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+	return err == nil && len(decoded) == byteCount
 }
 
 func (s *Service) storeAndCommit(ctx context.Context, tx *sql.Tx, input preparedInput, response Response, now time.Time) (Response, error) {

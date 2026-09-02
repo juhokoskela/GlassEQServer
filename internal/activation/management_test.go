@@ -18,6 +18,7 @@ func TestManagementTokenHash(t *testing.T) {
 		{name: "activation token", value: activationTokenPrefix + validToken[len(managementTokenPrefix):]},
 		{name: "short secret", value: managementTokenPrefix + base64.RawURLEncoding.EncodeToString(make([]byte, 31))},
 		{name: "padded", value: validToken + "="},
+		{name: "non-zero trailing bits", value: validToken[:len(validToken)-1] + "B"},
 		{name: "invalid base64", value: managementTokenPrefix + "!"},
 	}
 	for _, test := range tests {

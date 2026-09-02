@@ -49,9 +49,13 @@ func TestManagementSessionListsActiveSlotsWithPostgreSQL(t *testing.T) {
 		if !wantIDs[activation.ID] {
 			t.Errorf("unexpected managed activation %q", activation.ID)
 		}
+		delete(wantIDs, activation.ID)
 		if activation.ActivatedAt != service.now().Unix() || activation.LastRefreshedAt != service.now().Unix() {
 			t.Errorf("managed activation times = %+v", activation)
 		}
+	}
+	if len(wantIDs) != 0 {
+		t.Errorf("missing managed activations: %v", wantIDs)
 	}
 
 	tokenHash := sha256.Sum256([]byte(sessionBody.ManagementToken))
@@ -68,6 +72,48 @@ func TestManagementSessionListsActiveSlotsWithPostgreSQL(t *testing.T) {
 		t.Errorf("deleted rows = %d, want 1", deleted)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens", nil, 0)
+}
+
+func TestManagementSessionDoesNotWaitForEntitlementSigningWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_management_signing", testLicenseKey)
+	service := newTestService(t, database, localIssuer(t))
+	activation := decodeSuccess(t, activate(t, service, testLicenseKey, testInstallA, "1635ae6c-4b5b-4a95-9eb2-695c79f5318b"))
+	issuer := &blockingIssuer{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	service.issuer = issuer
+	refreshContext, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	refreshResult := make(chan error, 1)
+	go func() {
+		_, err := service.RefreshEntitlement(refreshContext, RefreshInput{
+			ActivationToken: activation.ActivationToken,
+			InstallationID:  testInstallA,
+		})
+		refreshResult <- err
+	}()
+	select {
+	case <-issuer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("entitlement refresh did not reach signing")
+	}
+
+	sessionContext, cancelSession := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	session, sessionErr := service.CreateManagementSession(sessionContext, ManagementSessionInput{
+		LicenseKey: testLicenseKey,
+		ClientIP:   netip.MustParseAddr("192.0.2.42"),
+	})
+	cancelSession()
+	close(issuer.release)
+	if err := <-refreshResult; err != nil {
+		t.Fatalf("refresh entitlement: %v", err)
+	}
+	if sessionErr != nil {
+		t.Fatalf("create management session during signing: %v", sessionErr)
+	}
+	if session.Status != http.StatusCreated {
+		t.Errorf("management session status = %d, want %d: %s", session.Status, http.StatusCreated, session.Body)
+	}
 }
 
 func TestManagementSessionRateLimitWithPostgreSQL(t *testing.T) {
@@ -97,6 +143,7 @@ func TestManagedDeactivationIsIdempotentAndReleasesSlotWithPostgreSQL(t *testing
 	secondID := decodeClaims(t, second.Entitlement).ActivationID
 	session := decodeManagementSession(t, createManagementSession(t, service, testLicenseKey))
 
+	var firstTransactionID string
 	for attempt := range 2 {
 		response, err := service.DeactivateManaged(context.Background(), ManagedDeactivationInput{
 			ManagementToken: session.ManagementToken,
@@ -107,6 +154,15 @@ func TestManagedDeactivationIsIdempotentAndReleasesSlotWithPostgreSQL(t *testing
 		}
 		if response.Status != http.StatusNoContent {
 			t.Errorf("managed deactivation attempt %d status = %d, want %d", attempt+1, response.Status, http.StatusNoContent)
+		}
+		var transactionID string
+		if err := database.QueryRowContext(context.Background(), "SELECT xmin::text FROM activations WHERE id = $1", firstID).Scan(&transactionID); err != nil {
+			t.Fatalf("read deactivated row version: %v", err)
+		}
+		if attempt == 0 {
+			firstTransactionID = transactionID
+		} else if transactionID != firstTransactionID {
+			t.Errorf("repeated deactivation rewrote row: xmin changed from %s to %s", firstTransactionID, transactionID)
 		}
 	}
 

@@ -228,7 +228,7 @@ func findLicenseByID(ctx context.Context, tx *sql.Tx, licenseID string) (license
 		FROM licenses AS l
 		LEFT JOIN subscriptions AS s ON s.license_id = l.id
 		WHERE l.id = $1
-		FOR UPDATE OF l`, licenseID).Scan(
+		FOR NO KEY UPDATE OF l`, licenseID).Scan(
 		&license.id, &license.plan, &license.state, &license.subscriptionState,
 		&license.billingPeriodEnd, &license.recoveryUntil, &license.terminalAt,
 	)
