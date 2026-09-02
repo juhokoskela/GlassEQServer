@@ -15,6 +15,7 @@ import (
 
 const (
 	recoveryRequestScope      = "recovery_request"
+	recoveryRequestLifetime   = 30 * time.Minute
 	recoveryTokenLifetime     = 30 * time.Minute
 	recoveryEmailAttemptLimit = 3
 	recoveryIPAttemptLimit    = 20
@@ -41,7 +42,7 @@ type RecoveryEmailQueue interface {
 }
 
 func (s *Service) RequestRecovery(ctx context.Context, input RecoveryRequestInput) (Response, error) {
-	normalizedEmail, emailValid := normalizeRecoveryEmail(input.Email)
+	normalizedEmail, _ := normalizeRecoveryEmail(input.Email)
 	if !input.ClientIP.IsValid() {
 		return responseError(http.StatusBadRequest, "invalid_request", "The recovery request is invalid."), nil
 	}
@@ -87,72 +88,25 @@ func (s *Service) RequestRecovery(ctx context.Context, input RecoveryRequestInpu
 		return Response{}, err
 	}
 
-	var licenseIDs []string
-	if emailValid && !limited {
-		lookupHash := hmacSHA256(s.emailLookupHMACKey, normalizedEmail)
-		licenseIDs, err = findRecoveryLicenses(ctx, tx, lookupHash)
-		if err != nil {
-			return Response{}, err
-		}
-	}
-	for _, licenseID := range licenseIDs {
-		if err := s.createRecoveryDelivery(ctx, tx, licenseID, now); err != nil {
+	if !limited {
+		if err := s.enqueueRecoveryRequest(ctx, tx, normalizedEmail, now); err != nil {
 			return Response{}, err
 		}
 	}
 	return s.storeAndCommit(ctx, tx, idempotency, recoveryAcceptedResponse(), now)
 }
 
-func findRecoveryLicenses(ctx context.Context, tx *sql.Tx, lookupHash [sha256.Size]byte) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id
-		FROM licenses
-		WHERE recovery_email_lookup = $1 AND state = 'active'
-		ORDER BY id`, lookupHash[:])
+func (s *Service) enqueueRecoveryRequest(ctx context.Context, tx *sql.Tx, normalizedEmail string, now time.Time) error {
+	requestID, err := randomValue(s.random, "rrq_", 16)
 	if err != nil {
-		return nil, fmt.Errorf("find licenses for recovery: %w", err)
+		return fmt.Errorf("generate recovery request ID: %w", err)
 	}
-	defer rows.Close()
-	var licenseIDs []string
-	for rows.Next() {
-		var licenseID string
-		if err := rows.Scan(&licenseID); err != nil {
-			return nil, fmt.Errorf("scan license for recovery: %w", err)
-		}
-		licenseIDs = append(licenseIDs, licenseID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("find licenses for recovery: %w", err)
-	}
-	return licenseIDs, nil
-}
-
-func (s *Service) createRecoveryDelivery(ctx context.Context, tx *sql.Tx, licenseID string, now time.Time) error {
-	token, err := randomValue(s.random, recoveryTokenPrefix, 32)
-	if err != nil {
-		return fmt.Errorf("generate recovery token: %w", err)
-	}
-	deliveryID, err := randomValue(s.random, "red_", 16)
-	if err != nil {
-		return fmt.Errorf("generate recovery delivery ID: %w", err)
-	}
-	expiresAt := now.Add(recoveryTokenLifetime)
-	tokenCiphertext, err := s.databaseValues.seal([]byte(token), recoveryTokenAdditionalData(deliveryID, licenseID, expiresAt))
-	if err != nil {
-		return fmt.Errorf("encrypt recovery token: %w", err)
-	}
-	tokenHash := sha256.Sum256([]byte(token))
+	lookupHash := hmacSHA256(s.emailLookupHMACKey, normalizedEmail)
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
-		VALUES ($1, $2, 'recovery', $3, $4)`, tokenHash[:], licenseID, now, expiresAt); err != nil {
-		return fmt.Errorf("save recovery token: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO recovery_email_outbox (
-		    id, license_id, token_ciphertext, created_at, expires_at, next_attempt_at
-		) VALUES ($1, $2, $3, $4, $5, $4)`,
-		deliveryID, licenseID, tokenCiphertext, now, expiresAt); err != nil {
-		return fmt.Errorf("save recovery email: %w", err)
+		INSERT INTO recovery_request_jobs (id, email_lookup, created_at, expires_at)
+		VALUES ($1, $2, $3, $4)`,
+		requestID, lookupHash[:], now, now.Add(recoveryRequestLifetime)); err != nil {
+		return fmt.Errorf("save recovery request: %w", err)
 	}
 	return nil
 }
@@ -198,18 +152,4 @@ func normalizeRecoveryEmail(value string) (string, bool) {
 
 func recoveryAcceptedResponse() Response {
 	return Response{Status: http.StatusAccepted, Body: recoveryAcceptedBody}
-}
-
-func recoveryEmailAdditionalData(licenseID string) []byte {
-	return []byte("recovery-email\x00" + licenseID)
-}
-
-func recoveryTokenAdditionalData(deliveryID, licenseID string, expiresAt time.Time) []byte {
-	additionalData := make([]byte, 0, len(deliveryID)+len(licenseID)+32)
-	additionalData = append(additionalData, "recovery-token\x00"...)
-	additionalData = append(additionalData, deliveryID...)
-	additionalData = append(additionalData, 0)
-	additionalData = append(additionalData, licenseID...)
-	additionalData = append(additionalData, 0)
-	return binary.BigEndian.AppendUint64(additionalData, uint64(expiresAt.Unix()))
 }

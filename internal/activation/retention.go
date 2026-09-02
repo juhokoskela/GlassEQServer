@@ -78,6 +78,26 @@ func (s *Service) cleanupExpired(ctx context.Context, now time.Time, batchSize i
 		return idempotencyCount + rateLimitCount, fmt.Errorf("read deleted access-token count: %w", err)
 	}
 
+	requestResult, err := s.database.ExecContext(ctx, `
+		WITH expired AS (
+			SELECT id
+			FROM recovery_request_jobs
+			WHERE expires_at <= $1
+			ORDER BY expires_at
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM recovery_request_jobs AS jobs
+		USING expired
+		WHERE jobs.id = expired.id`, now, batchSize)
+	if err != nil {
+		return idempotencyCount + rateLimitCount + accessTokenCount, fmt.Errorf("delete expired recovery requests: %w", err)
+	}
+	requestCount, err := requestResult.RowsAffected()
+	if err != nil {
+		return idempotencyCount + rateLimitCount + accessTokenCount, fmt.Errorf("read deleted recovery-request count: %w", err)
+	}
+
 	outboxResult, err := s.database.ExecContext(ctx, `
 		WITH expired AS (
 			SELECT id
@@ -91,11 +111,11 @@ func (s *Service) cleanupExpired(ctx context.Context, now time.Time, batchSize i
 		USING expired
 		WHERE outbox.id = expired.id`, now, batchSize)
 	if err != nil {
-		return idempotencyCount + rateLimitCount + accessTokenCount, fmt.Errorf("delete expired recovery emails: %w", err)
+		return idempotencyCount + rateLimitCount + accessTokenCount + requestCount, fmt.Errorf("delete expired recovery emails: %w", err)
 	}
 	outboxCount, err := outboxResult.RowsAffected()
 	if err != nil {
-		return idempotencyCount + rateLimitCount + accessTokenCount, fmt.Errorf("read deleted recovery-email count: %w", err)
+		return idempotencyCount + rateLimitCount + accessTokenCount + requestCount, fmt.Errorf("read deleted recovery-email count: %w", err)
 	}
-	return idempotencyCount + rateLimitCount + accessTokenCount + outboxCount, nil
+	return idempotencyCount + rateLimitCount + accessTokenCount + requestCount + outboxCount, nil
 }

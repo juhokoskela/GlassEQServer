@@ -70,8 +70,9 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 		t.Fatalf("request recovery: %v", err)
 	}
 	assertRecoveryAccepted(t, response)
-	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 1)
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 0)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 
 	replay, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
 		Email:          testRecoveryEmail,
@@ -84,8 +85,12 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	if replay.Status != response.Status || string(replay.Body) != string(response.Body) {
 		t.Errorf("replay = (%d, %s), want (%d, %s)", replay.Status, replay.Body, response.Status, response.Body)
 	}
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
-	tokenCiphertext := recoveryTokenCiphertext(t, database)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
+	queue.onSend = func(message RecoveryEmail) {
+		if strings.Contains(string(recoveryTokenCiphertext(t, database)), message.RecoveryToken) {
+			t.Error("recovery outbox contains the plaintext token")
+		}
+	}
 
 	dispatched, err := service.DispatchRecoveryEmail(context.Background(), service.now())
 	if err != nil {
@@ -111,9 +116,6 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	if _, valid := recoveryTokenHash(message.RecoveryToken); !valid {
 		t.Errorf("queued recovery token is invalid: %q", message.RecoveryToken)
 	}
-	if strings.Contains(string(tokenCiphertext), message.RecoveryToken) {
-		t.Error("recovery outbox contains the plaintext token")
-	}
 
 	session, err := service.ExchangeRecoveryToken(context.Background(), RecoverySessionInput{
 		RecoveryToken:  message.RecoveryToken,
@@ -125,6 +127,7 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	if session.Status != http.StatusCreated {
 		t.Errorf("recovery session status = %d, want %d", session.Status, http.StatusCreated)
 	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 0)
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 
 	dispatched, err = service.DispatchRecoveryEmail(context.Background(), service.now())
@@ -139,7 +142,8 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 func TestRecoveryRequestDoesNotRevealUnknownEmailWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	service := newTestService(t, database, localIssuer(t))
+	queue := &recordingRecoveryEmailQueue{}
+	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
 	seedRecoverableLicense(t, service, "lic_recovery_private", testLicenseKey, testRecoveryEmail)
 
 	known, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
@@ -172,7 +176,46 @@ func TestRecoveryRequestDoesNotRevealUnknownEmailWithPostgreSQL(t *testing.T) {
 	if invalid.Status != known.Status || string(invalid.Body) != string(known.Body) {
 		t.Errorf("invalid response = (%d, %s), want (%d, %s)", invalid.Status, invalid.Body, known.Status, known.Body)
 	}
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 3)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 0)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
+	for range 3 {
+		if _, err := service.DispatchRecoveryEmail(context.Background(), service.now()); err != nil {
+			t.Fatalf("process recovery request: %v", err)
+		}
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 0)
+	if len(queue.snapshot()) != 1 {
+		t.Errorf("queued messages = %d, want 1", len(queue.snapshot()))
+	}
+}
+
+func TestRecoveryRequestDoesNotReadLicensesSynchronouslyWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	service := newTestService(t, database, localIssuer(t))
+	seedRecoverableLicense(t, service, "lic_recovery_async", testLicenseKey, testRecoveryEmail)
+	lock, err := database.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin license table lock: %v", err)
+	}
+	defer lock.Rollback()
+	if _, err := lock.ExecContext(context.Background(), "LOCK TABLE licenses IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatalf("lock licenses table: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	response, err := service.RequestRecovery(ctx, RecoveryRequestInput{
+		Email:          testRecoveryEmail,
+		IdempotencyKey: testRecoveryIdempotencyKey(7),
+		ClientIP:       netip.MustParseAddr("192.0.2.62"),
+	})
+	if err != nil {
+		t.Fatalf("request recovery while licenses are locked: %v", err)
+	}
+	assertRecoveryAccepted(t, response)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
 }
 
 func TestRecoveryRequestRateLimitsEmailAndIPWithoutChangingResponseWithPostgreSQL(t *testing.T) {
@@ -192,7 +235,8 @@ func TestRecoveryRequestRateLimitsEmailAndIPWithoutChangingResponseWithPostgreSQ
 		}
 		assertRecoveryAccepted(t, response)
 	}
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, recoveryEmailAttemptLimit)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, recoveryEmailAttemptLimit)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 
 	clientIP := netip.MustParseAddr("192.0.2.54")
 	for attempt := range recoveryIPAttemptLimit + 1 {
@@ -250,7 +294,8 @@ func TestConcurrentRecoveryRequestReplayConsumesQuotaOnceWithPostgreSQL(t *testi
 	assertRateLimitAttempts(t, database, "recovery_ip", 1)
 	assertRateLimitAttempts(t, database, "recovery_email", 1)
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'recovery_request'", nil, 1)
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 }
 
 func TestRateLimitedRecoveryRequestRemainsSuppressedAfterWindowResetWithPostgreSQL(t *testing.T) {
@@ -293,7 +338,8 @@ func TestRateLimitedRecoveryRequestRemainsSuppressedAfterWindowResetWithPostgreS
 		t.Fatalf("replay limited recovery: %v", err)
 	}
 	assertRecoveryAccepted(t, replay)
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, recoveryEmailAttemptLimit)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, recoveryEmailAttemptLimit)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits", nil, 2)
 }
 
@@ -312,6 +358,23 @@ func TestRecoveryRequestRollsBackWhenReplayEncryptionFailsWithPostgreSQL(t *test
 	if err == nil {
 		t.Fatal("recovery request with failed replay encryption succeeded")
 	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 0)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 0)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
+}
+
+func TestRecoveryRequestPreparationRollsBackTokenFailureWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	service := newTestService(t, database, localIssuer(t))
+	seedRecoverableLicense(t, service, "lic_recovery_prepare_rollback", testLicenseKey, testRecoveryEmail)
+	requestRecovery(t, service, testRecoveryEmail, "192.0.2.63")
+	service.random = bytes.NewReader(nil)
+
+	if _, err := service.DispatchRecoveryEmail(context.Background(), service.now()); err == nil {
+		t.Fatal("prepared recovery request with failed token generation")
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 0)
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 }
@@ -347,10 +410,14 @@ func TestRecoveryEmailDispatchRetriesAfterQueueFailureWithPostgreSQL(t *testing.
 func TestRecoveryEmailDispatchSkipsNearExpiryTokenWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{}
+	queue := &recordingRecoveryEmailQueue{err: errors.New("queue unavailable")}
 	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
 	seedRecoverableLicense(t, service, "lic_recovery_expiring", testLicenseKey, testRecoveryEmail)
 	requestRecovery(t, service, testRecoveryEmail, "192.0.2.61")
+	if _, err := service.DispatchRecoveryEmail(context.Background(), service.now()); err == nil {
+		t.Fatal("initial recovery email dispatch succeeded")
+	}
+	queue.setError(nil)
 	now := service.now().Add(recoveryTokenLifetime - recoveryMinimumDeliveryLifetime)
 
 	dispatched, err := service.DispatchRecoveryEmail(context.Background(), now)
@@ -360,8 +427,8 @@ func TestRecoveryEmailDispatchSkipsNearExpiryTokenWithPostgreSQL(t *testing.T) {
 	if dispatched {
 		t.Error("dispatched a near-expiry recovery email")
 	}
-	if len(queue.snapshot()) != 0 {
-		t.Errorf("queued messages = %d, want 0", len(queue.snapshot()))
+	if len(queue.snapshot()) != 1 {
+		t.Errorf("queue attempts = %d, want 1", len(queue.snapshot()))
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
 }
@@ -374,33 +441,21 @@ func TestConcurrentRecoveryDispatchClaimsOneEmailWithPostgreSQL(t *testing.T) {
 	seedRecoverableLicense(t, service, "lic_recovery_claim", testLicenseKey, testRecoveryEmail)
 	requestRecovery(t, service, testRecoveryEmail, "192.0.2.57")
 
-	type result struct {
-		dispatched bool
-		err        error
-	}
-	results := make(chan result, 2)
+	results := make(chan error, 2)
 	start := make(chan struct{})
 	for range 2 {
 		go func() {
 			<-start
-			dispatched, err := service.DispatchRecoveryEmail(context.Background(), service.now())
-			results <- result{dispatched: dispatched, err: err}
+			_, err := service.DispatchRecoveryEmail(context.Background(), service.now())
+			results <- err
 		}()
 	}
 	close(start)
 
-	dispatched := 0
 	for range 2 {
-		result := <-results
-		if result.err != nil {
-			t.Fatalf("dispatch recovery email concurrently: %v", result.err)
+		if err := <-results; err != nil {
+			t.Fatalf("dispatch recovery email concurrently: %v", err)
 		}
-		if result.dispatched {
-			dispatched++
-		}
-	}
-	if dispatched != 1 {
-		t.Errorf("successful dispatches = %d, want 1", dispatched)
 	}
 	if len(queue.snapshot()) != 1 {
 		t.Errorf("queued messages = %d, want 1", len(queue.snapshot()))
@@ -518,13 +573,19 @@ type recordingRecoveryEmailQueue struct {
 	mu       sync.Mutex
 	messages []RecoveryEmail
 	err      error
+	onSend   func(RecoveryEmail)
 }
 
 func (q *recordingRecoveryEmailQueue) SendRecoveryEmail(_ context.Context, message RecoveryEmail) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.messages = append(q.messages, message)
-	return q.err
+	err := q.err
+	onSend := q.onSend
+	q.mu.Unlock()
+	if onSend != nil {
+		onSend(message)
+	}
+	return err
 }
 
 func (q *recordingRecoveryEmailQueue) snapshot() []RecoveryEmail {

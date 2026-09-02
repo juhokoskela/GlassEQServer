@@ -310,6 +310,16 @@ func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
 			t.Fatalf("insert access token %d: %v", index, err)
 		}
 
+		requestLookup := sha256.Sum256([]byte(fmt.Sprintf("recovery-request-%d", index)))
+		_, err = database.ExecContext(context.Background(), `
+			INSERT INTO recovery_request_jobs (id, email_lookup, created_at, expires_at)
+			VALUES ($1, $2, $3, $4)`,
+			fmt.Sprintf("rrq_cleanup_%d", index), requestLookup[:],
+			expiresAt.Add(-recoveryRequestLifetime), expiresAt)
+		if err != nil {
+			t.Fatalf("insert recovery request %d: %v", index, err)
+		}
+
 		_, err = database.ExecContext(context.Background(), `
 			INSERT INTO recovery_email_outbox (
 			    id, license_id, token_ciphertext, created_at, expires_at, next_attempt_at
@@ -325,24 +335,26 @@ func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clean one batch: %v", err)
 	}
-	if deleted != 4 {
-		t.Errorf("deleted rows = %d, want 4", deleted)
+	if deleted != 5 {
+		t.Errorf("deleted rows = %d, want 5", deleted)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE expires_at <= $1", now, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits WHERE window_start < $1", now.Truncate(rateLimitWindow), 1)
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE expires_at <= $1", now, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs WHERE expires_at <= $1", now, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox WHERE expires_at <= $1", now, 1)
 
 	deleted, err = service.CleanupExpired(context.Background(), now)
 	if err != nil {
 		t.Fatalf("clean remaining rows: %v", err)
 	}
-	if deleted != 4 {
-		t.Errorf("remaining deleted rows = %d, want 4", deleted)
+	if deleted != 5 {
+		t.Errorf("remaining deleted rows = %d, want 5", deleted)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
 }
 
@@ -366,7 +378,7 @@ func openTestDatabase(t *testing.T) *sql.DB {
 func resetActivationData(t *testing.T, database *sql.DB) {
 	t.Helper()
 	_, err := database.ExecContext(context.Background(), `
-		TRUNCATE recovery_email_outbox, activation_rate_limits, idempotency_records, activations,
+		TRUNCATE recovery_email_outbox, recovery_request_jobs, activation_rate_limits, idempotency_records, activations,
 		         subscriptions, license_keys, licenses CASCADE`)
 	if err != nil {
 		t.Fatalf("reset activation data: %v", err)
