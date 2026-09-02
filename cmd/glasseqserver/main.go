@@ -19,14 +19,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/juhokoskela/GlassEQServer/internal/activation"
 	"github.com/juhokoskela/GlassEQServer/internal/config"
 	"github.com/juhokoskela/GlassEQServer/internal/entitlement"
 	"github.com/juhokoskela/GlassEQServer/internal/httpapi"
 )
 
 const (
-	startupTimeout  = 10 * time.Second
-	shutdownTimeout = 10 * time.Second
+	startupTimeout            = 10 * time.Second
+	shutdownTimeout           = 10 * time.Second
+	activationCleanupTimeout  = 5 * time.Second
+	activationCleanupInterval = time.Minute
 )
 
 func main() {
@@ -53,9 +56,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("load AWS configuration: %w", err)
 	}
-	_, publicKey, err := entitlement.LoadKMSSigner(startupCtx, kms.NewFromConfig(awsSettings), settings.EntitlementKMSKeyID)
+	signer, publicKey, err := entitlement.LoadKMSSigner(startupCtx, kms.NewFromConfig(awsSettings), settings.EntitlementKMSKeyID)
 	if err != nil {
 		return err
+	}
+	issuer, err := entitlement.NewIssuer(settings.EntitlementSigningKeyID, signer)
+	if err != nil {
+		return fmt.Errorf("create entitlement issuer: %w", err)
 	}
 
 	database, err := sql.Open("pgx", settings.DatabaseURL)
@@ -69,6 +76,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := database.PingContext(startupCtx); err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
+	activationService, err := activation.NewService(database, issuer, settings.IdempotencyKey, settings.RateLimitHMACKey)
+	if err != nil {
+		return fmt.Errorf("create activation service: %w", err)
+	}
 
 	listener, err := net.Listen("tcp", settings.HTTPAddress)
 	if err != nil {
@@ -77,7 +88,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler:           httpapi.New(database, logger),
+		Handler:           httpapi.New(database, activationService, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -91,7 +102,38 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"entitlement_key_id", settings.EntitlementSigningKeyID,
 		"entitlement_public_key_sha256", hex.EncodeToString(fingerprint[:]),
 	)
-	return serve(ctx, server, listener)
+	cleanupCtx, stopCleanup := context.WithCancel(ctx)
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		runActivationCleanup(cleanupCtx, activationService, logger)
+	}()
+	serveErr := serve(ctx, server, listener)
+	stopCleanup()
+	<-cleanupDone
+	return serveErr
+}
+
+type activationCleaner interface {
+	CleanupExpired(context.Context, time.Time) (int64, error)
+}
+
+func runActivationCleanup(ctx context.Context, cleaner activationCleaner, logger *slog.Logger) {
+	ticker := time.NewTicker(activationCleanupInterval)
+	defer ticker.Stop()
+	for {
+		cleanupCtx, cancel := context.WithTimeout(ctx, activationCleanupTimeout)
+		_, err := cleaner.CleanupExpired(cleanupCtx, time.Now())
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			logger.WarnContext(ctx, "activation cleanup failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 type httpServer interface {

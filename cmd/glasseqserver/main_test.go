@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"testing"
@@ -53,10 +55,41 @@ func TestServeReturnsGracefulAndForcedShutdownErrors(t *testing.T) {
 	}
 }
 
+func TestActivationCleanupStopsWithContext(t *testing.T) {
+	cleaner := &recordingCleaner{called: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runActivationCleanup(ctx, cleaner, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}()
+
+	select {
+	case <-cleaner.called:
+	case <-time.After(time.Second):
+		t.Fatal("activation cleanup did not run")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("activation cleanup did not stop")
+	}
+}
+
 type failingShutdownServer struct {
 	closed      chan struct{}
 	shutdownErr error
 	closeErr    error
+}
+
+type recordingCleaner struct {
+	called chan struct{}
+}
+
+func (c *recordingCleaner) CleanupExpired(context.Context, time.Time) (int64, error) {
+	c.called <- struct{}{}
+	return 0, nil
 }
 
 func (s *failingShutdownServer) Serve(net.Listener) error {

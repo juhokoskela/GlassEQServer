@@ -49,6 +49,8 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+        env:
+          GLASSEQ_TEST_DATABASE_URL: postgres://glasseq:glasseq@127.0.0.1:5432/glasseq?sslmode=disable
 
       - name: Vet
         run: go vet ./...
