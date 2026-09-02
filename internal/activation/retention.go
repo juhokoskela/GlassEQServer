@@ -8,7 +8,7 @@ import (
 
 const cleanupBatchSize = 1000
 
-// CleanupExpired deletes one bounded batch of stale request state.
+// CleanupExpired deletes one bounded batch of stale transient state.
 func (s *Service) CleanupExpired(ctx context.Context, now time.Time) (int64, error) {
 	return s.cleanupExpired(ctx, now.UTC(), cleanupBatchSize)
 }
@@ -57,5 +57,25 @@ func (s *Service) cleanupExpired(ctx context.Context, now time.Time, batchSize i
 	if err != nil {
 		return idempotencyCount, fmt.Errorf("read deleted rate-limit count: %w", err)
 	}
-	return idempotencyCount + rateLimitCount, nil
+
+	accessTokenResult, err := s.database.ExecContext(ctx, `
+		WITH expired AS (
+			SELECT token_hash
+			FROM access_tokens
+			WHERE expires_at <= $1
+			ORDER BY expires_at
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM access_tokens AS tokens
+		USING expired
+		WHERE tokens.token_hash = expired.token_hash`, now, batchSize)
+	if err != nil {
+		return idempotencyCount + rateLimitCount, fmt.Errorf("delete expired access tokens: %w", err)
+	}
+	accessTokenCount, err := accessTokenResult.RowsAffected()
+	if err != nil {
+		return idempotencyCount + rateLimitCount, fmt.Errorf("read deleted access-token count: %w", err)
+	}
+	return idempotencyCount + rateLimitCount + accessTokenCount, nil
 }

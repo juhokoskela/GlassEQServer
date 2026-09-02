@@ -271,6 +271,7 @@ func TestIPRateLimitStopsCreatingCredentialRowsWithPostgreSQL(t *testing.T) {
 func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_cleanup", testLicenseKey)
 	service := newTestService(t, database, localIssuer(t))
 	now := time.Unix(1_800_000_000, 0).UTC()
 
@@ -299,27 +300,38 @@ func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("insert rate limit %d: %v", index, err)
 		}
+
+		accessTokenHash := sha256.Sum256([]byte(fmt.Sprintf("access-token-%d", index)))
+		_, err = database.ExecContext(context.Background(), `
+			INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
+			VALUES ($1, 'lic_cleanup', 'management', $2, $3)`,
+			accessTokenHash[:], expiresAt.Add(-managementTokenLifetime), expiresAt)
+		if err != nil {
+			t.Fatalf("insert access token %d: %v", index, err)
+		}
 	}
 
 	deleted, err := service.cleanupExpired(context.Background(), now, 1)
 	if err != nil {
 		t.Fatalf("clean one batch: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("deleted rows = %d, want 2", deleted)
+	if deleted != 3 {
+		t.Errorf("deleted rows = %d, want 3", deleted)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE expires_at <= $1", now, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits WHERE window_start < $1", now.Truncate(rateLimitWindow), 1)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE expires_at <= $1", now, 1)
 
 	deleted, err = service.CleanupExpired(context.Background(), now)
 	if err != nil {
 		t.Fatalf("clean remaining rows: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("remaining deleted rows = %d, want 2", deleted)
+	if deleted != 3 {
+		t.Errorf("remaining deleted rows = %d, want 3", deleted)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens", nil, 1)
 }
 
 func openTestDatabase(t *testing.T) *sql.DB {
@@ -496,6 +508,7 @@ func decodeSuccess(t *testing.T, response Response) successBody {
 
 type entitlementClaims struct {
 	Plan             string `json:"plan"`
+	ActivationID     string `json:"activation_id"`
 	InstallationID   string `json:"installation_id"`
 	Revision         int64  `json:"revision"`
 	BillingPeriodEnd int64  `json:"billing_period_end"`
