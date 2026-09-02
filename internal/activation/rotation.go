@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"time"
@@ -17,11 +15,7 @@ import (
 const (
 	licenseKeyRotationScope    = "license_key_rotation"
 	licenseKeyRotationCooldown = 24 * time.Hour
-	licenseKeyPrefix           = "GEQ1"
-	licenseKeyByteCount        = 16
 )
-
-var licenseKeyEncoding = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
 
 type LicenseKeyRotationInput struct {
 	ManagementToken string
@@ -61,9 +55,7 @@ func (s *Service) RotateLicenseKey(ctx context.Context, input LicenseKeyRotation
 
 	licenseID, sessionFound, err := lockManagementLicense(ctx, tx, tokenHash, now)
 	if databaseLockUnavailable(err) {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+		return databaseBusyResponse(), nil
 	}
 	if err != nil {
 		return Response{}, err
@@ -171,21 +163,6 @@ func lockManagementLicense(ctx context.Context, tx *sql.Tx, tokenHash [sha256.Si
 		return "", false, fmt.Errorf("lock license for key rotation: %w", err)
 	}
 	return licenseID, true, nil
-}
-
-func databaseLockUnavailable(err error) bool {
-	var databaseError interface{ SQLState() string }
-	return errors.As(err, &databaseError) && databaseError.SQLState() == "55P03"
-}
-
-func generateLicenseKey(random io.Reader) (string, string, error) {
-	value := make([]byte, licenseKeyByteCount)
-	if _, err := io.ReadFull(random, value); err != nil {
-		return "", "", err
-	}
-	encoded := licenseKeyEncoding.EncodeToString(value)
-	display := licenseKeyPrefix + "-" + encoded[:5] + "-" + encoded[5:10] + "-" + encoded[10:15] + "-" + encoded[15:20] + "-" + encoded[20:25] + "-" + encoded[25:]
-	return display, licenseKeyPrefix + encoded, nil
 }
 
 type licenseKeyRotationBody struct {

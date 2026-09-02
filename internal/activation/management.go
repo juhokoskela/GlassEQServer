@@ -152,9 +152,7 @@ func (s *Service) DeactivateManaged(ctx context.Context, input ManagedDeactivati
 		FROM target
 		WHERE activation.id = target.id`, input.ActivationID, licenseID, now)
 	if databaseLockUnavailable(err) {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+		return databaseBusyResponse(), nil
 	}
 	if err != nil {
 		return Response{}, fmt.Errorf("deactivate managed activation: %w", err)

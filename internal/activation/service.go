@@ -130,9 +130,7 @@ func (s *Service) Activate(ctx context.Context, input Input) (Response, error) {
 		return Response{}, err
 	}
 	if !locked {
-		response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
-		response.RetryAfterSeconds = 1
-		return response, nil
+		return databaseBusyResponse(), nil
 	}
 	replayed, found, conflict, err = s.loadIdempotency(ctx, tx, idempotency, now)
 	if err != nil {
@@ -302,34 +300,6 @@ func canonicalInstallation(value string) (string, [sha256.Size]byte, bool) {
 	}
 	canonical := strings.ToUpper(identifier.String())
 	return canonical, sha256.Sum256([]byte(canonical)), true
-}
-
-func normalizeLicenseKey(value string) (string, bool) {
-	if value == "" || len(value) > 128 {
-		return value, false
-	}
-	var normalized strings.Builder
-	normalized.Grow(len(value))
-	for i := range len(value) {
-		character := value[i]
-		if character == '-' {
-			continue
-		}
-		if character >= 'a' && character <= 'z' {
-			character -= 'a' - 'A'
-		}
-		normalized.WriteByte(character)
-	}
-	result := normalized.String()
-	if len(result) != 30 || !strings.HasPrefix(result, "GEQ1") {
-		return result, false
-	}
-	for i := 4; i < len(result); i++ {
-		if !strings.ContainsRune("0123456789ABCDEFGHJKMNPQRSTVWXYZ", rune(result[i])) {
-			return result, false
-		}
-	}
-	return result, true
 }
 
 func tryLockCredential(ctx context.Context, tx *sql.Tx, credentialHash [sha256.Size]byte) (bool, error) {
@@ -651,6 +621,17 @@ func idempotencyAdditionalData(input idempotencyRequest, status int) []byte {
 
 func responseError(status int, code, message string) Response {
 	return Response{Status: status, ErrorCode: code, ErrorMessage: message}
+}
+
+func databaseBusyResponse() Response {
+	response := responseError(http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.")
+	response.RetryAfterSeconds = 1
+	return response
+}
+
+func databaseLockUnavailable(err error) bool {
+	var databaseError interface{ SQLState() string }
+	return errors.As(err, &databaseError) && databaseError.SQLState() == "55P03"
 }
 
 type successBody struct {
