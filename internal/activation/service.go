@@ -263,11 +263,8 @@ func prepare(input Input) (preparedInput, string) {
 	if !valid {
 		return preparedInput{}, "invalid_request"
 	}
-	if len(input.IdempotencyKey) != 36 {
-		return preparedInput{}, "invalid_request"
-	}
-	idempotencyKey, err := uuid.Parse(input.IdempotencyKey)
-	if err != nil {
+	idempotencyKey, valid := canonicalIdempotencyKey(input.IdempotencyKey)
+	if !valid {
 		return preparedInput{}, "invalid_request"
 	}
 	if !input.ClientIP.IsValid() {
@@ -279,9 +276,20 @@ func prepare(input Input) (preparedInput, string) {
 		credentialValid:  credentialValid,
 		installationID:   installationID,
 		installationHash: installationHash,
-		idempotencyKey:   idempotencyKey.String(),
+		idempotencyKey:   idempotencyKey,
 		clientIP:         input.ClientIP.Unmap(),
 	}, ""
+}
+
+func canonicalIdempotencyKey(value string) (string, bool) {
+	if len(value) != 36 {
+		return "", false
+	}
+	identifier, err := uuid.Parse(value)
+	if err != nil {
+		return "", false
+	}
+	return identifier.String(), true
 }
 
 func canonicalInstallation(value string) (string, [sha256.Size]byte, bool) {
