@@ -27,6 +27,9 @@ CREATE INDEX recovery_email_outbox_pending
 
 DROP TABLE recovery_email_outbox;
 
+DELETE FROM activation_rate_limits
+WHERE kind IN ('recovery_ip', 'recovery_email');
+
 ALTER TABLE activation_rate_limits
     DROP CONSTRAINT activation_rate_limits_kind_check,
     ADD CONSTRAINT activation_rate_limits_kind_check
