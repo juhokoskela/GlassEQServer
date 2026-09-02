@@ -7,6 +7,46 @@ import (
 	"github.com/juhokoskela/GlassEQServer/internal/activation"
 )
 
+func (a *api) requestRecovery(w http.ResponseWriter, request *http.Request) {
+	requestID, err := randomRequestID()
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "generate request ID", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", "")
+		return
+	}
+
+	var body recoveryRequest
+	if status := decodeJSONRequest(w, request, &body); status != 0 {
+		writeError(w, status, "invalid_request", "The recovery request is invalid.", requestID)
+		return
+	}
+	idempotencyKey, ok := singleHeader(request, "Idempotency-Key")
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "The recovery request is invalid.", requestID)
+		return
+	}
+	clientIP, err := requestClientIP(request)
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "resolve recovery client IP", "request_id", requestID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(request.Context(), activationTimeout)
+	defer cancel()
+	response, err := a.activations.RequestRecovery(ctx, activation.RecoveryRequestInput{
+		Email:          body.Email,
+		IdempotencyKey: idempotencyKey,
+		ClientIP:       clientIP,
+	})
+	if err != nil {
+		a.logger.ErrorContext(request.Context(), "request recovery", "request_id", requestID, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
+		return
+	}
+	writeServiceResponse(w, response, requestID)
+}
+
 func (a *api) createRecoverySession(w http.ResponseWriter, request *http.Request) {
 	requestID, err := randomRequestID()
 	if err != nil {
@@ -38,4 +78,8 @@ func (a *api) createRecoverySession(w http.ResponseWriter, request *http.Request
 		return
 	}
 	writeServiceResponse(w, response, requestID)
+}
+
+type recoveryRequest struct {
+	Email string `json:"email"`
 }

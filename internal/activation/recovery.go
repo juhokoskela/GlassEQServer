@@ -53,10 +53,11 @@ func (s *Service) ExchangeRecoveryToken(ctx context.Context, input RecoverySessi
 
 	var available bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT expires_at > $2 AND consumed_at IS NULL
-		FROM access_tokens
-		WHERE token_hash = $1 AND purpose = 'recovery'
-		FOR UPDATE NOWAIT`, tokenHash[:], now).Scan(&available)
+		SELECT token.expires_at > $2 AND token.consumed_at IS NULL AND license.state = 'active'
+		FROM access_tokens AS token
+		JOIN licenses AS license ON license.id = token.license_id
+		WHERE token.token_hash = $1 AND token.purpose = 'recovery'
+		FOR UPDATE OF token, license NOWAIT`, tokenHash[:], now).Scan(&available)
 	if databaseLockUnavailable(err) {
 		return databaseBusyResponse(), nil
 	}
@@ -85,13 +86,16 @@ func (s *Service) ExchangeRecoveryToken(ctx context.Context, input RecoverySessi
 
 	result, err := tx.ExecContext(ctx, `
 		WITH recovery AS (
-			UPDATE access_tokens
+			UPDATE access_tokens AS token
 			SET consumed_at = $2
-			WHERE token_hash = $1
-			  AND purpose = 'recovery'
-			  AND expires_at > $2
-			  AND consumed_at IS NULL
-			RETURNING license_id
+			FROM licenses AS license
+			WHERE token.token_hash = $1
+			  AND token.purpose = 'recovery'
+			  AND token.expires_at > $2
+			  AND token.consumed_at IS NULL
+			  AND license.id = token.license_id
+			  AND license.state = 'active'
+			RETURNING token.license_id
 		)
 		INSERT INTO access_tokens (token_hash, license_id, purpose, created_at, expires_at)
 		SELECT $3, license_id, 'management', $2, $4

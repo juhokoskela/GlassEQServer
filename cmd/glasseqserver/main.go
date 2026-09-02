@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/juhokoskela/GlassEQServer/internal/activation"
@@ -30,6 +32,7 @@ const (
 	shutdownTimeout           = 10 * time.Second
 	activationCleanupTimeout  = 5 * time.Second
 	activationCleanupInterval = time.Minute
+	recoveryDispatchInterval  = time.Second
 )
 
 func main() {
@@ -76,7 +79,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := database.PingContext(startupCtx); err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
-	activationService, err := activation.NewService(database, issuer, settings.IdempotencyKey, settings.RateLimitHMACKey)
+	recoveryEmails, err := activation.NewSQSRecoveryEmailQueue(sqs.NewFromConfig(awsSettings), settings.RecoveryQueueURL)
+	if err != nil {
+		return fmt.Errorf("create recovery email queue: %w", err)
+	}
+	activationService, err := activation.NewService(database, issuer, activation.Secrets{
+		IdempotencyKey:        settings.IdempotencyKey,
+		RateLimitHMACKey:      settings.RateLimitHMACKey,
+		EmailLookupHMACKey:    settings.EmailLookupHMACKey,
+		DatabaseEncryptionKey: settings.DatabaseEncryptionKey,
+	}, recoveryEmails)
 	if err != nil {
 		return fmt.Errorf("create activation service: %w", err)
 	}
@@ -102,15 +114,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"entitlement_key_id", settings.EntitlementSigningKeyID,
 		"entitlement_public_key_sha256", hex.EncodeToString(fingerprint[:]),
 	)
-	cleanupCtx, stopCleanup := context.WithCancel(ctx)
-	cleanupDone := make(chan struct{})
-	go func() {
-		defer close(cleanupDone)
-		runActivationCleanup(cleanupCtx, activationService, logger)
-	}()
+	backgroundCtx, stopBackground := context.WithCancel(ctx)
+	var background sync.WaitGroup
+	background.Go(func() { runActivationCleanup(backgroundCtx, activationService, logger) })
+	background.Go(func() { runRecoveryEmailDispatch(backgroundCtx, activationService, logger) })
 	serveErr := serve(ctx, server, listener)
-	stopCleanup()
-	<-cleanupDone
+	stopBackground()
+	background.Wait()
 	return serveErr
 }
 
@@ -132,6 +142,30 @@ func runActivationCleanup(ctx context.Context, cleaner activationCleaner, logger
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+	}
+}
+
+type recoveryEmailDispatcher interface {
+	DispatchRecoveryEmail(context.Context, time.Time) (bool, error)
+}
+
+func runRecoveryEmailDispatch(ctx context.Context, dispatcher recoveryEmailDispatcher, logger *slog.Logger) {
+	for {
+		worked, err := dispatcher.DispatchRecoveryEmail(ctx, time.Now())
+		if err != nil && ctx.Err() == nil {
+			logger.WarnContext(ctx, "recovery email dispatch failed", "error", err)
+		}
+		if err == nil && worked {
+			continue
+		}
+
+		timer := time.NewTimer(recoveryDispatchInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }

@@ -7,14 +7,14 @@ import (
 	"io"
 )
 
-type responseCipher struct {
+type secretCipher struct {
 	aead   cipher.AEAD
 	random io.Reader
 }
 
-func newResponseCipher(key []byte, random io.Reader) (*responseCipher, error) {
+func newSecretCipher(key []byte, random io.Reader) (*secretCipher, error) {
 	if len(key) != 32 {
-		return nil, errors.New("idempotency key must contain 32 bytes")
+		return nil, errors.New("encryption key must contain 32 bytes")
 	}
 	if random == nil {
 		return nil, errors.New("random source is required")
@@ -27,10 +27,10 @@ func newResponseCipher(key []byte, random io.Reader) (*responseCipher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &responseCipher{aead: aead, random: random}, nil
+	return &secretCipher{aead: aead, random: random}, nil
 }
 
-func (c *responseCipher) seal(plaintext, additionalData []byte) ([]byte, error) {
+func (c *secretCipher) seal(plaintext, additionalData []byte) ([]byte, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := io.ReadFull(c.random, nonce); err != nil {
 		return nil, err
@@ -38,10 +38,10 @@ func (c *responseCipher) seal(plaintext, additionalData []byte) ([]byte, error) 
 	return c.aead.Seal(nonce, nonce, plaintext, additionalData), nil
 }
 
-func (c *responseCipher) open(ciphertext, additionalData []byte) ([]byte, error) {
+func (c *secretCipher) open(ciphertext, additionalData []byte) ([]byte, error) {
 	nonceSize := c.aead.NonceSize()
 	if len(ciphertext) < nonceSize {
-		return nil, errors.New("idempotency response is truncated")
+		return nil, errors.New("ciphertext is truncated")
 	}
 	return c.aead.Open(nil, ciphertext[:nonceSize], ciphertext[nonceSize:], additionalData)
 }

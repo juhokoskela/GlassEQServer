@@ -296,6 +296,7 @@ type fakeActivationService struct {
 	managementToken     string
 	managedDeactivation activation.ManagedDeactivationInput
 	rotationInput       activation.LicenseKeyRotationInput
+	recoveryRequest     activation.RecoveryRequestInput
 	recoveryInput       activation.RecoverySessionInput
 	calls               int
 	deadlineRemaining   time.Duration
@@ -325,6 +326,13 @@ func (f *fakeActivationService) DeactivateManaged(ctx context.Context, input act
 func (f *fakeActivationService) RotateLicenseKey(ctx context.Context, input activation.LicenseKeyRotationInput) (activation.Response, error) {
 	f.calls++
 	f.rotationInput = input
+	f.recordDeadline(ctx)
+	return f.response, f.err
+}
+
+func (f *fakeActivationService) RequestRecovery(ctx context.Context, input activation.RecoveryRequestInput) (activation.Response, error) {
+	f.calls++
+	f.recoveryRequest = input
 	f.recordDeadline(ctx)
 	return f.response, f.err
 }

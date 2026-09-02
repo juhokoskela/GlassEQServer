@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestResponseCipherRoundTripBindsAdditionalData(t *testing.T) {
-	cipher, err := newResponseCipher(make([]byte, 32), bytes.NewReader(make([]byte, 12)))
+func TestSecretCipherRoundTripBindsAdditionalData(t *testing.T) {
+	cipher, err := newSecretCipher(make([]byte, 32), bytes.NewReader(make([]byte, 12)))
 	if err != nil {
 		t.Fatalf("create response cipher: %v", err)
 	}
@@ -26,14 +26,14 @@ func TestResponseCipherRoundTripBindsAdditionalData(t *testing.T) {
 	}
 }
 
-func TestResponseCipherRejectsInvalidConfigurationAndInput(t *testing.T) {
-	if _, err := newResponseCipher(make([]byte, 31), bytes.NewReader(nil)); err == nil {
+func TestSecretCipherRejectsInvalidConfigurationAndInput(t *testing.T) {
+	if _, err := newSecretCipher(make([]byte, 31), bytes.NewReader(nil)); err == nil {
 		t.Fatal("create response cipher with short key succeeded")
 	}
-	if _, err := newResponseCipher(make([]byte, 32), nil); err == nil {
+	if _, err := newSecretCipher(make([]byte, 32), nil); err == nil {
 		t.Fatal("create response cipher without randomness succeeded")
 	}
-	cipher, err := newResponseCipher(make([]byte, 32), bytes.NewReader(nil))
+	cipher, err := newSecretCipher(make([]byte, 32), bytes.NewReader(nil))
 	if err != nil {
 		t.Fatalf("create response cipher: %v", err)
 	}
@@ -42,5 +42,7 @@ func TestResponseCipherRejectsInvalidConfigurationAndInput(t *testing.T) {
 	}
 	if _, err := cipher.open(make([]byte, 11), nil); err == nil {
 		t.Fatal("open truncated response succeeded")
+	} else if err.Error() != "ciphertext is truncated" {
+		t.Errorf("truncated ciphertext error = %q", err)
 	}
 }

@@ -99,6 +99,40 @@ func TestRecoveryTokenExchangeRejectsExpiredTokenWithPostgreSQL(t *testing.T) {
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE token_hash = $1 AND consumed_at IS NULL", recoveryHash[:], 1)
 }
 
+func TestRecoveryTokenExchangeRejectsInactiveLicenseWithPostgreSQL(t *testing.T) {
+	for _, state := range []string{"refunded", "charged_back", "revoked"} {
+		t.Run(state, func(t *testing.T) {
+			database := openTestDatabase(t)
+			resetActivationData(t, database)
+			licenseID := "lic_recovery_" + state
+			seedPerpetualLicense(t, database, licenseID, testLicenseKey)
+			service := newTestService(t, database, localIssuer(t))
+			recoveryToken := testRecoveryToken(5)
+			seedRecoveryToken(t, database, licenseID, recoveryToken, service.now())
+			if _, err := database.ExecContext(context.Background(), `
+				UPDATE licenses
+				SET state = $1
+				WHERE id = $2`, state, licenseID); err != nil {
+				t.Fatalf("make license inactive: %v", err)
+			}
+
+			response, err := service.ExchangeRecoveryToken(context.Background(), RecoverySessionInput{
+				RecoveryToken:  recoveryToken,
+				IdempotencyKey: "47621703-4aa5-42d3-a563-7099370055ad",
+			})
+			if err != nil {
+				t.Fatalf("exchange recovery token: %v", err)
+			}
+			assertErrorCode(t, response, http.StatusUnauthorized, "invalid_credentials")
+
+			recoveryHash, _ := recoveryTokenHash(recoveryToken)
+			assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE token_hash = $1 AND consumed_at IS NULL", recoveryHash[:], 1)
+			assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE license_id = $1 AND purpose = 'management'", licenseID, 0)
+			assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'recovery_session'", nil, 0)
+		})
+	}
+}
+
 func TestRecoveryTokenExchangeIsSingleUseWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
