@@ -20,6 +20,9 @@ type Config struct {
 	EntitlementSigningKeyID string
 	IdempotencyKey          []byte
 	RateLimitHMACKey        []byte
+	EmailLookupHMACKey      []byte
+	DatabaseEncryptionKey   []byte
+	RecoveryQueueURL        string
 }
 
 func Load() (Config, error) {
@@ -55,6 +58,18 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	emailLookupHMACKey, err := secretKey(lookup, "GLASSEQ_EMAIL_LOOKUP_HMAC_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	databaseEncryptionKey, err := secretKey(lookup, "GLASSEQ_DATABASE_ENCRYPTION_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	recoveryQueueURL, err := required(lookup, "GLASSEQ_RECOVERY_QUEUE_URL")
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		HTTPAddress:             httpAddress,
@@ -63,6 +78,9 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		EntitlementSigningKeyID: signingKeyID,
 		IdempotencyKey:          idempotencyKey,
 		RateLimitHMACKey:        rateLimitHMACKey,
+		EmailLookupHMACKey:      emailLookupHMACKey,
+		DatabaseEncryptionKey:   databaseEncryptionKey,
+		RecoveryQueueURL:        recoveryQueueURL,
 	}, nil
 }
 

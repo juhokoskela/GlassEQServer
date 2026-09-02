@@ -40,12 +40,22 @@ type entitlementIssuer interface {
 }
 
 type Service struct {
-	database         *sql.DB
-	issuer           entitlementIssuer
-	responses        *secretCipher
-	rateLimitHMACKey []byte
-	random           io.Reader
-	now              func() time.Time
+	database           *sql.DB
+	issuer             entitlementIssuer
+	responses          *secretCipher
+	databaseValues     *secretCipher
+	recoveryEmails     RecoveryEmailQueue
+	rateLimitHMACKey   []byte
+	emailLookupHMACKey []byte
+	random             io.Reader
+	now                func() time.Time
+}
+
+type Secrets struct {
+	IdempotencyKey        []byte
+	RateLimitHMACKey      []byte
+	EmailLookupHMACKey    []byte
+	DatabaseEncryptionKey []byte
 }
 
 type Input struct {
@@ -63,27 +73,40 @@ type Response struct {
 	RetryAfterSeconds int
 }
 
-func NewService(database *sql.DB, issuer entitlementIssuer, idempotencyKey, rateLimitHMACKey []byte) (*Service, error) {
+func NewService(database *sql.DB, issuer entitlementIssuer, secrets Secrets, recoveryEmails RecoveryEmailQueue) (*Service, error) {
 	if database == nil {
 		return nil, errors.New("activation database is required")
 	}
 	if issuer == nil {
 		return nil, errors.New("entitlement issuer is required")
 	}
-	responses, err := newSecretCipher(idempotencyKey, rand.Reader)
-	if err != nil {
-		return nil, err
+	if recoveryEmails == nil {
+		return nil, errors.New("recovery email queue is required")
 	}
-	if len(rateLimitHMACKey) != 32 {
+	responses, err := newSecretCipher(secrets.IdempotencyKey, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("idempotency responses: %w", err)
+	}
+	databaseValues, err := newSecretCipher(secrets.DatabaseEncryptionKey, rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("database values: %w", err)
+	}
+	if len(secrets.RateLimitHMACKey) != 32 {
 		return nil, errors.New("rate-limit HMAC key must contain 32 bytes")
 	}
+	if len(secrets.EmailLookupHMACKey) != 32 {
+		return nil, errors.New("email-lookup HMAC key must contain 32 bytes")
+	}
 	return &Service{
-		database:         database,
-		issuer:           issuer,
-		responses:        responses,
-		rateLimitHMACKey: append([]byte(nil), rateLimitHMACKey...),
-		random:           rand.Reader,
-		now:              time.Now,
+		database:           database,
+		issuer:             issuer,
+		responses:          responses,
+		databaseValues:     databaseValues,
+		recoveryEmails:     recoveryEmails,
+		rateLimitHMACKey:   append([]byte(nil), secrets.RateLimitHMACKey...),
+		emailLookupHMACKey: append([]byte(nil), secrets.EmailLookupHMACKey...),
+		random:             rand.Reader,
+		now:                time.Now,
 	}, nil
 }
 
@@ -306,7 +329,7 @@ func tryLockCredential(ctx context.Context, tx *sql.Tx, credentialHash [sha256.S
 	key := int64(binary.BigEndian.Uint64(credentialHash[:8]))
 	var locked bool
 	if err := tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", key).Scan(&locked); err != nil {
-		return false, fmt.Errorf("lock activation credential: %w", err)
+		return false, fmt.Errorf("lock request credential: %w", err)
 	}
 	return locked, nil
 }
@@ -329,7 +352,7 @@ func (s *Service) loadIdempotency(ctx context.Context, database rowQuerier, inpu
 		SELECT request_hash, status_code, response_ciphertext
 		FROM idempotency_records
 		WHERE scope = $1 AND credential_hash = $2 AND idempotency_key = $3
-		  AND expires_at > $4 AND status_code IN (200, 201)`,
+		  AND expires_at > $4 AND status_code BETWEEN 200 AND 299`,
 		input.scope, input.credentialHash[:], input.key, now).Scan(&requestHash, &status, &ciphertext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Response{}, false, false, nil
@@ -387,7 +410,7 @@ func incrementRateLimit(ctx context.Context, tx *sql.Tx, kind string, subjectHas
 		DO UPDATE SET attempts = activation_rate_limits.attempts + 1
 		RETURNING attempts`, kind, subjectHash[:], windowStart).Scan(&attempts)
 	if err != nil {
-		return 0, fmt.Errorf("update credential %s rate limit: %w", kind, err)
+		return 0, fmt.Errorf("update %s rate limit: %w", kind, err)
 	}
 	return attempts, nil
 }
@@ -582,7 +605,7 @@ func (s *Service) storeAndCommit(ctx context.Context, tx *sql.Tx, input idempote
 		              created_at = EXCLUDED.created_at,
 		              expires_at = EXCLUDED.expires_at
 		WHERE idempotency_records.expires_at <= EXCLUDED.created_at
-		   OR idempotency_records.status_code NOT IN (200, 201)`,
+		   OR idempotency_records.status_code NOT BETWEEN 200 AND 299`,
 		input.scope, input.credentialHash[:], input.key, input.requestHash[:],
 		response.Status, ciphertext, now, now.Add(idempotencyLifetime))
 	if err != nil {

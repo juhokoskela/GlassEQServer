@@ -77,5 +77,26 @@ func (s *Service) cleanupExpired(ctx context.Context, now time.Time, batchSize i
 	if err != nil {
 		return idempotencyCount + rateLimitCount, fmt.Errorf("read deleted access-token count: %w", err)
 	}
-	return idempotencyCount + rateLimitCount + accessTokenCount, nil
+
+	outboxResult, err := s.database.ExecContext(ctx, `
+		WITH expired AS (
+			SELECT id
+			FROM recovery_email_outbox
+			WHERE (dispatched_at IS NULL AND expires_at <= $1)
+			   OR dispatched_at <= $1 - interval '24 hours'
+			ORDER BY expires_at
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM recovery_email_outbox AS outbox
+		USING expired
+		WHERE outbox.id = expired.id`, now, batchSize)
+	if err != nil {
+		return idempotencyCount + rateLimitCount + accessTokenCount, fmt.Errorf("delete expired recovery emails: %w", err)
+	}
+	outboxCount, err := outboxResult.RowsAffected()
+	if err != nil {
+		return idempotencyCount + rateLimitCount + accessTokenCount, fmt.Errorf("read deleted recovery-email count: %w", err)
+	}
+	return idempotencyCount + rateLimitCount + accessTokenCount + outboxCount, nil
 }

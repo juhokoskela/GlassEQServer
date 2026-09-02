@@ -13,6 +13,9 @@ func TestLoad(t *testing.T) {
 		"GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID": "entitlement-2026-01",
 		"GLASSEQ_IDEMPOTENCY_KEY":            testSecretKey(1),
 		"GLASSEQ_RATE_LIMIT_HMAC_KEY":        testSecretKey(2),
+		"GLASSEQ_EMAIL_LOOKUP_HMAC_KEY":      testSecretKey(3),
+		"GLASSEQ_DATABASE_ENCRYPTION_KEY":    testSecretKey(4),
+		"GLASSEQ_RECOVERY_QUEUE_URL":         "https://sqs.eu-north-1.amazonaws.com/123456789012/recovery.fifo",
 	}
 
 	got, err := load(mapLookup(values))
@@ -36,6 +39,15 @@ func TestLoad(t *testing.T) {
 	}
 	if len(got.RateLimitHMACKey) != 32 {
 		t.Errorf("rate-limit HMAC key length = %d", len(got.RateLimitHMACKey))
+	}
+	if len(got.EmailLookupHMACKey) != 32 {
+		t.Errorf("email-lookup HMAC key length = %d", len(got.EmailLookupHMACKey))
+	}
+	if len(got.DatabaseEncryptionKey) != 32 {
+		t.Errorf("database encryption key length = %d", len(got.DatabaseEncryptionKey))
+	}
+	if got.RecoveryQueueURL != values["GLASSEQ_RECOVERY_QUEUE_URL"] {
+		t.Errorf("recovery queue URL = %q", got.RecoveryQueueURL)
 	}
 }
 
