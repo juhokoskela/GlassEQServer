@@ -71,7 +71,7 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	}
 	assertRecoveryAccepted(t, response)
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 1)
-	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox WHERE dispatched_at IS NULL", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
 
 	replay, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
 		Email:          testRecoveryEmail,
@@ -85,6 +85,7 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 		t.Errorf("replay = (%d, %s), want (%d, %s)", replay.Status, replay.Body, response.Status, response.Body)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
+	tokenCiphertext := recoveryTokenCiphertext(t, database)
 
 	dispatched, err := service.DispatchRecoveryEmail(context.Background(), service.now())
 	if err != nil {
@@ -110,7 +111,9 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	if _, valid := recoveryTokenHash(message.RecoveryToken); !valid {
 		t.Errorf("queued recovery token is invalid: %q", message.RecoveryToken)
 	}
-	assertRecoveryTokenEncrypted(t, database, message.RecoveryToken)
+	if strings.Contains(string(tokenCiphertext), message.RecoveryToken) {
+		t.Error("recovery outbox contains the plaintext token")
+	}
 
 	session, err := service.ExchangeRecoveryToken(context.Background(), RecoverySessionInput{
 		RecoveryToken:  message.RecoveryToken,
@@ -122,6 +125,7 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	if session.Status != http.StatusCreated {
 		t.Errorf("recovery session status = %d, want %d", session.Status, http.StatusCreated)
 	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 0)
 
 	dispatched, err = service.DispatchRecoveryEmail(context.Background(), service.now())
 	if err != nil {
@@ -203,7 +207,94 @@ func TestRecoveryRequestRateLimitsEmailAndIPWithoutChangingResponseWithPostgreSQ
 		assertRecoveryAccepted(t, response)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits WHERE kind = 'recovery_email'", nil, recoveryIPAttemptLimit+1)
-	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'recovery_request'", nil, recoveryEmailAttemptLimit+recoveryIPAttemptLimit)
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'recovery_request'", nil, recoveryEmailAttemptLimit+recoveryIPAttemptLimit+2)
+}
+
+func TestConcurrentRecoveryRequestReplayConsumesQuotaOnceWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	service := newTestService(t, database, localIssuer(t))
+	seedRecoverableLicense(t, service, "lic_recovery_concurrent", testLicenseKey, testRecoveryEmail)
+	reader := &blockingReader{entered: make(chan struct{}), release: make(chan struct{})}
+	service.random = reader
+	input := RecoveryRequestInput{
+		Email:          testRecoveryEmail,
+		IdempotencyKey: testRecoveryIdempotencyKey(100),
+		ClientIP:       netip.MustParseAddr("192.0.2.59"),
+	}
+
+	type result struct {
+		response Response
+		err      error
+	}
+	results := make(chan result, 2)
+	go func() {
+		response, err := service.RequestRecovery(context.Background(), input)
+		results <- result{response: response, err: err}
+	}()
+	<-reader.entered
+	go func() {
+		response, err := service.RequestRecovery(context.Background(), input)
+		results <- result{response: response, err: err}
+	}()
+	waitForAdvisoryWait(t, database)
+	close(reader.release)
+
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("request recovery concurrently: %v", result.err)
+		}
+		assertRecoveryAccepted(t, result.response)
+	}
+	assertRateLimitAttempts(t, database, "recovery_ip", 1)
+	assertRateLimitAttempts(t, database, "recovery_email", 1)
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'recovery_request'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
+}
+
+func TestRateLimitedRecoveryRequestRemainsSuppressedAfterWindowResetWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	service := newTestService(t, database, localIssuer(t))
+	seedRecoverableLicense(t, service, "lic_recovery_replay_limit", testLicenseKey, testRecoveryEmail)
+	clientIP := netip.MustParseAddr("192.0.2.60")
+
+	for attempt := range recoveryEmailAttemptLimit {
+		response, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
+			Email:          testRecoveryEmail,
+			IdempotencyKey: testRecoveryIdempotencyKey(110 + attempt),
+			ClientIP:       clientIP,
+		})
+		if err != nil {
+			t.Fatalf("request allowed recovery: %v", err)
+		}
+		assertRecoveryAccepted(t, response)
+	}
+	limitedKey := testRecoveryIdempotencyKey(120)
+	response, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
+		Email:          testRecoveryEmail,
+		IdempotencyKey: limitedKey,
+		ClientIP:       clientIP,
+	})
+	if err != nil {
+		t.Fatalf("request limited recovery: %v", err)
+	}
+	assertRecoveryAccepted(t, response)
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records WHERE scope = 'recovery_request'", nil, recoveryEmailAttemptLimit+1)
+
+	service.now = func() time.Time { return time.Unix(1_800_000_000, 0).UTC().Add(rateLimitWindow) }
+	replay, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
+		Email:          testRecoveryEmail,
+		IdempotencyKey: limitedKey,
+		ClientIP:       clientIP,
+	})
+	if err != nil {
+		t.Fatalf("replay limited recovery: %v", err)
+	}
+	assertRecoveryAccepted(t, replay)
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, recoveryEmailAttemptLimit)
+	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits", nil, 2)
 }
 
 func TestRecoveryRequestRollsBackWhenReplayEncryptionFailsWithPostgreSQL(t *testing.T) {
@@ -251,6 +342,28 @@ func TestRecoveryEmailDispatchRetriesAfterQueueFailureWithPostgreSQL(t *testing.
 	if len(queue.snapshot()) != 2 {
 		t.Errorf("queue attempts = %d, want 2", len(queue.snapshot()))
 	}
+}
+
+func TestRecoveryEmailDispatchSkipsNearExpiryTokenWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	queue := &recordingRecoveryEmailQueue{}
+	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	seedRecoverableLicense(t, service, "lic_recovery_expiring", testLicenseKey, testRecoveryEmail)
+	requestRecovery(t, service, testRecoveryEmail, "192.0.2.61")
+	now := service.now().Add(recoveryTokenLifetime - recoveryMinimumDeliveryLifetime)
+
+	dispatched, err := service.DispatchRecoveryEmail(context.Background(), now)
+	if err != nil {
+		t.Fatalf("dispatch near-expiry recovery email: %v", err)
+	}
+	if dispatched {
+		t.Error("dispatched a near-expiry recovery email")
+	}
+	if len(queue.snapshot()) != 0 {
+		t.Errorf("queued messages = %d, want 0", len(queue.snapshot()))
+	}
+	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
 }
 
 func TestConcurrentRecoveryDispatchClaimsOneEmailWithPostgreSQL(t *testing.T) {
@@ -338,7 +451,7 @@ func assertRecoveryAccepted(t *testing.T, response Response) {
 	}
 }
 
-func assertRecoveryTokenEncrypted(t *testing.T, database *sql.DB, token string) {
+func recoveryTokenCiphertext(t *testing.T, database *sql.DB) []byte {
 	t.Helper()
 	var ciphertext []byte
 	if err := database.QueryRowContext(context.Background(), `
@@ -346,9 +459,59 @@ func assertRecoveryTokenEncrypted(t *testing.T, database *sql.DB, token string) 
 		FROM recovery_email_outbox`).Scan(&ciphertext); err != nil {
 		t.Fatalf("read encrypted recovery token: %v", err)
 	}
-	if strings.Contains(string(ciphertext), token) {
-		t.Error("recovery outbox contains the plaintext token")
+	return ciphertext
+}
+
+func assertRateLimitAttempts(t *testing.T, database *sql.DB, kind string, want int) {
+	t.Helper()
+	var got int
+	if err := database.QueryRowContext(context.Background(), `
+		SELECT attempts
+		FROM activation_rate_limits
+		WHERE kind = $1`, kind).Scan(&got); err != nil {
+		t.Fatalf("read %s rate limit: %v", kind, err)
 	}
+	if got != want {
+		t.Errorf("%s attempts = %d, want %d", kind, got, want)
+	}
+}
+
+func waitForAdvisoryWait(t *testing.T, database *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var waiting bool
+		if err := database.QueryRowContext(context.Background(), `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks
+				WHERE locktype = 'advisory' AND NOT granted
+			)`).Scan(&waiting); err != nil {
+			t.Fatalf("inspect advisory locks: %v", err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("concurrent recovery request did not wait for the credential lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type blockingReader struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingReader) Read(buffer []byte) (int, error) {
+	r.once.Do(func() {
+		close(r.entered)
+		<-r.release
+	})
+	clear(buffer)
+	return len(buffer), nil
 }
 
 type recordingRecoveryEmailQueue struct {

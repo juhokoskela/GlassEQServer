@@ -76,7 +76,7 @@ License-key rotation requires a management session and an idempotency UUID. A li
 
 Well-formed recovery requests always return the same `202` response for known, unknown, invalid, and rate-limited email addresses. Requests are limited to three attempts per normalized email and 20 attempts per IP address each hour. For a matching license, the service stores the hashed 30-minute token, encrypted delivery data, and encrypted idempotency replay in one transaction.
 
-A background dispatcher claims pending deliveries without holding a database connection during the SQS call. It publishes the decrypted email and recovery token to the configured FIFO queue with the outbox ID as both the message deduplication ID and message group ID. A separate consumer must deduplicate that stable delivery ID before calling the email provider because SQS FIFO deduplication lasts five minutes. The consumer and email template are not implemented yet.
+A background dispatcher claims pending deliveries without holding a database connection during the SQS call. It does not send tokens with less than five minutes remaining. After publishing the decrypted email and recovery token, it deletes the outbox row. The outbox ID is both the message deduplication ID and message group ID. A separate consumer must deduplicate that stable delivery ID before calling the email provider because SQS FIFO deduplication lasts five minutes. The consumer and email template are not implemented yet.
 
 Recovery tokens can be exchanged once. The exchange consumes the recovery token, creates a 15-minute management session, and stores an encrypted response atomically. Successful exchanges can be replayed with the same idempotency key for 24 hours, including after the recovery token expires.
 

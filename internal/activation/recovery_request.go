@@ -14,12 +14,10 @@ import (
 )
 
 const (
-	recoveryRequestScope       = "recovery_request"
-	recoveryTokenLifetime      = 30 * time.Minute
-	recoveryQueueTimeout       = 10 * time.Second
-	recoveryDispatchRetryDelay = time.Minute
-	recoveryEmailAttemptLimit  = 3
-	recoveryIPAttemptLimit     = 20
+	recoveryRequestScope      = "recovery_request"
+	recoveryTokenLifetime     = 30 * time.Minute
+	recoveryEmailAttemptLimit = 3
+	recoveryIPAttemptLimit    = 20
 )
 
 var recoveryAcceptedBody = []byte(`{"accepted":true}`)
@@ -68,26 +66,14 @@ func (s *Service) RequestRecovery(ctx context.Context, input RecoveryRequestInpu
 		return replayed, nil
 	}
 
-	limited, err := s.consumeRecoveryRateLimits(ctx, normalizedEmail, input.ClientIP.Unmap(), now)
-	if err != nil {
-		return Response{}, err
-	}
-	if limited {
-		return recoveryAcceptedResponse(), nil
-	}
-
 	tx, err := s.database.BeginTx(ctx, nil)
 	if err != nil {
 		return Response{}, fmt.Errorf("begin recovery request: %w", err)
 	}
 	defer tx.Rollback()
 
-	locked, err := tryLockCredential(ctx, tx, credentialHash)
-	if err != nil {
+	if err := lockRecoveryCredential(ctx, tx, credentialHash); err != nil {
 		return Response{}, err
-	}
-	if !locked {
-		return databaseBusyResponse(), nil
 	}
 	replayed, replayFound, _, err = s.loadIdempotency(ctx, tx, idempotency, now)
 	if err != nil {
@@ -96,9 +82,13 @@ func (s *Service) RequestRecovery(ctx context.Context, input RecoveryRequestInpu
 	if replayFound {
 		return replayed, nil
 	}
+	limited, err := s.recoveryRateLimited(ctx, tx, normalizedEmail, input.ClientIP.Unmap(), now)
+	if err != nil {
+		return Response{}, err
+	}
 
 	var licenseIDs []string
-	if emailValid {
+	if emailValid && !limited {
 		lookupHash := hmacSHA256(s.emailLookupHMACKey, normalizedEmail)
 		licenseIDs, err = findRecoveryLicenses(ctx, tx, lookupHash)
 		if err != nil {
@@ -167,13 +157,7 @@ func (s *Service) createRecoveryDelivery(ctx context.Context, tx *sql.Tx, licens
 	return nil
 }
 
-func (s *Service) consumeRecoveryRateLimits(ctx context.Context, normalizedEmail string, clientIP netip.Addr, now time.Time) (bool, error) {
-	tx, err := s.database.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("begin recovery rate limit: %w", err)
-	}
-	defer tx.Rollback()
-
+func (s *Service) recoveryRateLimited(ctx context.Context, tx *sql.Tx, normalizedEmail string, clientIP netip.Addr, now time.Time) (bool, error) {
 	windowStart := now.Truncate(rateLimitWindow)
 	ipHash := hmacSHA256(s.rateLimitHMACKey, "recovery_ip\x00"+clientIP.String())
 	ipAttempts, err := incrementRateLimit(ctx, tx, "recovery_ip", ipHash, windowStart)
@@ -189,10 +173,15 @@ func (s *Service) consumeRecoveryRateLimits(ctx context.Context, normalizedEmail
 		}
 		limited = emailAttempts > recoveryEmailAttemptLimit
 	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit recovery rate limit: %w", err)
-	}
 	return limited, nil
+}
+
+func lockRecoveryCredential(ctx context.Context, tx *sql.Tx, credentialHash [sha256.Size]byte) error {
+	key := int64(binary.BigEndian.Uint64(credentialHash[:8]))
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", key); err != nil {
+		return fmt.Errorf("lock recovery credential: %w", err)
+	}
+	return nil
 }
 
 func normalizeRecoveryEmail(value string) (string, bool) {

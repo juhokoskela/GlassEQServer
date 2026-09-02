@@ -32,7 +32,6 @@ const (
 	shutdownTimeout           = 10 * time.Second
 	activationCleanupTimeout  = 5 * time.Second
 	activationCleanupInterval = time.Minute
-	recoveryDispatchTimeout   = 10 * time.Second
 	recoveryDispatchInterval  = time.Second
 )
 
@@ -153,9 +152,7 @@ type recoveryEmailDispatcher interface {
 
 func runRecoveryEmailDispatch(ctx context.Context, dispatcher recoveryEmailDispatcher, logger *slog.Logger) {
 	for {
-		dispatchCtx, cancel := context.WithTimeout(ctx, recoveryDispatchTimeout)
-		dispatched, err := dispatcher.DispatchRecoveryEmail(dispatchCtx, time.Now())
-		cancel()
+		dispatched, err := dispatcher.DispatchRecoveryEmail(ctx, time.Now())
 		if err != nil && ctx.Err() == nil {
 			logger.WarnContext(ctx, "recovery email dispatch failed", "error", err)
 		}

@@ -78,7 +78,10 @@ func TestActivationCleanupStopsWithContext(t *testing.T) {
 }
 
 func TestRecoveryEmailDispatchStopsWithContext(t *testing.T) {
-	dispatcher := &recordingRecoveryDispatcher{called: make(chan struct{}, 1)}
+	dispatcher := &recordingRecoveryDispatcher{
+		called:      make(chan struct{}, 1),
+		hasDeadline: make(chan bool, 1),
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -90,6 +93,9 @@ func TestRecoveryEmailDispatchStopsWithContext(t *testing.T) {
 	case <-dispatcher.called:
 	case <-time.After(time.Second):
 		t.Fatal("recovery dispatcher did not run")
+	}
+	if <-dispatcher.hasDeadline {
+		t.Error("dispatch loop imposed an outer deadline")
 	}
 	cancel()
 	select {
@@ -110,7 +116,8 @@ type recordingCleaner struct {
 }
 
 type recordingRecoveryDispatcher struct {
-	called chan struct{}
+	called      chan struct{}
+	hasDeadline chan bool
 }
 
 func (c *recordingCleaner) CleanupExpired(context.Context, time.Time) (int64, error) {
@@ -118,7 +125,9 @@ func (c *recordingCleaner) CleanupExpired(context.Context, time.Time) (int64, er
 	return 0, nil
 }
 
-func (d *recordingRecoveryDispatcher) DispatchRecoveryEmail(context.Context, time.Time) (bool, error) {
+func (d *recordingRecoveryDispatcher) DispatchRecoveryEmail(ctx context.Context, _ time.Time) (bool, error) {
+	_, hasDeadline := ctx.Deadline()
+	d.hasDeadline <- hasDeadline
 	d.called <- struct{}{}
 	return false, nil
 }

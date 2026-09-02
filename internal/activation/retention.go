@@ -82,8 +82,7 @@ func (s *Service) cleanupExpired(ctx context.Context, now time.Time, batchSize i
 		WITH expired AS (
 			SELECT id
 			FROM recovery_email_outbox
-			WHERE (dispatched_at IS NULL AND expires_at <= $1)
-			   OR dispatched_at <= $1 - interval '24 hours'
+			WHERE expires_at <= $1
 			ORDER BY expires_at
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
