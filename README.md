@@ -2,13 +2,14 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, and recovery-token exchange endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery-request delivery, and download endpoints are not implemented yet.
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, and account-recovery endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery-email consumption, and download endpoints are not implemented yet.
 
 ## Trust boundaries
 
 - AWS KMS holds the entitlement private key. The service can request Ed25519 signatures but cannot export the private key.
 - The Sparkle and Apple release keys do not belong to this service. The GlassEQ release workflow builds and signs updates separately.
 - The ECS task role must not be able to upload, replace, or delete update artifacts.
+- The ECS task role may send messages only to the recovery-email FIFO queue. The queue must use server-side encryption.
 - The ECS task security group must accept public HTTP traffic only through the Application Load Balancer. The load balancer must use its default `append` mode for `X-Forwarded-For`, with client-port preservation disabled. Activation rate limits use the rightmost address appended by the load balancer.
 - Logs must not contain credentials, entitlement bodies, email addresses, Stripe payloads, or download authorization headers.
 
@@ -40,9 +41,12 @@ The server requires these environment variables:
 | `GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID` | Public JWS `kid`, such as `entitlement-2026-01` |
 | `GLASSEQ_IDEMPOTENCY_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts replay responses |
 | `GLASSEQ_RATE_LIMIT_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key that hashes client IP addresses |
+| `GLASSEQ_EMAIL_LOOKUP_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key used for recovery-email lookups |
+| `GLASSEQ_DATABASE_ENCRYPTION_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts recovery emails and queued tokens |
+| `GLASSEQ_RECOVERY_QUEUE_URL` | HTTPS URL of the recovery-email SQS FIFO queue |
 | `GLASSEQ_HTTP_ADDRESS` | Listen address, defaults to `:8080` |
 
-Keep the idempotency key stable across deployments so every task can replay responses created during the preceding 24 hours. Store both keys in the deployment's secret manager; do not commit them.
+Keep the encryption and HMAC keys stable across deployments. Store them in the deployment's secret manager; do not commit them.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
@@ -59,6 +63,7 @@ The service exposes:
 - `GET /v1/management/activations` for listing the license's active slots.
 - `DELETE /v1/management/activations/{activation_id}` for releasing one of those slots.
 - `POST /v1/management/license-key-rotations` for replacing the license key.
+- `POST /v1/recovery-requests` for requesting email recovery. Requires an `Idempotency-Key` header.
 - `POST /v1/recovery-sessions` for exchanging a one-time bearer recovery token for a management session. Requires an `Idempotency-Key` header.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
@@ -69,7 +74,11 @@ Management sessions authenticate with the license key and return a short-lived b
 
 License-key rotation requires a management session and an idempotency UUID. A license can rotate once every 24 hours. A successful rotation consumes the management session, retains only the previous revoked key, and leaves existing activations intact. The encrypted success response remains replayable for 24 hours, including after the management session expires, so a lost HTTP response does not lose the new key.
 
-Recovery tokens expire after 30 minutes and can be exchanged once. The exchange consumes the recovery token, creates a 15-minute management session, and stores an encrypted response atomically. Successful exchanges can be replayed with the same idempotency key for 24 hours, including after the recovery token expires. Recovery-request generation and email delivery are not implemented yet.
+Well-formed recovery requests always return the same `202` response for known, unknown, invalid, and rate-limited email addresses. Requests are limited to three attempts per normalized email and 20 attempts per IP address each hour. For a matching license, the service stores the hashed 30-minute token, encrypted delivery data, and encrypted idempotency replay in one transaction.
+
+A background dispatcher claims pending deliveries without holding a database connection during the SQS call. It publishes the decrypted email and recovery token to the configured FIFO queue with the outbox ID as both the message deduplication ID and message group ID. A separate consumer must deduplicate that stable delivery ID before calling the email provider because SQS FIFO deduplication lasts five minutes. The consumer and email template are not implemented yet.
+
+Recovery tokens can be exchanged once. The exchange consumes the recovery token, creates a 15-minute management session, and stores an encrypted response atomically. Successful exchanges can be replayed with the same idempotency key for 24 hours, including after the recovery token expires.
 
 ## Checks
 
