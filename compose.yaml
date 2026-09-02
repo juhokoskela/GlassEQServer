@@ -1,0 +1,33 @@
+name: glasseqserver
+
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+    environment:
+      POSTGRES_DB: glasseq
+      POSTGRES_PASSWORD: glasseq
+      POSTGRES_USER: glasseq
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glasseq -d glasseq"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  migrate:
+    image: juhokoskela/goose:v3.27.3@sha256:db4be381f2173bfd8994b9ca03e2fa2f8d7692ac3cef4aa5e2059db3e760cc3d
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgres://glasseq:glasseq@postgres:5432/glasseq?sslmode=disable
+    volumes:
+      - ./migrations:/migrations:ro
+
+volumes:
+  postgres-data:
