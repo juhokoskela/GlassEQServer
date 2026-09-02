@@ -54,6 +54,8 @@ The service exposes:
 - `GET /readyz` for PostgreSQL readiness.
 - `POST /v1/activations` for creating or restoring one of a license's two activation slots.
 
+Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
+
 ## Checks
 
 ```sh

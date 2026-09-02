@@ -26,8 +26,10 @@ import (
 )
 
 const (
-	startupTimeout  = 10 * time.Second
-	shutdownTimeout = 10 * time.Second
+	startupTimeout            = 10 * time.Second
+	shutdownTimeout           = 10 * time.Second
+	activationCleanupTimeout  = 5 * time.Second
+	activationCleanupInterval = time.Minute
 )
 
 func main() {
@@ -100,7 +102,38 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"entitlement_key_id", settings.EntitlementSigningKeyID,
 		"entitlement_public_key_sha256", hex.EncodeToString(fingerprint[:]),
 	)
-	return serve(ctx, server, listener)
+	cleanupCtx, stopCleanup := context.WithCancel(ctx)
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		runActivationCleanup(cleanupCtx, activationService, logger)
+	}()
+	serveErr := serve(ctx, server, listener)
+	stopCleanup()
+	<-cleanupDone
+	return serveErr
+}
+
+type activationCleaner interface {
+	CleanupExpired(context.Context, time.Time) (int64, error)
+}
+
+func runActivationCleanup(ctx context.Context, cleaner activationCleaner, logger *slog.Logger) {
+	ticker := time.NewTicker(activationCleanupInterval)
+	defer ticker.Stop()
+	for {
+		cleanupCtx, cancel := context.WithTimeout(ctx, activationCleanupTimeout)
+		_, err := cleaner.CleanupExpired(cleanupCtx, time.Now())
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			logger.WarnContext(ctx, "activation cleanup failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 type httpServer interface {
