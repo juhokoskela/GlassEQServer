@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+        env:
+          POSTGRES_DB: glasseq
+          POSTGRES_PASSWORD: glasseq
+          POSTGRES_USER: glasseq
+        options: >-
+          --health-cmd "pg_isready -U glasseq -d glasseq"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Apply migrations
+        run: >-
+          docker run --rm --network host
+          --volume "$GITHUB_WORKSPACE/migrations:/migrations:ro"
+          --env GOOSE_DRIVER=postgres
+          --env GOOSE_DBSTRING=postgres://glasseq:glasseq@127.0.0.1:5432/glasseq?sslmode=disable
+          juhokoskela/goose:v3.27.3@sha256:db4be381f2173bfd8994b9ca03e2fa2f8d7692ac3cef4aa5e2059db3e760cc3d
+          up
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build service image
+        run: docker build --build-arg SOURCE_REVISION="$GITHUB_SHA" .
