@@ -66,7 +66,7 @@ Refresh and current-installation deactivation authenticate with the activation t
 
 Management sessions authenticate with the license key and return a short-lived bearer token. The service stores only its SHA-256 hash. Slot listing exposes opaque activation IDs and timestamps, not device details. Remote release is idempotent and cannot affect another license's activation.
 
-License-key rotation requires a management session and an idempotency UUID. It returns the new key once, revokes the previous key, and leaves existing activations intact. The encrypted success response remains replayable for 24 hours so a lost HTTP response does not lose the new key.
+License-key rotation requires a management session and an idempotency UUID. A license can rotate once every 24 hours. A successful rotation consumes the management session, retains only the previous revoked key, and leaves existing activations intact. The encrypted success response remains replayable for 24 hours, including after the management session expires, so a lost HTTP response does not lose the new key.
 
 ## Checks
 

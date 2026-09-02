@@ -1,6 +1,7 @@
 package activation
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -15,6 +16,7 @@ func TestLicenseKeyRotationWithPostgreSQL(t *testing.T) {
 	resetActivationData(t, database)
 	seedPerpetualLicense(t, database, "lic_rotation", testLicenseKey)
 	service := newTestService(t, database, localIssuer(t))
+	rotationTime := service.now()
 	activation := decodeSuccess(t, activate(t, service, testLicenseKey, testInstallA, "cb0d985e-1595-44bd-91d4-e4e25c639ae6"))
 	session := decodeManagementSession(t, createManagementSession(t, service, testLicenseKey))
 
@@ -36,7 +38,33 @@ func TestLicenseKeyRotationWithPostgreSQL(t *testing.T) {
 		t.Errorf("replay = (%d, %s), want (%d, %s)", replay.Status, replay.Body, first.Status, first.Body)
 	}
 	assertRotationResponseIsEncrypted(t, database, firstBody.LicenseKey)
+
+	second := rotateLicenseKey(t, service, LicenseKeyRotationInput{
+		ManagementToken: session.ManagementToken,
+		IdempotencyKey:  "b0554c65-a281-4bfe-8de6-c10d07992950",
+	})
+	assertErrorCode(t, second, http.StatusUnauthorized, "invalid_credentials")
 	assertErrorCode(t, createManagementSession(t, service, testLicenseKey), http.StatusUnauthorized, "invalid_credentials")
+	newSessionResponse := createManagementSession(t, service, firstBody.LicenseKey)
+	if newSessionResponse.Status != http.StatusCreated {
+		t.Fatalf("management session with rotated key status = %d, want %d", newSessionResponse.Status, http.StatusCreated)
+	}
+	newSession := decodeManagementSession(t, newSessionResponse)
+	cooldown := rotateLicenseKey(t, service, LicenseKeyRotationInput{
+		ManagementToken: newSession.ManagementToken,
+		IdempotencyKey:  "f4bf4696-78d0-414f-9c7a-b0fc79e3c34f",
+	})
+	assertErrorCode(t, cooldown, http.StatusTooManyRequests, "rate_limited")
+	if cooldown.RetryAfterSeconds != int(licenseKeyRotationCooldown.Seconds()) {
+		t.Errorf("cooldown Retry-After = %d", cooldown.RetryAfterSeconds)
+	}
+
+	service.now = func() time.Time { return rotationTime.Add(managementTokenLifetime) }
+	expiredSessionReplay := rotateLicenseKey(t, service, input)
+	if expiredSessionReplay.Status != first.Status || string(expiredSessionReplay.Body) != string(first.Body) {
+		t.Errorf("expired-session replay = (%d, %s), want (%d, %s)", expiredSessionReplay.Status, expiredSessionReplay.Body, first.Status, first.Body)
+	}
+
 	if response := createManagementSession(t, service, firstBody.LicenseKey); response.Status != http.StatusCreated {
 		t.Errorf("management session with rotated key status = %d, want %d", response.Status, http.StatusCreated)
 	}
@@ -52,22 +80,64 @@ func TestLicenseKeyRotationWithPostgreSQL(t *testing.T) {
 		t.Errorf("refresh after rotation status = %d, want %d", refreshed.Status, http.StatusOK)
 	}
 
-	second := rotateLicenseKey(t, service, LicenseKeyRotationInput{
-		ManagementToken: session.ManagementToken,
-		IdempotencyKey:  "b0554c65-a281-4bfe-8de6-c10d07992950",
-	})
-	secondBody := decodeLicenseKeyRotation(t, second)
-	if secondBody.LicenseKey == firstBody.LicenseKey {
-		t.Error("second rotation returned the previous license key")
-	}
-	assertErrorCode(t, createManagementSession(t, service, firstBody.LicenseKey), http.StatusUnauthorized, "invalid_credentials")
-	if response := createManagementSession(t, service, secondBody.LicenseKey); response.Status != http.StatusCreated {
-		t.Errorf("management session with second rotated key status = %d, want %d", response.Status, http.StatusCreated)
+	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation' AND state = 'active'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation' AND state = 'revoked'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM activations WHERE license_id = 'lic_rotation' AND state = 'active'", nil, 1)
+}
+
+func TestLicenseKeyRotationBoundsRetainedKeysWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_rotation_retention", testLicenseKey)
+	service := newTestService(t, database, localIssuer(t))
+	currentKey := testLicenseKey
+	now := service.now()
+	service.now = func() time.Time { return now }
+	idempotencyKeys := [...]string{
+		"d532f449-4f43-4375-b941-141649636a1c",
+		"3f779e0e-5a3f-491c-b2c8-68251c04ac45",
+		"c61566bf-159c-4ef0-acf9-ef301ee295f9",
 	}
 
-	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation' AND state = 'active'", nil, 1)
-	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation' AND state = 'revoked'", nil, 2)
-	assertRowCount(t, database, "SELECT count(*) FROM activations WHERE license_id = 'lic_rotation' AND state = 'active'", nil, 1)
+	for rotation := range 3 {
+		if rotation > 0 {
+			now = now.Add(licenseKeyRotationCooldown)
+		}
+		session := decodeManagementSession(t, createManagementSession(t, service, currentKey))
+		response := rotateLicenseKey(t, service, LicenseKeyRotationInput{
+			ManagementToken: session.ManagementToken,
+			IdempotencyKey:  idempotencyKeys[rotation],
+		})
+		currentKey = decodeLicenseKeyRotation(t, response).LicenseKey
+	}
+
+	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation_retention' AND state = 'active'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation_retention' AND state = 'revoked'", nil, 1)
+}
+
+func TestLicenseKeyRotationRollsBackWhenReplayEncryptionFailsWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	seedPerpetualLicense(t, database, "lic_rotation_rollback", testLicenseKey)
+	service := newTestService(t, database, localIssuer(t))
+	session := decodeManagementSession(t, createManagementSession(t, service, testLicenseKey))
+	service.responses.random = bytes.NewReader(nil)
+
+	_, err := service.RotateLicenseKey(context.Background(), LicenseKeyRotationInput{
+		ManagementToken: session.ManagementToken,
+		IdempotencyKey:  "a17721ab-5c74-4d7d-8494-f3e47cdf0ab7",
+	})
+	if err == nil {
+		t.Fatal("rotation with failed replay encryption succeeded")
+	}
+
+	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation_rollback' AND state = 'active'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation_rollback' AND state = 'revoked'", nil, 0)
+	assertRowCount(t, database, "SELECT count(*) FROM access_tokens", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records", nil, 0)
+	if response := createManagementSession(t, service, testLicenseKey); response.Status != http.StatusCreated {
+		t.Errorf("management session with original key status = %d, want %d", response.Status, http.StatusCreated)
+	}
 }
 
 func TestLicenseKeyRotationRejectsExpiredManagementSessionWithPostgreSQL(t *testing.T) {
