@@ -248,6 +248,26 @@ func TestActivationRateLimitWithPostgreSQL(t *testing.T) {
 	assertRowCount(t, database, "SELECT count(*) FROM idempotency_records", nil, 0)
 }
 
+func TestIPRateLimitStopsCreatingCredentialRowsWithPostgreSQL(t *testing.T) {
+	database := openTestDatabase(t)
+	resetActivationData(t, database)
+	service := newTestService(t, database, localIssuer(t))
+
+	for attempt := 1; attempt <= ipAttemptLimit+10; attempt++ {
+		licenseKey := fmt.Sprintf("invalid-license-%d", attempt)
+		idempotencyKey := fmt.Sprintf("00000000-0000-4000-8001-%012d", attempt)
+		response := activate(t, service, licenseKey, testInstallA, idempotencyKey)
+		if attempt <= ipAttemptLimit {
+			assertErrorCode(t, response, http.StatusUnauthorized, "invalid_credentials")
+			continue
+		}
+		assertErrorCode(t, response, http.StatusTooManyRequests, "rate_limited")
+	}
+
+	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits WHERE kind = 'ip'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM activation_rate_limits WHERE kind = 'license_key'", nil, ipAttemptLimit)
+}
+
 func TestActivationCleanupIsBoundedWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)

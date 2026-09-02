@@ -353,18 +353,22 @@ func (s *Service) consumeRateLimits(ctx context.Context, input preparedInput, no
 
 	windowStart := now.Truncate(rateLimitWindow)
 	ipHash := hmacSHA256(s.rateLimitHMACKey, input.clientIP.String())
-	licenseAttempts, err := incrementRateLimit(ctx, tx, "license_key", input.credentialHash, windowStart)
-	if err != nil {
-		return 0, err
-	}
 	ipAttempts, err := incrementRateLimit(ctx, tx, "ip", ipHash, windowStart)
 	if err != nil {
 		return 0, err
 	}
+	limited := ipAttempts > ipAttemptLimit
+	if !limited {
+		licenseAttempts, err := incrementRateLimit(ctx, tx, "license_key", input.credentialHash, windowStart)
+		if err != nil {
+			return 0, err
+		}
+		limited = licenseAttempts > licenseKeyAttemptLimit
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit activation rate limit: %w", err)
 	}
-	if licenseAttempts <= licenseKeyAttemptLimit && ipAttempts <= ipAttemptLimit {
+	if !limited {
 		return 0, nil
 	}
 	seconds := int(math.Ceil(windowStart.Add(rateLimitWindow).Sub(now).Seconds()))
