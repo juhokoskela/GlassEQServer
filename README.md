@@ -44,9 +44,15 @@ The server requires these environment variables:
 | `GLASSEQ_EMAIL_LOOKUP_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key used for recovery-email lookups |
 | `GLASSEQ_DATABASE_ENCRYPTION_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts recovery emails and queued tokens |
 | `GLASSEQ_RECOVERY_QUEUE_URL` | HTTPS URL of the recovery-email SQS FIFO queue |
+| `GLASSEQ_STRIPE_SECRET_KEY` | Stripe secret API key; store it in AWS Secrets Manager |
+| `GLASSEQ_STRIPE_MODE` | Expected Stripe environment, exactly `test` or `live` |
+| `GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID` | Environment-specific perpetual Product ID |
+| `GLASSEQ_STRIPE_PERPETUAL_PRICE_ID` | Environment-specific perpetual Price ID |
+| `GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID` | Environment-specific monthly Product ID |
+| `GLASSEQ_STRIPE_MONTHLY_PRICE_ID` | Environment-specific monthly Price ID |
 | `GLASSEQ_HTTP_ADDRESS` | Listen address, defaults to `:8080` |
 
-Keep the encryption and HMAC keys stable across deployments. Store them in the deployment's secret manager; do not commit them.
+Keep the encryption and HMAC keys stable across deployments. Store them and the Stripe secret key in the deployment's secret manager; do not commit them. Stripe mode is explicit so a deployment cannot silently accept objects from the other environment.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
