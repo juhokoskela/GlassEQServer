@@ -21,6 +21,7 @@ const (
 	stripeRequestTimeout = 15 * time.Second
 	stripeResponseLimit  = 1 << 20
 	checkoutURLHost      = "checkout.stripe.com"
+	maxClientReferenceID = 200
 )
 
 var (
@@ -47,7 +48,6 @@ const (
 
 type CheckoutConfig struct {
 	SecretKey        string
-	LiveMode         bool
 	PerpetualPriceID string
 	MonthlyPriceID   string
 }
@@ -76,8 +76,15 @@ type checkoutSessionCreator interface {
 }
 
 func NewCheckoutClient(config CheckoutConfig) (*CheckoutClient, error) {
-	if err := validateCheckoutConfig(config); err != nil {
+	liveMode, err := stripeLiveMode(config.SecretKey)
+	if err != nil {
 		return nil, err
+	}
+	if !strings.HasPrefix(config.PerpetualPriceID, "price_") {
+		return nil, errors.New("perpetual Stripe Price ID must start with price_")
+	}
+	if !strings.HasPrefix(config.MonthlyPriceID, "price_") {
+		return nil, errors.New("monthly Stripe Price ID must start with price_")
 	}
 
 	httpClient := &http.Client{
@@ -92,30 +99,22 @@ func NewCheckoutClient(config CheckoutConfig) (*CheckoutClient, error) {
 		LeveledLogger:   &stripe.LeveledLogger{Level: stripe.LevelNull},
 	})
 	client := stripe.NewClient(config.SecretKey, stripe.WithBackends(backends))
-	return newCheckoutClient(config, client.V1CheckoutSessions), nil
-}
-
-func newCheckoutClient(config CheckoutConfig, sessions checkoutSessionCreator) *CheckoutClient {
 	return &CheckoutClient{
-		sessions:         sessions,
-		liveMode:         config.LiveMode,
+		sessions:         client.V1CheckoutSessions,
+		liveMode:         liveMode,
 		perpetualPriceID: config.PerpetualPriceID,
 		monthlyPriceID:   config.MonthlyPriceID,
-	}
+	}, nil
 }
 
 func (c *CheckoutClient) Create(ctx context.Context, input CreateCheckoutSessionInput) (CheckoutSession, error) {
-	if strings.TrimSpace(input.OrderID) == "" {
-		return CheckoutSession{}, errors.New("checkout order ID is required")
+	if input.OrderID == "" || strings.TrimSpace(input.OrderID) != input.OrderID || len(input.OrderID) > maxClientReferenceID {
+		return CheckoutSession{}, errors.New("valid checkout order ID is required")
 	}
 	if input.IdempotencyKey == "" || strings.TrimSpace(input.IdempotencyKey) != input.IdempotencyKey || len(input.IdempotencyKey) > 255 {
 		return CheckoutSession{}, errors.New("valid Stripe idempotency key is required")
 	}
 
-	priceID, mode, err := c.checkoutTerms(input.Plan)
-	if err != nil {
-		return CheckoutSession{}, err
-	}
 	metadata := map[string]string{
 		"order_id":       input.OrderID,
 		"plan":           string(input.Plan),
@@ -127,21 +126,26 @@ func (c *CheckoutClient) Create(ctx context.Context, input CreateCheckoutSession
 		ConsentCollection: &stripe.CheckoutSessionCreateConsentCollectionParams{
 			TermsOfService: stripe.String(string(stripe.CheckoutSessionConsentCollectionTermsOfServiceRequired)),
 		},
-		LineItems: []*stripe.CheckoutSessionCreateLineItemParams{{
-			Price:    stripe.String(priceID),
-			Quantity: stripe.Int64(1),
-		}},
+		LineItems:       []*stripe.CheckoutSessionCreateLineItemParams{{Quantity: stripe.Int64(1)}},
 		ManagedPayments: &stripe.CheckoutSessionCreateManagedPaymentsParams{Enabled: stripe.Bool(true)},
 		Metadata:        metadata,
-		Mode:            stripe.String(string(mode)),
 		SuccessURL:      stripe.String(CheckoutSuccessURL),
 	}
-	if input.Plan == PlanPerpetualV1 {
+	var mode stripe.CheckoutSessionMode
+	switch input.Plan {
+	case PlanPerpetualV1:
+		mode = stripe.CheckoutSessionModePayment
+		params.LineItems[0].Price = stripe.String(c.perpetualPriceID)
 		params.CustomerCreation = stripe.String(string(stripe.CheckoutSessionCustomerCreationAlways))
 		params.PaymentIntentData = &stripe.CheckoutSessionCreatePaymentIntentDataParams{Metadata: metadata}
-	} else {
+	case PlanMonthly:
+		mode = stripe.CheckoutSessionModeSubscription
+		params.LineItems[0].Price = stripe.String(c.monthlyPriceID)
 		params.SubscriptionData = &stripe.CheckoutSessionCreateSubscriptionDataParams{Metadata: metadata}
+	default:
+		return CheckoutSession{}, fmt.Errorf("unsupported checkout plan %q", input.Plan)
 	}
+	params.Mode = stripe.String(string(mode))
 	params.SetIdempotencyKey(input.IdempotencyKey)
 
 	requestCtx, cancel := context.WithTimeout(ctx, stripeRequestTimeout)
@@ -188,28 +192,19 @@ func (t responseLimitTransport) RoundTrip(request *http.Request) (*http.Response
 	return response, nil
 }
 
-func (c *CheckoutClient) checkoutTerms(plan Plan) (string, stripe.CheckoutSessionMode, error) {
-	switch plan {
-	case PlanPerpetualV1:
-		return c.perpetualPriceID, stripe.CheckoutSessionModePayment, nil
-	case PlanMonthly:
-		return c.monthlyPriceID, stripe.CheckoutSessionModeSubscription, nil
+func stripeLiveMode(key string) (bool, error) {
+	switch {
+	case validStripeKeyPrefix(key, "sk_test_"), validStripeKeyPrefix(key, "rk_test_"):
+		return false, nil
+	case validStripeKeyPrefix(key, "sk_live_"), validStripeKeyPrefix(key, "rk_live_"):
+		return true, nil
 	default:
-		return "", "", fmt.Errorf("unsupported checkout plan %q", plan)
+		return false, errors.New("Stripe API key must be a test or live secret or restricted key")
 	}
 }
 
-func validateCheckoutConfig(config CheckoutConfig) error {
-	if strings.TrimSpace(config.SecretKey) == "" {
-		return errors.New("Stripe secret key is required")
-	}
-	if !strings.HasPrefix(config.PerpetualPriceID, "price_") {
-		return errors.New("perpetual Stripe Price ID must start with price_")
-	}
-	if !strings.HasPrefix(config.MonthlyPriceID, "price_") {
-		return errors.New("monthly Stripe Price ID must start with price_")
-	}
-	return nil
+func validStripeKeyPrefix(key, prefix string) bool {
+	return len(key) > len(prefix) && strings.HasPrefix(key, prefix) && strings.TrimSpace(key) == key
 }
 
 func validCheckoutSession(session *stripe.CheckoutSession, input CreateCheckoutSessionInput, mode stripe.CheckoutSessionMode, liveMode bool) bool {

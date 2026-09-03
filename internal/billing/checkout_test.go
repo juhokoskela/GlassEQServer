@@ -50,10 +50,7 @@ func TestCheckoutClientCreatesServerOwnedSession(t *testing.T) {
 			const orderID = "ord_01K4D8P6WZCP7G9N4N7V0A9T8S"
 			backend := &fakeCheckoutSessions{}
 			backend.response = checkoutResponse(orderID, test.wantMode, false)
-			client := newCheckoutClient(CheckoutConfig{
-				PerpetualPriceID: "price_perpetual",
-				MonthlyPriceID:   "price_monthly",
-			}, backend)
+			client := testCheckoutClient(backend)
 
 			ctx := context.WithValue(context.Background(), contextKey{}, "request")
 			got, err := client.Create(ctx, CreateCheckoutSessionInput{
@@ -99,6 +96,7 @@ func TestCheckoutClientCreatesServerOwnedSession(t *testing.T) {
 func TestCheckoutClientRejectsInvalidInputBeforeCallingStripe(t *testing.T) {
 	tests := []CreateCheckoutSessionInput{
 		{Plan: PlanMonthly, IdempotencyKey: "key"},
+		{OrderID: strings.Repeat("a", 201), Plan: PlanMonthly, IdempotencyKey: "key"},
 		{OrderID: "order", Plan: Plan("annual"), IdempotencyKey: "key"},
 		{OrderID: "order", Plan: PlanMonthly},
 		{OrderID: "order", Plan: PlanMonthly, IdempotencyKey: " key "},
@@ -107,10 +105,7 @@ func TestCheckoutClientRejectsInvalidInputBeforeCallingStripe(t *testing.T) {
 
 	for _, input := range tests {
 		backend := &fakeCheckoutSessions{}
-		client := newCheckoutClient(CheckoutConfig{
-			PerpetualPriceID: "price_perpetual",
-			MonthlyPriceID:   "price_monthly",
-		}, backend)
+		client := testCheckoutClient(backend)
 		if _, err := client.Create(context.Background(), input); err == nil {
 			t.Errorf("Create(%+v) succeeded", input)
 		}
@@ -142,7 +137,7 @@ func TestCheckoutClientRejectsInvalidStripeResponse(t *testing.T) {
 			response := checkoutResponse(orderID, stripe.CheckoutSessionModeSubscription, false)
 			test.mutate(response)
 			backend := &fakeCheckoutSessions{response: response}
-			client := newCheckoutClient(CheckoutConfig{MonthlyPriceID: "price_monthly"}, backend)
+			client := testCheckoutClient(backend)
 
 			_, err := client.Create(context.Background(), CreateCheckoutSessionInput{
 				OrderID:        orderID,
@@ -163,7 +158,7 @@ func TestCheckoutClientSanitizesStripeError(t *testing.T) {
 		RequestID:      "req_example",
 		Msg:            "sensitive upstream message",
 	}}
-	client := newCheckoutClient(CheckoutConfig{MonthlyPriceID: "price_monthly"}, backend)
+	client := testCheckoutClient(backend)
 
 	_, err := client.Create(context.Background(), CreateCheckoutSessionInput{
 		OrderID:        "order",
@@ -184,7 +179,7 @@ func TestCheckoutClientSanitizesStripeError(t *testing.T) {
 
 func TestCheckoutClientSanitizesUnexpectedError(t *testing.T) {
 	backend := &fakeCheckoutSessions{err: errors.New("sensitive malformed response")}
-	client := newCheckoutClient(CheckoutConfig{MonthlyPriceID: "price_monthly"}, backend)
+	client := testCheckoutClient(backend)
 
 	_, err := client.Create(context.Background(), CreateCheckoutSessionInput{
 		OrderID:        "order",
@@ -204,10 +199,37 @@ func TestNewCheckoutClientRejectsIncompleteConfig(t *testing.T) {
 		{},
 		{SecretKey: "sk_test_secret"},
 		{SecretKey: "sk_test_secret", PerpetualPriceID: "price_perpetual"},
+		{SecretKey: "invalid", PerpetualPriceID: "price_perpetual", MonthlyPriceID: "price_monthly"},
 	}
 	for _, config := range tests {
 		if _, err := NewCheckoutClient(config); err == nil {
 			t.Error("NewCheckoutClient succeeded with incomplete configuration")
+		}
+	}
+}
+
+func TestNewCheckoutClientDerivesModeFromAPIKey(t *testing.T) {
+	tests := []struct {
+		key      string
+		liveMode bool
+	}{
+		{key: "sk_test_secret"},
+		{key: "rk_test_secret"},
+		{key: "sk_live_secret", liveMode: true},
+		{key: "rk_live_secret", liveMode: true},
+	}
+
+	for _, test := range tests {
+		client, err := NewCheckoutClient(CheckoutConfig{
+			SecretKey:        test.key,
+			PerpetualPriceID: "price_perpetual",
+			MonthlyPriceID:   "price_monthly",
+		})
+		if err != nil {
+			t.Fatalf("create Checkout client: %v", err)
+		}
+		if client.liveMode != test.liveMode {
+			t.Errorf("key prefix %q produced live mode %t", test.key[:7], client.liveMode)
 		}
 	}
 }
@@ -287,6 +309,14 @@ func checkoutResponse(orderID string, mode stripe.CheckoutSessionMode, liveMode 
 		Mode:              mode,
 		ClientReferenceID: orderID,
 		ManagedPayments:   &stripe.CheckoutSessionManagedPayments{Enabled: true},
+	}
+}
+
+func testCheckoutClient(sessions checkoutSessionCreator) *CheckoutClient {
+	return &CheckoutClient{
+		sessions:         sessions,
+		perpetualPriceID: "price_perpetual",
+		monthlyPriceID:   "price_monthly",
 	}
 }
 

@@ -23,16 +23,13 @@ type Config struct {
 	EmailLookupHMACKey      []byte
 	DatabaseEncryptionKey   []byte
 	RecoveryQueueURL        string
-	Stripe                  StripeConfig
+	Stripe                  *StripeConfig
 }
 
 type StripeConfig struct {
-	SecretKey          string
-	LiveMode           bool
-	PerpetualProductID string
-	PerpetualPriceID   string
-	MonthlyProductID   string
-	MonthlyPriceID     string
+	SecretKey        string
+	PerpetualPriceID string
+	MonthlyPriceID   string
 }
 
 func Load() (Config, error) {
@@ -99,47 +96,43 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	}, nil
 }
 
-func loadStripe(lookup func(string) (string, bool)) (StripeConfig, error) {
-	secretKey, err := required(lookup, "GLASSEQ_STRIPE_SECRET_KEY")
-	if err != nil {
-		return StripeConfig{}, err
-	}
-	mode, err := required(lookup, "GLASSEQ_STRIPE_MODE")
-	if err != nil {
-		return StripeConfig{}, err
-	}
-	if mode != "test" && mode != "live" {
-		return StripeConfig{}, errors.New("GLASSEQ_STRIPE_MODE must be test or live")
-	}
-	if !strings.HasPrefix(secretKey, "sk_"+mode+"_") && !strings.HasPrefix(secretKey, "rk_"+mode+"_") {
-		return StripeConfig{}, errors.New("GLASSEQ_STRIPE_SECRET_KEY does not match GLASSEQ_STRIPE_MODE")
+func loadStripe(lookup func(string) (string, bool)) (*StripeConfig, error) {
+	if !anyConfigured(lookup,
+		"GLASSEQ_STRIPE_SECRET_KEY",
+		"GLASSEQ_STRIPE_PERPETUAL_PRICE_ID",
+		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID",
+	) {
+		return nil, nil
 	}
 
-	perpetualProductID, err := stripeID(lookup, "GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID", "prod_")
+	secretKey, err := required(lookup, "GLASSEQ_STRIPE_SECRET_KEY")
 	if err != nil {
-		return StripeConfig{}, err
+		return nil, err
 	}
 	perpetualPriceID, err := stripeID(lookup, "GLASSEQ_STRIPE_PERPETUAL_PRICE_ID", "price_")
 	if err != nil {
-		return StripeConfig{}, err
-	}
-	monthlyProductID, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID", "prod_")
-	if err != nil {
-		return StripeConfig{}, err
+		return nil, err
 	}
 	monthlyPriceID, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_PRICE_ID", "price_")
 	if err != nil {
-		return StripeConfig{}, err
+		return nil, err
 	}
 
-	return StripeConfig{
-		SecretKey:          secretKey,
-		LiveMode:           mode == "live",
-		PerpetualProductID: perpetualProductID,
-		PerpetualPriceID:   perpetualPriceID,
-		MonthlyProductID:   monthlyProductID,
-		MonthlyPriceID:     monthlyPriceID,
+	return &StripeConfig{
+		SecretKey:        secretKey,
+		PerpetualPriceID: perpetualPriceID,
+		MonthlyPriceID:   monthlyPriceID,
 	}, nil
+}
+
+func anyConfigured(lookup func(string) (string, bool), names ...string) bool {
+	for _, name := range names {
+		value, ok := lookup(name)
+		if ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func stripeID(lookup func(string) (string, bool), name, prefix string) (string, error) {

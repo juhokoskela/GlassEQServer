@@ -41,30 +41,38 @@ func TestLoad(t *testing.T) {
 	if got.RecoveryQueueURL != values["GLASSEQ_RECOVERY_QUEUE_URL"] {
 		t.Errorf("recovery queue URL = %q", got.RecoveryQueueURL)
 	}
-	if got.Stripe.SecretKey != values["GLASSEQ_STRIPE_SECRET_KEY"] {
-		t.Error("Stripe secret key was not loaded")
-	}
-	if got.Stripe.LiveMode {
-		t.Error("Stripe live mode = true, want false")
-	}
-	if got.Stripe.PerpetualProductID != values["GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID"] ||
-		got.Stripe.PerpetualPriceID != values["GLASSEQ_STRIPE_PERPETUAL_PRICE_ID"] ||
-		got.Stripe.MonthlyProductID != values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] ||
-		got.Stripe.MonthlyPriceID != values["GLASSEQ_STRIPE_MONTHLY_PRICE_ID"] {
-		t.Error("Stripe product catalog was not loaded")
+	if got.Stripe != nil {
+		t.Error("Stripe configuration was enabled without Stripe variables")
 	}
 }
 
-func TestLoadRejectsInvalidStripeConfigurationWithoutEchoingSecret(t *testing.T) {
+func TestLoadStripeConfiguration(t *testing.T) {
 	values := validValues()
-	values["GLASSEQ_STRIPE_SECRET_KEY"] = "sk_live_do-not-echo"
+	values["GLASSEQ_STRIPE_SECRET_KEY"] = "sk_test_secret"
+	values["GLASSEQ_STRIPE_PERPETUAL_PRICE_ID"] = "price_1UBVfNEC4w9ZWN2YlB59OzfZ"
+	values["GLASSEQ_STRIPE_MONTHLY_PRICE_ID"] = "price_1UBVdzEC4w9ZWN2Y8pOBCyAE"
+
+	got, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load configuration: %v", err)
+	}
+	if got.Stripe == nil {
+		t.Fatal("Stripe configuration is nil")
+	}
+	if got.Stripe.SecretKey != values["GLASSEQ_STRIPE_SECRET_KEY"] ||
+		got.Stripe.PerpetualPriceID != values["GLASSEQ_STRIPE_PERPETUAL_PRICE_ID"] ||
+		got.Stripe.MonthlyPriceID != values["GLASSEQ_STRIPE_MONTHLY_PRICE_ID"] {
+		t.Error("Stripe configuration was not loaded")
+	}
+}
+
+func TestLoadRejectsIncompleteStripeConfigurationWithoutEchoingSecret(t *testing.T) {
+	values := validValues()
+	values["GLASSEQ_STRIPE_SECRET_KEY"] = "sk_test_do-not-echo"
 
 	_, err := load(mapLookup(values))
-	if err == nil {
-		t.Fatal("load configuration succeeded")
-	}
-	if !strings.Contains(err.Error(), "GLASSEQ_STRIPE_SECRET_KEY") {
-		t.Fatalf("error = %q, want Stripe key context", err)
+	if err == nil || !strings.Contains(err.Error(), "GLASSEQ_STRIPE_PERPETUAL_PRICE_ID") {
+		t.Fatalf("error = %q, want missing Stripe Price ID", err)
 	}
 	if strings.Contains(err.Error(), "do-not-echo") {
 		t.Fatalf("error disclosed Stripe credentials: %q", err)
@@ -138,20 +146,14 @@ func testSecretKey(value byte) string {
 
 func validValues() map[string]string {
 	return map[string]string{
-		"GLASSEQ_DATABASE_URL":                "postgres://glasseq:secret@db.example.com/glasseq",
-		"GLASSEQ_ENTITLEMENT_KMS_KEY_ID":      "kms-key",
-		"GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID":  "entitlement-2026-01",
-		"GLASSEQ_IDEMPOTENCY_KEY":             testSecretKey(1),
-		"GLASSEQ_RATE_LIMIT_HMAC_KEY":         testSecretKey(2),
-		"GLASSEQ_EMAIL_LOOKUP_HMAC_KEY":       testSecretKey(3),
-		"GLASSEQ_DATABASE_ENCRYPTION_KEY":     testSecretKey(4),
-		"GLASSEQ_RECOVERY_QUEUE_URL":          "https://sqs.eu-north-1.amazonaws.com/123456789012/recovery.fifo",
-		"GLASSEQ_STRIPE_SECRET_KEY":           "sk_test_secret",
-		"GLASSEQ_STRIPE_MODE":                 "test",
-		"GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID": "prod_VBtSu7EmXGUrL8",
-		"GLASSEQ_STRIPE_PERPETUAL_PRICE_ID":   "price_1UBVfNEC4w9ZWN2YlB59OzfZ",
-		"GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID":   "prod_VBtQ3VslhU3Tgv",
-		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID":     "price_1UBVdzEC4w9ZWN2Y8pOBCyAE",
+		"GLASSEQ_DATABASE_URL":               "postgres://glasseq:secret@db.example.com/glasseq",
+		"GLASSEQ_ENTITLEMENT_KMS_KEY_ID":     "kms-key",
+		"GLASSEQ_ENTITLEMENT_SIGNING_KEY_ID": "entitlement-2026-01",
+		"GLASSEQ_IDEMPOTENCY_KEY":            testSecretKey(1),
+		"GLASSEQ_RATE_LIMIT_HMAC_KEY":        testSecretKey(2),
+		"GLASSEQ_EMAIL_LOOKUP_HMAC_KEY":      testSecretKey(3),
+		"GLASSEQ_DATABASE_ENCRYPTION_KEY":    testSecretKey(4),
+		"GLASSEQ_RECOVERY_QUEUE_URL":         "https://sqs.eu-north-1.amazonaws.com/123456789012/recovery.fifo",
 	}
 }
 
