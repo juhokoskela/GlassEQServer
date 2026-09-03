@@ -38,7 +38,7 @@ ALTER TABLE activation_rate_limits
 
 CREATE TABLE license_delivery_outbox (
     id text PRIMARY KEY,
-    license_key_id text NOT NULL UNIQUE REFERENCES license_keys (id),
+    license_key_id text NOT NULL UNIQUE REFERENCES license_keys (id) ON DELETE CASCADE,
     created_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
     next_attempt_at timestamptz NOT NULL,
