@@ -97,7 +97,7 @@ Every Session has:
 - `client_reference_id`, `order_id`, `plan`, and `policy_version` set by the server;
 - terms-of-service consent required.
 
-The Stripe API version is a source-level constant shared by Checkout requests and the EventBridge destination. Managed Payments is still a public preview, so the exact version must be chosen and verified with a sandbox purchase immediately before implementation. Production rollout must not silently use Stripe's latest version.
+The Stripe API version is the source-level constant `2026-07-29.preview`, pinned by the exact `stripe-go` preview release used by the server and shared with the EventBridge destination. Managed Payments is still a public preview, so that version must be verified with a sandbox purchase before production rollout. Production must not silently use Stripe's latest version.
 
 ## Accepted Stripe events
 

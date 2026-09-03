@@ -23,6 +23,13 @@ type Config struct {
 	EmailLookupHMACKey      []byte
 	DatabaseEncryptionKey   []byte
 	RecoveryQueueURL        string
+	Stripe                  *StripeConfig
+}
+
+type StripeConfig struct {
+	SecretKey        string
+	PerpetualPriceID string
+	MonthlyPriceID   string
 }
 
 func Load() (Config, error) {
@@ -70,6 +77,10 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	stripeConfig, err := loadStripe(lookup)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		HTTPAddress:             httpAddress,
@@ -81,7 +92,58 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		EmailLookupHMACKey:      emailLookupHMACKey,
 		DatabaseEncryptionKey:   databaseEncryptionKey,
 		RecoveryQueueURL:        recoveryQueueURL,
+		Stripe:                  stripeConfig,
 	}, nil
+}
+
+func loadStripe(lookup func(string) (string, bool)) (*StripeConfig, error) {
+	if !anyConfigured(lookup,
+		"GLASSEQ_STRIPE_SECRET_KEY",
+		"GLASSEQ_STRIPE_PERPETUAL_PRICE_ID",
+		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID",
+	) {
+		return nil, nil
+	}
+
+	secretKey, err := required(lookup, "GLASSEQ_STRIPE_SECRET_KEY")
+	if err != nil {
+		return nil, err
+	}
+	perpetualPriceID, err := stripeID(lookup, "GLASSEQ_STRIPE_PERPETUAL_PRICE_ID", "price_")
+	if err != nil {
+		return nil, err
+	}
+	monthlyPriceID, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_PRICE_ID", "price_")
+	if err != nil {
+		return nil, err
+	}
+
+	return &StripeConfig{
+		SecretKey:        secretKey,
+		PerpetualPriceID: perpetualPriceID,
+		MonthlyPriceID:   monthlyPriceID,
+	}, nil
+}
+
+func anyConfigured(lookup func(string) (string, bool), names ...string) bool {
+	for _, name := range names {
+		value, ok := lookup(name)
+		if ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func stripeID(lookup func(string) (string, bool), name, prefix string) (string, error) {
+	value, err := required(lookup, name)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(value, prefix) || len(value) == len(prefix) {
+		return "", fmt.Errorf("%s must start with %s", name, prefix)
+	}
+	return value, nil
 }
 
 func secretKey(lookup func(string) (string, bool), name string) ([]byte, error) {

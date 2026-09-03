@@ -48,6 +48,16 @@ The server requires these environment variables:
 
 Keep the encryption and HMAC keys stable across deployments. Store them in the deployment's secret manager; do not commit them.
 
+Stripe Checkout is not wired into the server yet. Its configuration is optional for now, but these variables must be supplied together when present:
+
+| Variable | Purpose |
+| --- | --- |
+| `GLASSEQ_STRIPE_SECRET_KEY` | Stripe secret or restricted API key; store it in AWS Secrets Manager |
+| `GLASSEQ_STRIPE_PERPETUAL_PRICE_ID` | Environment-specific perpetual Price ID |
+| `GLASSEQ_STRIPE_MONTHLY_PRICE_ID` | Environment-specific monthly Price ID |
+
+The Checkout client derives test or live mode from the API key and rejects a response from the other environment. Product IDs will become configuration when the deployment preflight starts validating the catalog.
+
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
 The configured KMS key ID may be an alias. The server resolves it once at startup and uses the returned immutable key ARN for the process lifetime. Rotating the key requires a new JWS `kid` and replacement of the running tasks.
