@@ -208,7 +208,7 @@ func validStripeKeyPrefix(key, prefix string) bool {
 }
 
 func validCheckoutSession(session *stripe.CheckoutSession, input CreateCheckoutSessionInput, mode stripe.CheckoutSessionMode, liveMode bool) bool {
-	if session == nil || !strings.HasPrefix(session.ID, "cs_") || session.ExpiresAt <= 0 || session.Status != stripe.CheckoutSessionStatusOpen {
+	if session == nil || !strings.HasPrefix(session.ID, "cs_") || session.ExpiresAt <= time.Now().Unix() || session.Status != stripe.CheckoutSessionStatusOpen {
 		return false
 	}
 	if session.Livemode != liveMode || session.Mode != mode || session.ClientReferenceID != input.OrderID {

@@ -130,6 +130,7 @@ func TestCheckoutClientRejectsInvalidStripeResponse(t *testing.T) {
 		{name: "untrusted URL", mutate: func(session *stripe.CheckoutSession) { session.URL = "https://example.com/session" }},
 		{name: "missing ID", mutate: func(session *stripe.CheckoutSession) { session.ID = "" }},
 		{name: "missing expiry", mutate: func(session *stripe.CheckoutSession) { session.ExpiresAt = 0 }},
+		{name: "expired", mutate: func(session *stripe.CheckoutSession) { session.ExpiresAt = time.Now().Add(-time.Minute).Unix() }},
 	}
 
 	for _, test := range tests {
