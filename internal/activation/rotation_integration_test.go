@@ -93,6 +93,13 @@ func TestLicenseKeyRotationBoundsRetainedKeysWithPostgreSQL(t *testing.T) {
 	currentKey := testLicenseKey
 	now := service.now()
 	service.now = func() time.Time { return now }
+	if _, err := database.ExecContext(context.Background(), `
+		INSERT INTO license_delivery_outbox (
+		    id, license_key_id, created_at, expires_at, next_attempt_at
+		) VALUES ($1, $2, $3, $3::timestamptz + interval '7 days', $3)`,
+		"email_rotation_retention", "key_lic_rotation_retention", now); err != nil {
+		t.Fatalf("seed license-delivery outbox: %v", err)
+	}
 	idempotencyKeys := [...]string{
 		"d532f449-4f43-4375-b941-141649636a1c",
 		"3f779e0e-5a3f-491c-b2c8-68251c04ac45",
@@ -113,6 +120,7 @@ func TestLicenseKeyRotationBoundsRetainedKeysWithPostgreSQL(t *testing.T) {
 
 	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation_retention' AND state = 'active'", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM license_keys WHERE license_id = 'lic_rotation_retention' AND state = 'revoked'", nil, 1)
+	assertRowCount(t, database, "SELECT count(*) FROM license_delivery_outbox WHERE id = 'email_rotation_retention'", nil, 0)
 }
 
 func TestLicenseKeyRotationRollsBackWhenReplayEncryptionFailsWithPostgreSQL(t *testing.T) {
