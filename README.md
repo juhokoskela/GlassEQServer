@@ -9,7 +9,7 @@ The project is under active development. The current service exposes liveness, d
 - AWS KMS holds the entitlement private key. The service can request Ed25519 signatures but cannot export the private key.
 - The Sparkle and Apple release keys do not belong to this service. The GlassEQ release workflow builds and signs updates separately.
 - The ECS task role must not be able to upload, replace, or delete update artifacts.
-- The ECS task role may send messages only to the recovery-email FIFO queue. The queue must use server-side encryption.
+- The ECS task role may send messages only to the email FIFO queue used for recovery and license delivery. The queue must use server-side encryption.
 - The ECS task security group must accept public HTTP traffic only through the Application Load Balancer. The load balancer must use its default `append` mode for `X-Forwarded-For`, with client-port preservation disabled. Activation rate limits use the rightmost address appended by the load balancer.
 - Logs must not contain credentials, entitlement bodies, email addresses, Stripe payloads, or download authorization headers.
 
