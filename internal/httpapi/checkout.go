@@ -22,14 +22,14 @@ type checkoutService interface {
 }
 
 func (a *api) createCheckoutSession(w http.ResponseWriter, request *http.Request) {
+	if !allowCheckoutOrigin(w, request, false) {
+		writeError(w, http.StatusForbidden, "origin_not_allowed", "The request origin is not allowed.", "")
+		return
+	}
 	requestID, err := randomRequestID()
 	if err != nil {
 		a.logger.ErrorContext(request.Context(), "generate request ID", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", "")
-		return
-	}
-	if !allowCheckoutOrigin(w, request, false) {
-		writeError(w, http.StatusForbidden, "origin_not_allowed", "The request origin is not allowed.", requestID)
 		return
 	}
 
