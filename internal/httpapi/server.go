@@ -45,11 +45,16 @@ type activationService interface {
 type api struct {
 	database    databasePinger
 	activations activationService
+	checkouts   checkoutService
 	logger      *slog.Logger
 }
 
 func New(database databasePinger, activations activationService, logger *slog.Logger) http.Handler {
-	api := &api{database: database, activations: activations, logger: logger}
+	return NewWithCheckout(database, activations, nil, logger)
+}
+
+func NewWithCheckout(database databasePinger, activations activationService, checkouts checkoutService, logger *slog.Logger) http.Handler {
+	api := &api{database: database, activations: activations, checkouts: checkouts, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", api.health)
 	mux.HandleFunc("GET /readyz", api.ready)
@@ -62,6 +67,10 @@ func New(database databasePinger, activations activationService, logger *slog.Lo
 	mux.HandleFunc("POST /v1/management/license-key-rotations", api.rotateLicenseKey)
 	mux.HandleFunc("POST /v1/recovery-requests", api.requestRecovery)
 	mux.HandleFunc("POST /v1/recovery-sessions", api.createRecoverySession)
+	if checkouts != nil {
+		mux.HandleFunc("POST /v1/checkout-sessions", api.createCheckoutSession)
+		mux.HandleFunc("OPTIONS /v1/checkout-sessions", api.checkoutPreflight)
+	}
 	return mux
 }
 

@@ -22,6 +22,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/juhokoskela/GlassEQServer/internal/activation"
+	"github.com/juhokoskela/GlassEQServer/internal/billing"
 	"github.com/juhokoskela/GlassEQServer/internal/config"
 	"github.com/juhokoskela/GlassEQServer/internal/entitlement"
 	"github.com/juhokoskela/GlassEQServer/internal/httpapi"
@@ -92,6 +93,20 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create activation service: %w", err)
 	}
+	var checkoutService *billing.OrderService
+	if settings.Stripe != nil {
+		checkoutClient, err := billing.NewCheckoutClient(settings.Stripe.SecretKey)
+		if err != nil {
+			return fmt.Errorf("create Stripe Checkout client: %w", err)
+		}
+		checkoutService, err = billing.NewOrderService(database, checkoutClient, billing.PriceCatalog{
+			PerpetualV1: settings.Stripe.PerpetualPriceID,
+			Monthly:     settings.Stripe.MonthlyPriceID,
+		}, settings.RateLimitHMACKey)
+		if err != nil {
+			return fmt.Errorf("create Checkout order service: %w", err)
+		}
+	}
 
 	listener, err := net.Listen("tcp", settings.HTTPAddress)
 	if err != nil {
@@ -99,8 +114,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer listener.Close()
 
+	var handler http.Handler
+	if checkoutService == nil {
+		handler = httpapi.New(database, activationService, logger)
+	} else {
+		handler = httpapi.NewWithCheckout(database, activationService, checkoutService, logger)
+	}
 	server := &http.Server{
-		Handler:           httpapi.New(database, activationService, logger),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -113,6 +134,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"address", listener.Addr().String(),
 		"entitlement_key_id", settings.EntitlementSigningKeyID,
 		"entitlement_public_key_sha256", hex.EncodeToString(fingerprint[:]),
+		"checkout_enabled", checkoutService != nil,
 	)
 	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	var background sync.WaitGroup

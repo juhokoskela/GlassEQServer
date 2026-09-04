@@ -62,7 +62,7 @@ Request body:
 {"plan":"perpetual_v1"}
 ```
 
-The only accepted plans are `perpetual_v1` and `monthly`. The response is:
+The only accepted plans are `perpetual_v1` and `monthly`. A successful request returns `201 Created`:
 
 ```json
 {
@@ -74,7 +74,9 @@ The caller generates a cryptographically random UUID v4 and sends it in canonica
 
 The server applies a short request deadline, permits 60 valid attempts per client IP per minute, and permits 20 new order reservations per client IP per hour. IPv6 addresses are grouped by `/64` for both limits. It uses the caller's idempotency UUID to derive a stable internal order ID and Stripe idempotency key. Repeating the same UUID and plan returns the same Stripe Session. Reusing it for another plan returns `409 Conflict`. Reusing it after that Session expires returns `409 Conflict` with `checkout_session_expired`; the caller must generate a new key.
 
-The browser-facing endpoint permits cross-origin requests only from `https://glasseq.app`, with the minimum methods and headers needed for this request. CORS is not authentication; server-owned parameters, validation, idempotency, and rate limits remain the security boundary.
+The route exists only when all Stripe configuration is present. Browser requests permit the exact origin `https://glasseq.app`. Preflight permits only `POST`, `Content-Type`, and `Idempotency-Key`. Requests without an `Origin` header remain available to non-browser clients. CORS is not authentication; server-owned parameters, validation, idempotency, and rate limits remain the security boundary.
+
+Malformed JSON and invalid fields return `400`, oversized request bodies return `413`, and missing or unsupported content types return `415`. A foreign browser origin returns `403`. Reusing one idempotency key for another plan, an expired Session, or a completed Session returns `409` with `checkout_idempotency_conflict`, `checkout_session_expired`, or `checkout_session_complete`. Rate limits return `429` with `Retry-After`, which the trusted browser origin may read. Temporary database, Stripe, and concurrency failures return `503` and are safe to retry with the same idempotency key.
 
 Creating a Session follows this sequence:
 
