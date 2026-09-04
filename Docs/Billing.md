@@ -72,22 +72,25 @@ The only accepted plans are `perpetual_v1` and `monthly`. The response is:
 
 The caller generates a cryptographically random UUID v4 and sends it in canonical lowercase form. The server rejects other UUID versions. Treat the key as a bearer capability until the Session expires. It authorizes replay of only that Checkout URL, not license or account access.
 
-The server applies a short request deadline and permits 20 new order reservations per client IP per hour. Replays do not consume this allowance. It uses the caller's idempotency UUID to derive a stable internal order ID and Stripe idempotency key. Repeating the same UUID and plan returns the same Stripe Session. Reusing it for another plan returns `409 Conflict`. Reusing it after that Session expires returns `409 Conflict` with `checkout_session_expired`; the caller must generate a new key.
+The server applies a short request deadline, permits 60 valid attempts per client IP per minute, and permits 20 new order reservations per client IP per hour. IPv6 addresses are grouped by `/64` for both limits. It uses the caller's idempotency UUID to derive a stable internal order ID and Stripe idempotency key. Repeating the same UUID and plan returns the same Stripe Session. Reusing it for another plan returns `409 Conflict`. Reusing it after that Session expires returns `409 Conflict` with `checkout_session_expired`; the caller must generate a new key.
 
 The browser-facing endpoint permits cross-origin requests only from `https://glasseq.app`, with the minimum methods and headers needed for this request. CORS is not authentication; server-owned parameters, validation, idempotency, and rate limits remain the security boundary.
 
 Creating a Session follows this sequence:
 
-1. Validate the request and look for an existing order created with the idempotency key.
-2. For a new request, enforce the IP rate limit and insert a pending order reservation in one short database transaction.
-3. Build the complete Stripe request from server-owned configuration.
-4. Create the Checkout Session outside any database transaction.
-5. Attach the Stripe Session ID to the reserved order in a short transaction.
-6. Return the Stripe-hosted URL.
+1. Validate the request and enforce the all-attempt IP rate limit.
+2. Look for an existing order created with the idempotency key.
+3. For a new request, enforce the reservation IP rate limit and insert a pending order reservation in one short database transaction.
+4. Build the complete Stripe request from server-owned configuration.
+5. Create or retrieve the Checkout Session outside any database transaction and within the task's four-request Stripe concurrency limit.
+6. Attach a newly created Stripe Session ID to the reserved order in a short transaction.
+7. Return the Stripe-hosted URL.
 
 The stable order reservation and Stripe idempotency key make a retry safe if Stripe creates the Session but the process fails before its ID is attached. The order identifier is also sent as `client_reference_id` and metadata, so an event can recover the association and fulfillment can reject an unrelated Session. The schema must allow a reserved order to exist briefly without a Stripe Session ID.
 
-Once an order has a Session ID, a replay retrieves that exact Session instead of repeating the create request. An unattached reservation repeats the idempotent create only during Stripe's 24-hour idempotency window. After that window, the reservation is treated as expired so a pruned Stripe key cannot create a replacement Session.
+Once an order has a Session ID, a replay retrieves that exact Session instead of repeating the create request. An unattached reservation repeats the idempotent create only until five minutes before Stripe's 24-hour idempotency boundary. After that cutoff, the reservation is treated as expired so a pruned Stripe key cannot create a replacement Session. Simultaneous requests using one idempotency key may receive a transient upstream or busy result; the caller retries the same request rather than generating a new key.
+
+Stripe's `expired` and `complete` Session statuses are valid terminal states. An expired Session returns `checkout_session_expired`; a complete Session returns `checkout_session_complete` while fulfillment proceeds from Stripe events. Only an open, unexpired Session returns a Checkout URL.
 
 Every Session has:
 
