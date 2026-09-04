@@ -88,6 +88,7 @@ func allowCheckoutOrigin(w http.ResponseWriter, request *http.Request, required 
 		return false
 	}
 	w.Header().Set("Access-Control-Allow-Origin", checkoutOrigin)
+	w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 	return true
 }
 
@@ -109,6 +110,7 @@ func validCheckoutPreflight(request *http.Request) bool {
 
 func (a *api) writeCheckoutError(w http.ResponseWriter, request *http.Request, requestID string, err error) {
 	var rateLimitError *billing.CheckoutRateLimitError
+	var stripeError *billing.StripeRequestError
 	switch {
 	case errors.Is(err, billing.ErrInvalidCheckoutRequest):
 		writeError(w, http.StatusBadRequest, "invalid_request", "The Checkout request is invalid.", requestID)
@@ -125,6 +127,14 @@ func (a *api) writeCheckoutError(w http.ResponseWriter, request *http.Request, r
 		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many Checkout requests. Try again later.", requestID)
 	case errors.Is(err, billing.ErrCheckoutBusy):
 		w.Header().Set("Retry-After", strconv.Itoa(checkoutBusyRetryAfter))
+		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
+	case errors.As(err, &stripeError):
+		a.logger.ErrorContext(request.Context(), "create Checkout Session",
+			"request_id", requestID,
+			"stripe_http_status", stripeError.HTTPStatusCode,
+			"stripe_code", stripeError.Code,
+			"stripe_request_id", stripeError.RequestID,
+		)
 		writeError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "The service is temporarily unavailable.", requestID)
 	default:
 		a.logger.ErrorContext(request.Context(), "create Checkout Session", "request_id", requestID, "error", err)

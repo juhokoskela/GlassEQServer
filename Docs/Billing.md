@@ -76,7 +76,7 @@ The server applies a short request deadline, permits 60 valid attempts per clien
 
 The route exists only when all Stripe configuration is present. Browser requests permit the exact origin `https://glasseq.app`. Preflight permits only `POST`, `Content-Type`, and `Idempotency-Key`. Requests without an `Origin` header remain available to non-browser clients. CORS is not authentication; server-owned parameters, validation, idempotency, and rate limits remain the security boundary.
 
-Invalid requests return `400`, and a foreign browser origin returns `403`. Reusing one idempotency key for another plan, an expired Session, or a completed Session returns `409` with `checkout_idempotency_conflict`, `checkout_session_expired`, or `checkout_session_complete`. Rate limits return `429` with `Retry-After`. Temporary database, Stripe, and concurrency failures return `503` and are safe to retry with the same idempotency key.
+Malformed JSON and invalid fields return `400`, oversized request bodies return `413`, and missing or unsupported content types return `415`. A foreign browser origin returns `403`. Reusing one idempotency key for another plan, an expired Session, or a completed Session returns `409` with `checkout_idempotency_conflict`, `checkout_session_expired`, or `checkout_session_complete`. Rate limits return `429` with `Retry-After`, which the trusted browser origin may read. Temporary database, Stripe, and concurrency failures return `503` and are safe to retry with the same idempotency key.
 
 Creating a Session follows this sequence:
 

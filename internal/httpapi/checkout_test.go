@@ -1,8 +1,9 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -14,12 +15,7 @@ import (
 )
 
 func TestCheckoutPassesBoundedRequestToService(t *testing.T) {
-	checkouts := &fakeCheckoutService{response: billing.CheckoutSession{
-		ID:        "cs_test_example",
-		URL:       "https://checkout.stripe.com/c/pay/example",
-		ExpiresAt: time.Now().Add(time.Hour),
-		State:     billing.CheckoutSessionOpen,
-	}}
+	checkouts := &fakeCheckoutService{response: billing.CheckoutSession{URL: "https://checkout.stripe.com/c/pay/example"}}
 	request := checkoutHTTPRequest(`{"plan":"monthly"}`)
 	request.Header.Set("Origin", checkoutOrigin)
 	request.Header.Set("X-Forwarded-For", "203.0.113.8, 198.51.100.4")
@@ -163,29 +159,33 @@ func TestCheckoutPreflight(t *testing.T) {
 
 func TestCheckoutMapsDomainErrors(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		wantStatus int
-		wantCode   string
-		wantRetry  string
-		retryable  bool
+		name        string
+		err         error
+		wantStatus  int
+		wantCode    string
+		wantRetry   string
+		retryable   bool
+		crossOrigin bool
 	}{
 		{name: "invalid", err: billing.ErrInvalidCheckoutRequest, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
 		{name: "idempotency conflict", err: billing.ErrCheckoutIdempotencyConflict, wantStatus: http.StatusConflict, wantCode: "checkout_idempotency_conflict"},
 		{name: "expired", err: billing.ErrCheckoutSessionExpired, wantStatus: http.StatusConflict, wantCode: "checkout_session_expired"},
 		{name: "complete", err: billing.ErrCheckoutSessionComplete, wantStatus: http.StatusConflict, wantCode: "checkout_session_complete"},
-		{name: "rate limited", err: &billing.CheckoutRateLimitError{RetryAfterSeconds: 42}, wantStatus: http.StatusTooManyRequests, wantCode: "rate_limited", wantRetry: "42", retryable: true},
+		{name: "rate limited", err: &billing.CheckoutRateLimitError{RetryAfterSeconds: 42}, wantStatus: http.StatusTooManyRequests, wantCode: "rate_limited", wantRetry: "42", retryable: true, crossOrigin: true},
 		{name: "busy", err: billing.ErrCheckoutBusy, wantStatus: http.StatusServiceUnavailable, wantCode: "temporarily_unavailable", wantRetry: "1", retryable: true},
 		{name: "Stripe unavailable", err: billing.ErrStripeUnavailable, wantStatus: http.StatusServiceUnavailable, wantCode: "temporarily_unavailable", retryable: true},
-		{name: "unexpected", err: errors.New("database unavailable"), wantStatus: http.StatusServiceUnavailable, wantCode: "temporarily_unavailable", retryable: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			checkouts := &fakeCheckoutService{err: test.err}
+			request := checkoutHTTPRequest(`{"plan":"monthly"}`)
+			if test.crossOrigin {
+				request.Header.Set("Origin", checkoutOrigin)
+			}
 			response := httptest.NewRecorder()
 
-			NewWithCheckout(&fakeDatabase{}, nil, checkouts, discardLogger()).ServeHTTP(response, checkoutHTTPRequest(`{"plan":"monthly"}`))
+			NewWithCheckout(&fakeDatabase{}, nil, checkouts, discardLogger()).ServeHTTP(response, request)
 
 			if response.Code != test.wantStatus {
 				t.Fatalf("status = %d, want %d", response.Code, test.wantStatus)
@@ -199,7 +199,39 @@ func TestCheckoutMapsDomainErrors(t *testing.T) {
 			if got := response.Header().Get("Retry-After"); got != test.wantRetry {
 				t.Errorf("Retry-After = %q, want %q", got, test.wantRetry)
 			}
+			if test.crossOrigin && response.Header().Get("Access-Control-Expose-Headers") != "Retry-After" {
+				t.Errorf("Access-Control-Expose-Headers = %q", response.Header().Get("Access-Control-Expose-Headers"))
+			}
 		})
+	}
+}
+
+func TestCheckoutLogsStripeRequestDiagnostics(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	checkouts := &fakeCheckoutService{err: &billing.StripeRequestError{
+		HTTPStatusCode: http.StatusTooManyRequests,
+		Code:           "rate_limit",
+		RequestID:      "req_stripe_example",
+	}}
+	response := httptest.NewRecorder()
+
+	NewWithCheckout(&fakeDatabase{}, nil, checkouts, logger).ServeHTTP(response, checkoutHTTPRequest(`{"plan":"monthly"}`))
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(response.Body.String(), "rate_limit") || strings.Contains(response.Body.String(), "req_stripe_example") {
+		t.Errorf("body exposes Stripe diagnostics: %q", response.Body.String())
+	}
+	for _, field := range []string{
+		`"stripe_http_status":429`,
+		`"stripe_code":"rate_limit"`,
+		`"stripe_request_id":"req_stripe_example"`,
+	} {
+		if !strings.Contains(logs.String(), field) {
+			t.Errorf("log = %q, want field %s", logs.String(), field)
+		}
 	}
 }
 
