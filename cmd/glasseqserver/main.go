@@ -41,10 +41,36 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, logger); err != nil {
-		logger.Error("server stopped", "error", err)
-		os.Exit(1)
+	if len(os.Args) == 1 {
+		if err := run(ctx, logger); err != nil {
+			logFailure(logger, "server stopped", err)
+			os.Exit(1)
+		}
+		return
 	}
+	if len(os.Args) == 2 && os.Args[1] == "check-stripe-catalog" {
+		if err := checkStripeCatalog(ctx, logger); err != nil {
+			logFailure(logger, "Stripe catalog check failed", err)
+			os.Exit(1)
+		}
+		return
+	}
+	logger.Error("invalid command", "error", "usage: glasseqserver [check-stripe-catalog]")
+	os.Exit(1)
+}
+
+func logFailure(logger *slog.Logger, message string, err error) {
+	var stripeError *billing.StripeRequestError
+	if errors.As(err, &stripeError) {
+		logger.Error(message,
+			"error", err,
+			"stripe_http_status", stripeError.HTTPStatusCode,
+			"stripe_code", stripeError.Code,
+			"stripe_request_id", stripeError.RequestID,
+		)
+		return
+	}
+	logger.Error(message, "error", err)
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
