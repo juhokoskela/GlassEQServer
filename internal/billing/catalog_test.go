@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -13,16 +14,21 @@ import (
 func TestCheckoutClientChecksCatalog(t *testing.T) {
 	catalog := testCatalogSpec()
 	prices := &fakeStripePrices{responses: map[string]*stripe.Price{
-		catalog.Perpetual.PriceID: testCatalogPrice(catalog.Perpetual, perpetualPriceAmount, false),
-		catalog.Monthly.PriceID:   testCatalogPrice(catalog.Monthly, monthlyPriceAmount, true),
+		catalog.Perpetual.PriceID: testCatalogPrice(catalog.Perpetual, 2_999, false),
+		catalog.Monthly.PriceID:   testCatalogPrice(catalog.Monthly, 299, true),
 	}}
 	client := &CheckoutClient{prices: prices}
 
 	if err := client.CheckCatalog(context.Background(), catalog); err != nil {
 		t.Fatalf("check catalog: %v", err)
 	}
-	if strings.Join(prices.ids, ",") != catalog.Perpetual.PriceID+","+catalog.Monthly.PriceID {
+	if !slices.Equal(prices.ids, []string{catalog.Perpetual.PriceID, catalog.Monthly.PriceID}) {
 		t.Errorf("retrieved Price IDs = %v", prices.ids)
+	}
+	for index, params := range prices.params {
+		if params == nil || len(params.Expand) != 1 || params.Expand[0] == nil || *params.Expand[0] != "product" {
+			t.Errorf("Price request %d expansions = %v, want product", index, params)
+		}
 	}
 	if !prices.hasDeadline {
 		t.Error("Stripe catalog requests have no deadline")
@@ -59,7 +65,7 @@ func TestCheckoutClientRejectsInvalidCatalogBeforeStripe(t *testing.T) {
 
 func TestCatalogPriceValidation(t *testing.T) {
 	configured := CatalogPrice{PriceID: "price_monthly", ProductID: "prod_monthly"}
-	expected := catalogPriceExpectation{plan: PlanMonthly, configured: configured, amount: monthlyPriceAmount, recurring: true}
+	expected := catalogPriceExpectation{plan: PlanMonthly, configured: configured, amount: monthlyPriceAmount}
 	tests := []struct {
 		name     string
 		mutate   func(*stripe.Price)
@@ -77,7 +83,14 @@ func TestCatalogPriceValidation(t *testing.T) {
 		{name: "custom amount", mutate: func(price *stripe.Price) { price.CustomUnitAmount = &stripe.PriceCustomUnitAmount{} }},
 		{name: "wrong amount", mutate: func(price *stripe.Price) { price.UnitAmount++ }},
 		{name: "inclusive tax", mutate: func(price *stripe.Price) { price.TaxBehavior = stripe.PriceTaxBehaviorInclusive }},
+		{name: "missing Product", mutate: func(price *stripe.Price) { price.Product = nil }},
 		{name: "wrong Product", mutate: func(price *stripe.Price) { price.Product.ID = "prod_other" }},
+		{name: "Product stub", mutate: func(price *stripe.Price) { price.Product.Object = "" }},
+		{name: "deleted Product", mutate: func(price *stripe.Price) { price.Product.Deleted = true }},
+		{name: "inactive Product", mutate: func(price *stripe.Price) { price.Product.Active = false }},
+		{name: "wrong Product environment", mutate: func(price *stripe.Price) { price.Product.Livemode = true }},
+		{name: "missing Product tax code", mutate: func(price *stripe.Price) { price.Product.TaxCode = nil }},
+		{name: "wrong Product tax code", mutate: func(price *stripe.Price) { price.Product.TaxCode.ID = "txcd_10000000" }},
 		{name: "one-time", mutate: func(price *stripe.Price) { price.Type = stripe.PriceTypeOneTime; price.Recurring = nil }},
 		{name: "wrong interval", mutate: func(price *stripe.Price) { price.Recurring.Interval = stripe.PriceRecurringIntervalYear }},
 		{name: "wrong interval count", mutate: func(price *stripe.Price) { price.Recurring.IntervalCount = 2 }},
@@ -146,10 +159,15 @@ func testCatalogPrice(configured CatalogPrice, amount int64, recurring bool) *st
 		Currency:      stripe.CurrencyEUR,
 		ID:            configured.PriceID,
 		Object:        "price",
-		Product:       &stripe.Product{ID: configured.ProductID},
-		TaxBehavior:   stripe.PriceTaxBehaviorExclusive,
-		Type:          stripe.PriceTypeOneTime,
-		UnitAmount:    amount,
+		Product: &stripe.Product{
+			Active:  true,
+			ID:      configured.ProductID,
+			Object:  "product",
+			TaxCode: &stripe.TaxCode{ID: glassEQTaxCode},
+		},
+		TaxBehavior: stripe.PriceTaxBehaviorExclusive,
+		Type:        stripe.PriceTypeOneTime,
+		UnitAmount:  amount,
 	}
 	if recurring {
 		price.Type = stripe.PriceTypeRecurring
@@ -166,11 +184,13 @@ type fakeStripePrices struct {
 	responses   map[string]*stripe.Price
 	err         error
 	ids         []string
+	params      []*stripe.PriceRetrieveParams
 	hasDeadline bool
 }
 
-func (f *fakeStripePrices) Retrieve(ctx context.Context, id string, _ *stripe.PriceRetrieveParams) (*stripe.Price, error) {
+func (f *fakeStripePrices) Retrieve(ctx context.Context, id string, params *stripe.PriceRetrieveParams) (*stripe.Price, error) {
 	f.ids = append(f.ids, id)
+	f.params = append(f.params, params)
 	_, f.hasDeadline = ctx.Deadline()
 	return f.responses[id], f.err
 }

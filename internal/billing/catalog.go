@@ -11,6 +11,7 @@ import (
 const (
 	perpetualPriceAmount = 2_999
 	monthlyPriceAmount   = 299
+	glassEQTaxCode       = "txcd_10202001"
 )
 
 type CatalogSpec struct {
@@ -27,13 +28,12 @@ type catalogPriceExpectation struct {
 	plan       Plan
 	configured CatalogPrice
 	amount     int64
-	recurring  bool
 }
 
 func (c *CheckoutClient) CheckCatalog(ctx context.Context, catalog CatalogSpec) error {
 	expectations := []catalogPriceExpectation{
 		{plan: PlanPerpetualV1, configured: catalog.Perpetual, amount: perpetualPriceAmount},
-		{plan: PlanMonthly, configured: catalog.Monthly, amount: monthlyPriceAmount, recurring: true},
+		{plan: PlanMonthly, configured: catalog.Monthly, amount: monthlyPriceAmount},
 	}
 	for _, expected := range expectations {
 		if !validPriceID(expected.configured.PriceID) {
@@ -46,8 +46,10 @@ func (c *CheckoutClient) CheckCatalog(ctx context.Context, catalog CatalogSpec) 
 
 	requestCtx, cancel := context.WithTimeout(ctx, stripeRequestTimeout)
 	defer cancel()
+	params := &stripe.PriceRetrieveParams{}
+	params.AddExpand("product")
 	for _, expected := range expectations {
-		price, err := c.prices.Retrieve(requestCtx, expected.configured.PriceID, nil)
+		price, err := c.prices.Retrieve(requestCtx, expected.configured.PriceID, params)
 		if err != nil {
 			return fmt.Errorf("retrieve %s Stripe Price: %w", expected.plan, sanitizeStripeError(requestCtx, err))
 		}
@@ -90,19 +92,35 @@ func validateCatalogPrice(price *stripe.Price, expected catalogPriceExpectation,
 	if price.Product == nil || price.Product.ID != expected.configured.ProductID {
 		return fmt.Errorf("%s Product does not match %q", name, expected.configured.ProductID)
 	}
+	if price.Product.Object != "product" || price.Product.Deleted {
+		return errors.New(name + " Product response is not a Product")
+	}
+	if !price.Product.Active {
+		return errors.New(name + " Product is inactive")
+	}
+	if price.Product.Livemode != liveMode {
+		return errors.New(name + " Product belongs to the wrong Stripe environment")
+	}
+	if price.Product.TaxCode == nil || price.Product.TaxCode.ID != glassEQTaxCode {
+		return fmt.Errorf("%s Product tax code must be %s", name, glassEQTaxCode)
+	}
 
-	if !expected.recurring {
+	switch expected.plan {
+	case PlanPerpetualV1:
 		if price.Type != stripe.PriceTypeOneTime || price.Recurring != nil {
 			return errors.New(name + " must be one-time")
 		}
 		return nil
+	case PlanMonthly:
+		if price.Type != stripe.PriceTypeRecurring || price.Recurring == nil {
+			return errors.New(name + " must be recurring")
+		}
+		if price.Recurring.Interval != stripe.PriceRecurringIntervalMonth || price.Recurring.IntervalCount != 1 ||
+			price.Recurring.UsageType != stripe.PriceRecurringUsageTypeLicensed || price.Recurring.TrialPeriodDays != 0 {
+			return errors.New(name + " must bill one licensed unit monthly without a trial")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported catalog plan %q", expected.plan)
 	}
-	if price.Type != stripe.PriceTypeRecurring || price.Recurring == nil {
-		return errors.New(name + " must be recurring")
-	}
-	if price.Recurring.Interval != stripe.PriceRecurringIntervalMonth || price.Recurring.IntervalCount != 1 ||
-		price.Recurring.UsageType != stripe.PriceRecurringUsageTypeLicensed || price.Recurring.TrialPeriodDays != 0 {
-		return errors.New(name + " must bill one licensed unit monthly without a trial")
-	}
-	return nil
 }
