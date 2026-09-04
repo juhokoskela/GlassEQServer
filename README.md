@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, and account-recovery endpoints. It issues entitlements with an AWS KMS Ed25519 key. The Stripe Checkout client and database order coordinator are implemented, but the public billing API, event processing, recovery-email consumption, and download endpoints are not. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, account recovery, and optional Stripe Checkout. It issues entitlements with an AWS KMS Ed25519 key. Stripe event processing, recovery-email consumption, and download endpoints are not implemented. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
 
 ## Trust boundaries
 
@@ -48,7 +48,7 @@ The server requires these environment variables:
 
 Keep the encryption and HMAC keys stable across deployments. Store them in the deployment's secret manager; do not commit them.
 
-Stripe Checkout is not wired into the server yet. Its configuration is optional for now, but these variables must be supplied together when present:
+Stripe Checkout is optional. Supplying any of these variables requires all three and enables the public Checkout endpoint:
 
 | Variable | Purpose |
 | --- | --- |
@@ -56,7 +56,7 @@ Stripe Checkout is not wired into the server yet. Its configuration is optional 
 | `GLASSEQ_STRIPE_PERPETUAL_PRICE_ID` | Environment-specific perpetual Price ID |
 | `GLASSEQ_STRIPE_MONTHLY_PRICE_ID` | Environment-specific monthly Price ID |
 
-The Checkout client derives test or live mode from the API key and rejects a response from the other environment. Product IDs will become configuration when the deployment preflight starts validating the catalog.
+The Checkout client derives test or live mode from the API key and rejects a response from the other environment. The configured Price IDs remain server-owned and are never accepted from callers.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
@@ -75,6 +75,7 @@ The service exposes:
 - `POST /v1/management/license-key-rotations` for replacing the license key.
 - `POST /v1/recovery-requests` for requesting email recovery. Requires an `Idempotency-Key` header.
 - `POST /v1/recovery-sessions` for exchanging a one-time bearer recovery token for a management session. Requires an `Idempotency-Key` header.
+- `POST /v1/checkout-sessions` for creating or replaying a Stripe-hosted Checkout Session when Stripe is configured. Requires an `Idempotency-Key` header.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
 
@@ -93,7 +94,7 @@ Recovery tokens can be exchanged once while the associated license remains activ
 ## Checks
 
 ```sh
-go test -race ./...
+go test -race -p 1 ./...
 go vet ./...
 docker build --build-arg SOURCE_REVISION=development .
 ```
