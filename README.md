@@ -58,6 +58,21 @@ Stripe Checkout is optional. Supplying any of these variables requires all three
 
 The Checkout client derives test or live mode from the API key and rejects a response from the other environment. The configured Price IDs remain server-owned and are never accepted from callers.
 
+Before enabling Checkout or changing its Stripe catalog, add these variables to the preflight task's environment:
+
+| Variable | Purpose |
+| --- | --- |
+| `GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID` | Environment-specific perpetual Product ID |
+| `GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID` | Environment-specific monthly Product ID |
+
+The preflight task also needs the three Stripe Checkout variables above. Run it with the same server image:
+
+```sh
+glasseqserver check-stripe-catalog
+```
+
+The command retrieves both configured Prices and returns a nonzero status unless their environment, Products, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. Product IDs are required only by this command; they do not change whether the server enables Checkout at runtime.
+
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
 The configured KMS key ID may be an alias. The server resolves it once at startup and uses the returned immutable key ARN for the process lifetime. Rotating the key requires a new JWS `kid` and replacement of the running tasks.

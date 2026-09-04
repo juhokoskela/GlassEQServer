@@ -242,7 +242,7 @@ Retention is explicit:
 
 ## Configuration and rollout gates
 
-Sandbox and production use separate Stripe accounts or modes, keys, Price IDs, EventBridge destinations, queues, and secrets. A deployment preflight validates that both configured Prices exist, use EUR, have the expected recurring shape, and belong to the expected Products. Runtime requests trust the pinned Price IDs and do not repeat that network validation.
+Sandbox and production use separate Stripe accounts or modes, keys, Price IDs, EventBridge destinations, queues, and secrets. The `glasseqserver check-stripe-catalog` deployment preflight validates that both configured Prices are active, belong to the key's environment and expected Products, use the fixed tax-exclusive EUR amounts, and have the expected one-time or monthly billing shape without a trial. Runtime requests trust the pinned Price IDs and do not repeat that network validation.
 
 The billing feature stays disabled until all of these are true:
 
