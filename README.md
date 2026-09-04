@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, and account-recovery endpoints. It issues entitlements with an AWS KMS Ed25519 key. Billing, recovery-email consumption, and download endpoints are not implemented yet. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, and account-recovery endpoints. It issues entitlements with an AWS KMS Ed25519 key. The Stripe Checkout client and database order coordinator are implemented, but the public billing API, event processing, recovery-email consumption, and download endpoints are not. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
 
 ## Trust boundaries
 
