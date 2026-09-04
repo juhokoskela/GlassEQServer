@@ -26,6 +26,7 @@ const (
 
 var (
 	ErrInvalidCheckoutSession = errors.New("Stripe returned an invalid Checkout Session")
+	ErrCheckoutSessionExpired = errors.New("Checkout Session has expired")
 	ErrStripeUnavailable      = errors.New("Stripe Checkout is unavailable")
 )
 
@@ -46,16 +47,11 @@ const (
 	PlanMonthly     Plan = "monthly"
 )
 
-type CheckoutConfig struct {
-	SecretKey        string
-	PerpetualPriceID string
-	MonthlyPriceID   string
-}
-
-type CreateCheckoutSessionInput struct {
-	OrderID        string
-	Plan           Plan
-	IdempotencyKey string
+type CheckoutSessionSpec struct {
+	OrderID       string
+	Plan          Plan
+	PriceID       string
+	PolicyVersion string
 }
 
 type CheckoutSession struct {
@@ -65,26 +61,19 @@ type CheckoutSession struct {
 }
 
 type CheckoutClient struct {
-	sessions         checkoutSessionCreator
-	liveMode         bool
-	perpetualPriceID string
-	monthlyPriceID   string
+	sessions checkoutSessionBackend
+	liveMode bool
 }
 
-type checkoutSessionCreator interface {
+type checkoutSessionBackend interface {
 	Create(context.Context, *stripe.CheckoutSessionCreateParams) (*stripe.CheckoutSession, error)
+	Retrieve(context.Context, string, *stripe.CheckoutSessionRetrieveParams) (*stripe.CheckoutSession, error)
 }
 
-func NewCheckoutClient(config CheckoutConfig) (*CheckoutClient, error) {
-	liveMode, err := stripeLiveMode(config.SecretKey)
+func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
+	liveMode, err := stripeLiveMode(secretKey)
 	if err != nil {
 		return nil, err
-	}
-	if !strings.HasPrefix(config.PerpetualPriceID, "price_") {
-		return nil, errors.New("perpetual Stripe Price ID must start with price_")
-	}
-	if !strings.HasPrefix(config.MonthlyPriceID, "price_") {
-		return nil, errors.New("monthly Stripe Price ID must start with price_")
 	}
 
 	httpClient := &http.Client{
@@ -98,31 +87,30 @@ func NewCheckoutClient(config CheckoutConfig) (*CheckoutClient, error) {
 		HTTPClient:      httpClient,
 		LeveledLogger:   &stripe.LeveledLogger{Level: stripe.LevelNull},
 	})
-	client := stripe.NewClient(config.SecretKey, stripe.WithBackends(backends))
+	client := stripe.NewClient(secretKey, stripe.WithBackends(backends))
 	return &CheckoutClient{
-		sessions:         client.V1CheckoutSessions,
-		liveMode:         liveMode,
-		perpetualPriceID: config.PerpetualPriceID,
-		monthlyPriceID:   config.MonthlyPriceID,
+		sessions: client.V1CheckoutSessions,
+		liveMode: liveMode,
 	}, nil
 }
 
-func (c *CheckoutClient) Create(ctx context.Context, input CreateCheckoutSessionInput) (CheckoutSession, error) {
-	if input.OrderID == "" || strings.TrimSpace(input.OrderID) != input.OrderID || len(input.OrderID) > maxClientReferenceID {
-		return CheckoutSession{}, errors.New("valid checkout order ID is required")
+func (c *CheckoutClient) Create(ctx context.Context, spec CheckoutSessionSpec, idempotencyKey string) (CheckoutSession, error) {
+	mode, err := validateCheckoutSessionSpec(spec)
+	if err != nil {
+		return CheckoutSession{}, err
 	}
-	if input.IdempotencyKey == "" || strings.TrimSpace(input.IdempotencyKey) != input.IdempotencyKey || len(input.IdempotencyKey) > 255 {
+	if idempotencyKey == "" || strings.TrimSpace(idempotencyKey) != idempotencyKey || len(idempotencyKey) > 255 {
 		return CheckoutSession{}, errors.New("valid Stripe idempotency key is required")
 	}
 
 	metadata := map[string]string{
-		"order_id":       input.OrderID,
-		"plan":           string(input.Plan),
-		"policy_version": PolicyVersion,
+		"order_id":       spec.OrderID,
+		"plan":           string(spec.Plan),
+		"policy_version": spec.PolicyVersion,
 	}
 	params := &stripe.CheckoutSessionCreateParams{
 		CancelURL:         stripe.String(CheckoutCancelURL),
-		ClientReferenceID: stripe.String(input.OrderID),
+		ClientReferenceID: stripe.String(spec.OrderID),
 		ConsentCollection: &stripe.CheckoutSessionCreateConsentCollectionParams{
 			TermsOfService: stripe.String(string(stripe.CheckoutSessionConsentCollectionTermsOfServiceRequired)),
 		},
@@ -131,22 +119,16 @@ func (c *CheckoutClient) Create(ctx context.Context, input CreateCheckoutSession
 		Metadata:        metadata,
 		SuccessURL:      stripe.String(CheckoutSuccessURL),
 	}
-	var mode stripe.CheckoutSessionMode
-	switch input.Plan {
-	case PlanPerpetualV1:
-		mode = stripe.CheckoutSessionModePayment
-		params.LineItems[0].Price = stripe.String(c.perpetualPriceID)
+	params.LineItems[0].Price = stripe.String(spec.PriceID)
+	switch mode {
+	case stripe.CheckoutSessionModePayment:
 		params.CustomerCreation = stripe.String(string(stripe.CheckoutSessionCustomerCreationAlways))
 		params.PaymentIntentData = &stripe.CheckoutSessionCreatePaymentIntentDataParams{Metadata: metadata}
-	case PlanMonthly:
-		mode = stripe.CheckoutSessionModeSubscription
-		params.LineItems[0].Price = stripe.String(c.monthlyPriceID)
+	case stripe.CheckoutSessionModeSubscription:
 		params.SubscriptionData = &stripe.CheckoutSessionCreateSubscriptionDataParams{Metadata: metadata}
-	default:
-		return CheckoutSession{}, fmt.Errorf("unsupported checkout plan %q", input.Plan)
 	}
 	params.Mode = stripe.String(string(mode))
-	params.SetIdempotencyKey(input.IdempotencyKey)
+	params.SetIdempotencyKey(idempotencyKey)
 
 	requestCtx, cancel := context.WithTimeout(ctx, stripeRequestTimeout)
 	defer cancel()
@@ -154,14 +136,31 @@ func (c *CheckoutClient) Create(ctx context.Context, input CreateCheckoutSession
 	if err != nil {
 		return CheckoutSession{}, sanitizeStripeError(requestCtx, err)
 	}
-	if !validCheckoutSession(session, input, mode, c.liveMode) {
-		return CheckoutSession{}, ErrInvalidCheckoutSession
+	if err := validateCheckoutSession(session, "", spec, mode, c.liveMode, time.Now()); err != nil {
+		return CheckoutSession{}, err
 	}
-	return CheckoutSession{
-		ID:        session.ID,
-		URL:       session.URL,
-		ExpiresAt: time.Unix(session.ExpiresAt, 0).UTC(),
-	}, nil
+	return checkoutSessionResult(session), nil
+}
+
+func (c *CheckoutClient) Retrieve(ctx context.Context, sessionID string, spec CheckoutSessionSpec) (CheckoutSession, error) {
+	mode, err := validateCheckoutSessionSpec(spec)
+	if err != nil {
+		return CheckoutSession{}, err
+	}
+	if !strings.HasPrefix(sessionID, "cs_") || len(sessionID) == len("cs_") || strings.TrimSpace(sessionID) != sessionID {
+		return CheckoutSession{}, errors.New("valid Checkout Session ID is required")
+	}
+
+	requestCtx, cancel := context.WithTimeout(ctx, stripeRequestTimeout)
+	defer cancel()
+	session, err := c.sessions.Retrieve(requestCtx, sessionID, &stripe.CheckoutSessionRetrieveParams{})
+	if err != nil {
+		return CheckoutSession{}, sanitizeStripeError(requestCtx, err)
+	}
+	if err := validateCheckoutSession(session, sessionID, spec, mode, c.liveMode, time.Now()); err != nil {
+		return CheckoutSession{}, err
+	}
+	return checkoutSessionResult(session), nil
 }
 
 func sanitizeStripeError(ctx context.Context, err error) error {
@@ -207,16 +206,56 @@ func validStripeKeyPrefix(key, prefix string) bool {
 	return len(key) > len(prefix) && strings.HasPrefix(key, prefix) && strings.TrimSpace(key) == key
 }
 
-func validCheckoutSession(session *stripe.CheckoutSession, input CreateCheckoutSessionInput, mode stripe.CheckoutSessionMode, liveMode bool) bool {
-	if session == nil || !strings.HasPrefix(session.ID, "cs_") || session.ExpiresAt <= time.Now().Unix() || session.Status != stripe.CheckoutSessionStatusOpen {
-		return false
+func validPriceID(value string) bool {
+	return len(value) > len("price_") && strings.HasPrefix(value, "price_") && strings.TrimSpace(value) == value
+}
+
+func validateCheckoutSessionSpec(spec CheckoutSessionSpec) (stripe.CheckoutSessionMode, error) {
+	if spec.OrderID == "" || strings.TrimSpace(spec.OrderID) != spec.OrderID || len(spec.OrderID) > maxClientReferenceID {
+		return "", errors.New("valid Checkout order ID is required")
 	}
-	if session.Livemode != liveMode || session.Mode != mode || session.ClientReferenceID != input.OrderID {
-		return false
+	if !validPriceID(spec.PriceID) {
+		return "", errors.New("valid Stripe Price ID is required")
+	}
+	if spec.PolicyVersion == "" || strings.TrimSpace(spec.PolicyVersion) != spec.PolicyVersion {
+		return "", errors.New("valid policy version is required")
+	}
+	switch spec.Plan {
+	case PlanPerpetualV1:
+		return stripe.CheckoutSessionModePayment, nil
+	case PlanMonthly:
+		return stripe.CheckoutSessionModeSubscription, nil
+	default:
+		return "", fmt.Errorf("unsupported Checkout plan %q", spec.Plan)
+	}
+}
+
+func validateCheckoutSession(session *stripe.CheckoutSession, expectedID string, spec CheckoutSessionSpec, mode stripe.CheckoutSessionMode, liveMode bool, now time.Time) error {
+	if session == nil || !strings.HasPrefix(session.ID, "cs_") || session.ExpiresAt <= 0 || (expectedID != "" && session.ID != expectedID) {
+		return ErrInvalidCheckoutSession
+	}
+	if session.ExpiresAt <= now.Unix() {
+		return ErrCheckoutSessionExpired
+	}
+	if session.Status != stripe.CheckoutSessionStatusOpen {
+		return ErrInvalidCheckoutSession
+	}
+	if session.Livemode != liveMode || session.Mode != mode || session.ClientReferenceID != spec.OrderID {
+		return ErrInvalidCheckoutSession
 	}
 	if session.ManagedPayments == nil || !session.ManagedPayments.Enabled {
-		return false
+		return ErrInvalidCheckoutSession
+	}
+	if session.Metadata["order_id"] != spec.OrderID || session.Metadata["plan"] != string(spec.Plan) || session.Metadata["policy_version"] != spec.PolicyVersion {
+		return ErrInvalidCheckoutSession
 	}
 	parsedURL, err := url.Parse(session.URL)
-	return err == nil && parsedURL.Scheme == "https" && parsedURL.Host == checkoutURLHost && parsedURL.User == nil
+	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host != checkoutURLHost || parsedURL.User != nil {
+		return ErrInvalidCheckoutSession
+	}
+	return nil
+}
+
+func checkoutSessionResult(session *stripe.CheckoutSession) CheckoutSession {
+	return CheckoutSession{ID: session.ID, URL: session.URL, ExpiresAt: time.Unix(session.ExpiresAt, 0).UTC()}
 }
