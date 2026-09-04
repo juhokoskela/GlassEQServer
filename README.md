@@ -71,7 +71,7 @@ The preflight task also needs the three Stripe Checkout variables above. Run it 
 glasseqserver check-stripe-catalog
 ```
 
-The command retrieves both configured Prices and returns a nonzero status unless their environment, Products, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. Product IDs are required only by this command; they do not change whether the server enables Checkout at runtime.
+The command retrieves both configured Prices and their Products. It returns a nonzero status unless their environment, active Products, `txcd_10202001` tax code, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. Product IDs are required only by this command; they do not change whether the server enables Checkout at runtime.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
