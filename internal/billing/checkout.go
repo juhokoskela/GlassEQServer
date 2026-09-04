@@ -25,9 +25,10 @@ const (
 )
 
 var (
-	ErrInvalidCheckoutSession = errors.New("Stripe returned an invalid Checkout Session")
-	ErrCheckoutSessionExpired = errors.New("Checkout Session has expired")
-	ErrStripeUnavailable      = errors.New("Stripe Checkout is unavailable")
+	ErrInvalidCheckoutSession  = errors.New("Stripe returned an invalid Checkout Session")
+	ErrCheckoutSessionExpired  = errors.New("Checkout Session has expired")
+	ErrCheckoutSessionComplete = errors.New("Checkout Session is complete")
+	ErrStripeUnavailable       = errors.New("Stripe Checkout is unavailable")
 )
 
 type StripeRequestError struct {
@@ -50,14 +51,22 @@ const (
 type CheckoutSessionSpec struct {
 	OrderID       string
 	Plan          Plan
-	PriceID       string
 	PolicyVersion string
 }
+
+type CheckoutSessionState string
+
+const (
+	CheckoutSessionOpen     CheckoutSessionState = "open"
+	CheckoutSessionComplete CheckoutSessionState = "complete"
+	CheckoutSessionExpired  CheckoutSessionState = "expired"
+)
 
 type CheckoutSession struct {
 	ID        string
 	URL       string
 	ExpiresAt time.Time
+	State     CheckoutSessionState
 }
 
 type CheckoutClient struct {
@@ -94,10 +103,13 @@ func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
 	}, nil
 }
 
-func (c *CheckoutClient) Create(ctx context.Context, spec CheckoutSessionSpec, idempotencyKey string) (CheckoutSession, error) {
+func (c *CheckoutClient) Create(ctx context.Context, spec CheckoutSessionSpec, priceID, idempotencyKey string) (CheckoutSession, error) {
 	mode, err := validateCheckoutSessionSpec(spec)
 	if err != nil {
 		return CheckoutSession{}, err
+	}
+	if !validPriceID(priceID) {
+		return CheckoutSession{}, errors.New("valid Stripe Price ID is required")
 	}
 	if idempotencyKey == "" || strings.TrimSpace(idempotencyKey) != idempotencyKey || len(idempotencyKey) > 255 {
 		return CheckoutSession{}, errors.New("valid Stripe idempotency key is required")
@@ -114,12 +126,14 @@ func (c *CheckoutClient) Create(ctx context.Context, spec CheckoutSessionSpec, i
 		ConsentCollection: &stripe.CheckoutSessionCreateConsentCollectionParams{
 			TermsOfService: stripe.String(string(stripe.CheckoutSessionConsentCollectionTermsOfServiceRequired)),
 		},
-		LineItems:       []*stripe.CheckoutSessionCreateLineItemParams{{Quantity: stripe.Int64(1)}},
+		LineItems: []*stripe.CheckoutSessionCreateLineItemParams{{
+			Price:    stripe.String(priceID),
+			Quantity: stripe.Int64(1),
+		}},
 		ManagedPayments: &stripe.CheckoutSessionCreateManagedPaymentsParams{Enabled: stripe.Bool(true)},
 		Metadata:        metadata,
 		SuccessURL:      stripe.String(CheckoutSuccessURL),
 	}
-	params.LineItems[0].Price = stripe.String(spec.PriceID)
 	switch mode {
 	case stripe.CheckoutSessionModePayment:
 		params.CustomerCreation = stripe.String(string(stripe.CheckoutSessionCustomerCreationAlways))
@@ -136,10 +150,11 @@ func (c *CheckoutClient) Create(ctx context.Context, spec CheckoutSessionSpec, i
 	if err != nil {
 		return CheckoutSession{}, sanitizeStripeError(requestCtx, err)
 	}
-	if err := validateCheckoutSession(session, "", spec, mode, c.liveMode, time.Now()); err != nil {
+	state, err := validateCheckoutSession(session, "", spec, mode, c.liveMode, time.Now())
+	if err != nil {
 		return CheckoutSession{}, err
 	}
-	return checkoutSessionResult(session), nil
+	return checkoutSessionResult(session, state), nil
 }
 
 func (c *CheckoutClient) Retrieve(ctx context.Context, sessionID string, spec CheckoutSessionSpec) (CheckoutSession, error) {
@@ -157,10 +172,11 @@ func (c *CheckoutClient) Retrieve(ctx context.Context, sessionID string, spec Ch
 	if err != nil {
 		return CheckoutSession{}, sanitizeStripeError(requestCtx, err)
 	}
-	if err := validateCheckoutSession(session, sessionID, spec, mode, c.liveMode, time.Now()); err != nil {
+	state, err := validateCheckoutSession(session, sessionID, spec, mode, c.liveMode, time.Now())
+	if err != nil {
 		return CheckoutSession{}, err
 	}
-	return checkoutSessionResult(session), nil
+	return checkoutSessionResult(session, state), nil
 }
 
 func sanitizeStripeError(ctx context.Context, err error) error {
@@ -214,9 +230,6 @@ func validateCheckoutSessionSpec(spec CheckoutSessionSpec) (stripe.CheckoutSessi
 	if spec.OrderID == "" || strings.TrimSpace(spec.OrderID) != spec.OrderID || len(spec.OrderID) > maxClientReferenceID {
 		return "", errors.New("valid Checkout order ID is required")
 	}
-	if !validPriceID(spec.PriceID) {
-		return "", errors.New("valid Stripe Price ID is required")
-	}
 	if spec.PolicyVersion == "" || strings.TrimSpace(spec.PolicyVersion) != spec.PolicyVersion {
 		return "", errors.New("valid policy version is required")
 	}
@@ -230,32 +243,39 @@ func validateCheckoutSessionSpec(spec CheckoutSessionSpec) (stripe.CheckoutSessi
 	}
 }
 
-func validateCheckoutSession(session *stripe.CheckoutSession, expectedID string, spec CheckoutSessionSpec, mode stripe.CheckoutSessionMode, liveMode bool, now time.Time) error {
+func validateCheckoutSession(session *stripe.CheckoutSession, expectedID string, spec CheckoutSessionSpec, mode stripe.CheckoutSessionMode, liveMode bool, now time.Time) (CheckoutSessionState, error) {
 	if session == nil || !strings.HasPrefix(session.ID, "cs_") || session.ExpiresAt <= 0 || (expectedID != "" && session.ID != expectedID) {
-		return ErrInvalidCheckoutSession
-	}
-	if session.ExpiresAt <= now.Unix() {
-		return ErrCheckoutSessionExpired
-	}
-	if session.Status != stripe.CheckoutSessionStatusOpen {
-		return ErrInvalidCheckoutSession
+		return "", ErrInvalidCheckoutSession
 	}
 	if session.Livemode != liveMode || session.Mode != mode || session.ClientReferenceID != spec.OrderID {
-		return ErrInvalidCheckoutSession
+		return "", ErrInvalidCheckoutSession
 	}
 	if session.ManagedPayments == nil || !session.ManagedPayments.Enabled {
-		return ErrInvalidCheckoutSession
+		return "", ErrInvalidCheckoutSession
 	}
 	if session.Metadata["order_id"] != spec.OrderID || session.Metadata["plan"] != string(spec.Plan) || session.Metadata["policy_version"] != spec.PolicyVersion {
-		return ErrInvalidCheckoutSession
+		return "", ErrInvalidCheckoutSession
+	}
+
+	switch session.Status {
+	case stripe.CheckoutSessionStatusExpired:
+		return CheckoutSessionExpired, nil
+	case stripe.CheckoutSessionStatusComplete:
+		return CheckoutSessionComplete, nil
+	case stripe.CheckoutSessionStatusOpen:
+		if session.ExpiresAt <= now.Unix() {
+			return CheckoutSessionExpired, nil
+		}
+	default:
+		return "", ErrInvalidCheckoutSession
 	}
 	parsedURL, err := url.Parse(session.URL)
 	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host != checkoutURLHost || parsedURL.User != nil {
-		return ErrInvalidCheckoutSession
+		return "", ErrInvalidCheckoutSession
 	}
-	return nil
+	return CheckoutSessionOpen, nil
 }
 
-func checkoutSessionResult(session *stripe.CheckoutSession) CheckoutSession {
-	return CheckoutSession{ID: session.ID, URL: session.URL, ExpiresAt: time.Unix(session.ExpiresAt, 0).UTC()}
+func checkoutSessionResult(session *stripe.CheckoutSession, state CheckoutSessionState) CheckoutSession {
+	return CheckoutSession{ID: session.ID, URL: session.URL, ExpiresAt: time.Unix(session.ExpiresAt, 0).UTC(), State: state}
 }

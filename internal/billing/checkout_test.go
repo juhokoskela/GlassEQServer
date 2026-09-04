@@ -48,13 +48,13 @@ func TestCheckoutClientCreatesServerOwnedSession(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			const orderID = "ord_01K4D8P6WZCP7G9N4N7V0A9T8S"
-			spec := CheckoutSessionSpec{OrderID: orderID, Plan: test.plan, PriceID: test.wantPrice, PolicyVersion: PolicyVersion}
+			spec := CheckoutSessionSpec{OrderID: orderID, Plan: test.plan, PolicyVersion: PolicyVersion}
 			backend := &fakeCheckoutSessions{}
 			backend.response = checkoutResponse(spec, test.wantMode, false)
 			client := testCheckoutClient(backend)
 
 			ctx := context.WithValue(context.Background(), contextKey{}, "request")
-			got, err := client.Create(ctx, spec, "checkout-01K4D8P6WZCP7G9N4N7V0A9T8S")
+			got, err := client.Create(ctx, spec, test.wantPrice, "checkout-01K4D8P6WZCP7G9N4N7V0A9T8S")
 			if err != nil {
 				t.Fatalf("create Checkout Session: %v", err)
 			}
@@ -67,7 +67,7 @@ func TestCheckoutClientCreatesServerOwnedSession(t *testing.T) {
 			if _, ok := backend.context.Deadline(); !ok {
 				t.Error("Stripe request has no deadline")
 			}
-			assertCheckoutParams(t, backend.params, spec, test.wantMode)
+			assertCheckoutParams(t, backend.params, spec, test.wantPrice, test.wantMode)
 			if (backend.params.CustomerCreation != nil) != test.wantCustomer {
 				t.Errorf("customer creation present = %t", backend.params.CustomerCreation != nil)
 			}
@@ -91,25 +91,26 @@ func TestCheckoutClientCreatesServerOwnedSession(t *testing.T) {
 }
 
 func TestCheckoutClientRejectsInvalidInputBeforeCallingStripe(t *testing.T) {
-	validSpec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PriceID: "price_monthly", PolicyVersion: PolicyVersion}
+	validSpec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PolicyVersion: PolicyVersion}
 	tests := []struct {
-		spec CheckoutSessionSpec
-		key  string
+		spec    CheckoutSessionSpec
+		priceID string
+		key     string
 	}{
-		{spec: CheckoutSessionSpec{Plan: PlanMonthly, PriceID: "price_monthly", PolicyVersion: PolicyVersion}, key: "key"},
-		{spec: CheckoutSessionSpec{OrderID: strings.Repeat("a", 201), Plan: PlanMonthly, PriceID: "price_monthly", PolicyVersion: PolicyVersion}, key: "key"},
-		{spec: CheckoutSessionSpec{OrderID: "order", Plan: Plan("annual"), PriceID: "price_monthly", PolicyVersion: PolicyVersion}, key: "key"},
-		{spec: CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PriceID: "invalid", PolicyVersion: PolicyVersion}, key: "key"},
-		{spec: CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PriceID: "price_monthly"}, key: "key"},
-		{spec: validSpec},
-		{spec: validSpec, key: " key "},
-		{spec: validSpec, key: strings.Repeat("a", 256)},
+		{spec: CheckoutSessionSpec{Plan: PlanMonthly, PolicyVersion: PolicyVersion}, priceID: "price_monthly", key: "key"},
+		{spec: CheckoutSessionSpec{OrderID: strings.Repeat("a", 201), Plan: PlanMonthly, PolicyVersion: PolicyVersion}, priceID: "price_monthly", key: "key"},
+		{spec: CheckoutSessionSpec{OrderID: "order", Plan: Plan("annual"), PolicyVersion: PolicyVersion}, priceID: "price_monthly", key: "key"},
+		{spec: validSpec, priceID: "invalid", key: "key"},
+		{spec: CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly}, priceID: "price_monthly", key: "key"},
+		{spec: validSpec, priceID: "price_monthly"},
+		{spec: validSpec, priceID: "price_monthly", key: " key "},
+		{spec: validSpec, priceID: "price_monthly", key: strings.Repeat("a", 256)},
 	}
 
 	for _, test := range tests {
 		backend := &fakeCheckoutSessions{}
 		client := testCheckoutClient(backend)
-		if _, err := client.Create(context.Background(), test.spec, test.key); err == nil {
+		if _, err := client.Create(context.Background(), test.spec, test.priceID, test.key); err == nil {
 			t.Errorf("Create(%+v) succeeded", test.spec)
 		}
 		if backend.calls != 0 {
@@ -119,7 +120,7 @@ func TestCheckoutClientRejectsInvalidInputBeforeCallingStripe(t *testing.T) {
 }
 
 func TestCheckoutClientRejectsInvalidStripeResponse(t *testing.T) {
-	spec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PriceID: "price_monthly", PolicyVersion: PolicyVersion}
+	spec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PolicyVersion: PolicyVersion}
 	tests := []struct {
 		name    string
 		mutate  func(*stripe.CheckoutSession)
@@ -131,11 +132,10 @@ func TestCheckoutClientRejectsInvalidStripeResponse(t *testing.T) {
 		{name: "wrong mode", mutate: func(session *stripe.CheckoutSession) { session.Mode = stripe.CheckoutSessionModePayment }, wantErr: ErrInvalidCheckoutSession},
 		{name: "wrong order", mutate: func(session *stripe.CheckoutSession) { session.ClientReferenceID = "other" }, wantErr: ErrInvalidCheckoutSession},
 		{name: "wrong metadata", mutate: func(session *stripe.CheckoutSession) { session.Metadata["order_id"] = "other" }, wantErr: ErrInvalidCheckoutSession},
-		{name: "closed", mutate: func(session *stripe.CheckoutSession) { session.Status = stripe.CheckoutSessionStatusComplete }, wantErr: ErrInvalidCheckoutSession},
+		{name: "unknown status", mutate: func(session *stripe.CheckoutSession) { session.Status = "unknown" }, wantErr: ErrInvalidCheckoutSession},
 		{name: "untrusted URL", mutate: func(session *stripe.CheckoutSession) { session.URL = "https://example.com/session" }, wantErr: ErrInvalidCheckoutSession},
 		{name: "missing ID", mutate: func(session *stripe.CheckoutSession) { session.ID = "" }, wantErr: ErrInvalidCheckoutSession},
 		{name: "missing expiry", mutate: func(session *stripe.CheckoutSession) { session.ExpiresAt = 0 }, wantErr: ErrInvalidCheckoutSession},
-		{name: "expired", mutate: func(session *stripe.CheckoutSession) { session.ExpiresAt = time.Now().Add(-time.Minute).Unix() }, wantErr: ErrCheckoutSessionExpired},
 	}
 
 	for _, test := range tests {
@@ -145,7 +145,7 @@ func TestCheckoutClientRejectsInvalidStripeResponse(t *testing.T) {
 			backend := &fakeCheckoutSessions{response: response}
 			client := testCheckoutClient(backend)
 
-			_, err := client.Create(context.Background(), spec, "key")
+			_, err := client.Create(context.Background(), spec, "price_monthly", "key")
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("error = %v, want %v", err, test.wantErr)
 			}
@@ -153,8 +153,46 @@ func TestCheckoutClientRejectsInvalidStripeResponse(t *testing.T) {
 	}
 }
 
+func TestCheckoutClientModelsStripeSessionStates(t *testing.T) {
+	spec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PolicyVersion: PolicyVersion}
+	tests := []struct {
+		name   string
+		mutate func(*stripe.CheckoutSession)
+		want   CheckoutSessionState
+	}{
+		{name: "open", mutate: func(*stripe.CheckoutSession) {}, want: CheckoutSessionOpen},
+		{name: "expired status", mutate: func(session *stripe.CheckoutSession) {
+			session.Status = stripe.CheckoutSessionStatusExpired
+			session.URL = ""
+		}, want: CheckoutSessionExpired},
+		{name: "complete status", mutate: func(session *stripe.CheckoutSession) {
+			session.Status = stripe.CheckoutSessionStatusComplete
+			session.URL = ""
+		}, want: CheckoutSessionComplete},
+		{name: "open past expiry", mutate: func(session *stripe.CheckoutSession) {
+			session.ExpiresAt = time.Now().Add(-time.Minute).Unix()
+		}, want: CheckoutSessionExpired},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := checkoutResponse(spec, stripe.CheckoutSessionModeSubscription, false)
+			test.mutate(response)
+			client := testCheckoutClient(&fakeCheckoutSessions{response: response})
+
+			got, err := client.Create(context.Background(), spec, "price_monthly", "key")
+			if err != nil {
+				t.Fatalf("create Checkout Session: %v", err)
+			}
+			if got.State != test.want {
+				t.Errorf("state = %q, want %q", got.State, test.want)
+			}
+		})
+	}
+}
+
 func TestCheckoutClientRetrievesExpectedSession(t *testing.T) {
-	spec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PriceID: "price_monthly", PolicyVersion: PolicyVersion}
+	spec := CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PolicyVersion: PolicyVersion}
 	backend := &fakeCheckoutSessions{response: checkoutResponse(spec, stripe.CheckoutSessionModeSubscription, false)}
 	client := testCheckoutClient(backend)
 
@@ -180,7 +218,7 @@ func TestCheckoutClientSanitizesStripeError(t *testing.T) {
 	}}
 	client := testCheckoutClient(backend)
 
-	_, err := client.Create(context.Background(), testCheckoutSpec(), "key")
+	_, err := client.Create(context.Background(), testCheckoutSpec(), "price_monthly", "key")
 	var requestError *StripeRequestError
 	if !errors.As(err, &requestError) {
 		t.Fatalf("error = %v, want StripeRequestError", err)
@@ -197,7 +235,7 @@ func TestCheckoutClientSanitizesUnexpectedError(t *testing.T) {
 	backend := &fakeCheckoutSessions{err: errors.New("sensitive malformed response")}
 	client := testCheckoutClient(backend)
 
-	_, err := client.Create(context.Background(), testCheckoutSpec(), "key")
+	_, err := client.Create(context.Background(), testCheckoutSpec(), "price_monthly", "key")
 	if !errors.Is(err, ErrStripeUnavailable) {
 		t.Fatalf("error = %v, want ErrStripeUnavailable", err)
 	}
@@ -256,7 +294,7 @@ func TestStripeResponseLimit(t *testing.T) {
 	}
 }
 
-func assertCheckoutParams(t *testing.T, params *stripe.CheckoutSessionCreateParams, spec CheckoutSessionSpec, mode stripe.CheckoutSessionMode) {
+func assertCheckoutParams(t *testing.T, params *stripe.CheckoutSessionCreateParams, spec CheckoutSessionSpec, priceID string, mode stripe.CheckoutSessionMode) {
 	t.Helper()
 	if params == nil {
 		t.Fatal("Stripe parameters are nil")
@@ -270,7 +308,7 @@ func assertCheckoutParams(t *testing.T, params *stripe.CheckoutSessionCreatePara
 	if params.IdempotencyKey == nil || *params.IdempotencyKey != "checkout-01K4D8P6WZCP7G9N4N7V0A9T8S" {
 		t.Errorf("idempotency key = %v", params.IdempotencyKey)
 	}
-	if len(params.LineItems) != 1 || *params.LineItems[0].Price != spec.PriceID || *params.LineItems[0].Quantity != 1 {
+	if len(params.LineItems) != 1 || *params.LineItems[0].Price != priceID || *params.LineItems[0].Quantity != 1 {
 		t.Errorf("line items = %+v", params.LineItems)
 	}
 	if params.ManagedPayments == nil || params.ManagedPayments.Enabled == nil || !*params.ManagedPayments.Enabled {
@@ -320,7 +358,7 @@ func checkoutResponse(spec CheckoutSessionSpec, mode stripe.CheckoutSessionMode,
 }
 
 func testCheckoutSpec() CheckoutSessionSpec {
-	return CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PriceID: "price_monthly", PolicyVersion: PolicyVersion}
+	return CheckoutSessionSpec{OrderID: "order", Plan: PlanMonthly, PolicyVersion: PolicyVersion}
 }
 
 func testCheckoutClient(sessions checkoutSessionBackend) *CheckoutClient {
