@@ -21,6 +21,55 @@ func TestPrepareCheckoutOrderRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestPrepareCheckoutOrderNormalizesClientIP(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{input: "192.0.2.1", want: "192.0.2.1"},
+		{input: "::ffff:192.0.2.1", want: "192.0.2.1"},
+		{input: "2001:db8:1234:5678:1111:2222:3333:4444", want: "2001:db8:1234:5678::"},
+	}
+
+	for _, test := range tests {
+		input := CreateCheckoutOrderInput{
+			RequestID: "2b1bc1ba-407a-49f2-ad2e-a260a56bcf23",
+			Plan:      PlanMonthly,
+			ClientIP:  netip.MustParseAddr(test.input),
+		}
+		prepared, err := prepareCheckoutOrder(input)
+		if err != nil {
+			t.Fatalf("prepareCheckoutOrder(%q): %v", test.input, err)
+		}
+		if got := prepared.clientIP.String(); got != test.want {
+			t.Errorf("prepareCheckoutOrder(%q) IP = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestPrepareCheckoutOrderGroupsIPv6By64BitPrefix(t *testing.T) {
+	prepare := func(address string) netip.Addr {
+		t.Helper()
+		prepared, err := prepareCheckoutOrder(CreateCheckoutOrderInput{
+			RequestID: "2b1bc1ba-407a-49f2-ad2e-a260a56bcf23",
+			Plan:      PlanMonthly,
+			ClientIP:  netip.MustParseAddr(address),
+		})
+		if err != nil {
+			t.Fatalf("prepare Checkout order: %v", err)
+		}
+		return prepared.clientIP
+	}
+
+	first := prepare("2001:db8:1234:5678::1")
+	if second := prepare("2001:db8:1234:5678:ffff::2"); second != first {
+		t.Errorf("same /64 normalized to %s and %s", first, second)
+	}
+	if other := prepare("2001:db8:1234:5679::1"); other == first {
+		t.Errorf("different /64 prefixes both normalized to %s", first)
+	}
+}
+
 func TestNewOrderServiceRejectsInvalidConfiguration(t *testing.T) {
 	validPrices := PriceCatalog{PerpetualV1: "price_perpetual", Monthly: "price_monthly"}
 	validKey := make([]byte, 32)

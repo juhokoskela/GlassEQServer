@@ -16,13 +16,18 @@ import (
 
 const (
 	checkoutReservationLifetime = 24 * time.Hour
-	rateLimitWindow             = time.Hour
-	checkoutIPAttemptLimit      = 20
+	checkoutRetryMargin         = 5 * time.Minute
+	checkoutAttemptWindow       = time.Minute
+	checkoutAttemptLimit        = 60
+	checkoutReservationWindow   = time.Hour
+	checkoutReservationLimit    = 20
+	checkoutStripeConcurrency   = 4
 )
 
 var (
 	ErrInvalidCheckoutRequest      = errors.New("invalid Checkout request")
 	ErrCheckoutIdempotencyConflict = errors.New("Checkout idempotency key was used for another plan")
+	ErrCheckoutBusy                = errors.New("Checkout is busy")
 )
 
 type CheckoutRateLimitError struct {
@@ -45,7 +50,7 @@ type CreateCheckoutOrderInput struct {
 }
 
 type checkoutOrderClient interface {
-	Create(context.Context, CheckoutSessionSpec, string) (CheckoutSession, error)
+	Create(context.Context, CheckoutSessionSpec, string, string) (CheckoutSession, error)
 	Retrieve(context.Context, string, CheckoutSessionSpec) (CheckoutSession, error)
 }
 
@@ -54,6 +59,7 @@ type OrderService struct {
 	checkout         checkoutOrderClient
 	prices           PriceCatalog
 	rateLimitHMACKey []byte
+	stripeSlots      chan struct{}
 	now              func() time.Time
 }
 
@@ -78,6 +84,7 @@ func NewOrderService(database *sql.DB, checkout checkoutOrderClient, prices Pric
 		checkout:         checkout,
 		prices:           prices,
 		rateLimitHMACKey: append([]byte(nil), rateLimitHMACKey...),
+		stripeSlots:      make(chan struct{}, checkoutStripeConcurrency),
 		now:              time.Now,
 	}, nil
 }
@@ -88,6 +95,13 @@ func (s *OrderService) CreateCheckoutSession(ctx context.Context, input CreateCh
 		return CheckoutSession{}, err
 	}
 	now := s.now().UTC().Truncate(time.Microsecond)
+	retryAfter, err := s.consumeCheckoutAttempt(ctx, prepared.clientIP, now)
+	if err != nil {
+		return CheckoutSession{}, err
+	}
+	if retryAfter > 0 {
+		return CheckoutSession{}, &CheckoutRateLimitError{RetryAfterSeconds: retryAfter}
+	}
 	order, err := s.reserveOrder(ctx, prepared, now)
 	if err != nil {
 		return CheckoutSession{}, err
@@ -95,26 +109,52 @@ func (s *OrderService) CreateCheckoutSession(ctx context.Context, input CreateCh
 	spec := CheckoutSessionSpec{
 		OrderID:       order.id,
 		Plan:          order.plan,
-		PriceID:       order.priceID,
 		PolicyVersion: order.policyVersion,
 	}
 	if order.sessionID.Valid {
-		return s.checkout.Retrieve(ctx, order.sessionID.String, spec)
+		if !s.acquireStripeSlot() {
+			return CheckoutSession{}, ErrCheckoutBusy
+		}
+		session, err := s.checkout.Retrieve(ctx, order.sessionID.String, spec)
+		s.releaseStripeSlot()
+		if err != nil {
+			return CheckoutSession{}, err
+		}
+		return usableCheckoutSession(session)
 	}
 	// Stripe may discard POST idempotency results after 24 hours. Do not let an
 	// old unattached reservation create a replacement Session under the same key.
-	if !now.Before(order.createdAt.Add(checkoutReservationLifetime)) {
+	// The margin keeps the request clear of Stripe's pruning boundary.
+	retryNow := s.now().UTC()
+	if !retryNow.Before(order.createdAt.Add(checkoutReservationLifetime - checkoutRetryMargin)) {
 		return CheckoutSession{}, ErrCheckoutSessionExpired
 	}
+	if !s.acquireStripeSlot() {
+		return CheckoutSession{}, ErrCheckoutBusy
+	}
 
-	session, err := s.checkout.Create(ctx, spec, "checkout-"+prepared.requestID)
+	session, err := s.checkout.Create(ctx, spec, order.priceID, "checkout-"+prepared.requestID)
+	s.releaseStripeSlot()
 	if err != nil {
 		return CheckoutSession{}, err
 	}
 	if err := s.attachSession(ctx, order.id, session.ID); err != nil {
 		return CheckoutSession{}, err
 	}
-	return session, nil
+	return usableCheckoutSession(session)
+}
+
+func usableCheckoutSession(session CheckoutSession) (CheckoutSession, error) {
+	switch session.State {
+	case CheckoutSessionOpen:
+		return session, nil
+	case CheckoutSessionExpired:
+		return CheckoutSession{}, ErrCheckoutSessionExpired
+	case CheckoutSessionComplete:
+		return CheckoutSession{}, ErrCheckoutSessionComplete
+	default:
+		return CheckoutSession{}, ErrInvalidCheckoutSession
+	}
 }
 
 type preparedCheckoutOrder struct {
@@ -137,7 +177,11 @@ func prepareCheckoutOrder(input CreateCheckoutOrderInput) (preparedCheckoutOrder
 	if !input.ClientIP.IsValid() {
 		return preparedCheckoutOrder{}, ErrInvalidCheckoutRequest
 	}
-	return preparedCheckoutOrder{requestID: input.RequestID, plan: input.Plan, clientIP: input.ClientIP.Unmap()}, nil
+	clientIP := input.ClientIP.Unmap()
+	if clientIP.Is6() {
+		clientIP = netip.PrefixFrom(clientIP, 64).Masked().Addr()
+	}
+	return preparedCheckoutOrder{requestID: input.RequestID, plan: input.Plan, clientIP: clientIP}, nil
 }
 
 type checkoutOrder struct {
@@ -195,7 +239,7 @@ func (s *OrderService) reserveOrder(ctx context.Context, input preparedCheckoutO
 		return matchingCheckoutOrder(order, input.plan)
 	}
 
-	retryAfter, err := s.consumeCheckoutRateLimit(ctx, tx, input.clientIP, now)
+	retryAfter, err := s.consumeCheckoutReservation(ctx, tx, input.clientIP, now)
 	if err != nil {
 		return checkoutOrder{}, err
 	}
@@ -242,8 +286,28 @@ func (s *OrderService) priceID(plan Plan) string {
 	return s.prices.Monthly
 }
 
-func (s *OrderService) consumeCheckoutRateLimit(ctx context.Context, tx *sql.Tx, clientIP netip.Addr, now time.Time) (int, error) {
-	windowStart := now.Truncate(rateLimitWindow)
+func (s *OrderService) consumeCheckoutAttempt(ctx context.Context, clientIP netip.Addr, now time.Time) (int, error) {
+	windowStart := now.Truncate(checkoutAttemptWindow)
+	subjectHash := s.checkoutIPHash(clientIP)
+	var attempts int
+	err := s.database.QueryRowContext(ctx, `
+		INSERT INTO activation_rate_limits (kind, subject_hash, window_start, attempts)
+		VALUES ('checkout_attempt_ip', $1, $2, 1)
+		ON CONFLICT (kind, subject_hash, window_start)
+		DO UPDATE SET attempts = activation_rate_limits.attempts + 1
+		RETURNING attempts`, subjectHash[:], windowStart).Scan(&attempts)
+	if err != nil {
+		return 0, fmt.Errorf("update Checkout attempt rate limit: %w", err)
+	}
+	if attempts <= checkoutAttemptLimit {
+		return 0, nil
+	}
+	seconds := int(math.Ceil(windowStart.Add(checkoutAttemptWindow).Sub(now).Seconds()))
+	return max(seconds, 1), nil
+}
+
+func (s *OrderService) consumeCheckoutReservation(ctx context.Context, tx *sql.Tx, clientIP netip.Addr, now time.Time) (int, error) {
+	windowStart := now.Truncate(checkoutReservationWindow)
 	subjectHash := s.checkoutIPHash(clientIP)
 	var attempts int
 	err := tx.QueryRowContext(ctx, `
@@ -255,20 +319,33 @@ func (s *OrderService) consumeCheckoutRateLimit(ctx context.Context, tx *sql.Tx,
 	if err != nil {
 		return 0, fmt.Errorf("update Checkout IP rate limit: %w", err)
 	}
-	if attempts <= checkoutIPAttemptLimit {
+	if attempts <= checkoutReservationLimit {
 		return 0, nil
 	}
-	seconds := int(math.Ceil(windowStart.Add(rateLimitWindow).Sub(now).Seconds()))
+	seconds := int(math.Ceil(windowStart.Add(checkoutReservationWindow).Sub(now).Seconds()))
 	return max(seconds, 1), nil
 }
 
 func (s *OrderService) checkoutIPHash(clientIP netip.Addr) [sha256.Size]byte {
 	digest := hmac.New(sha256.New, s.rateLimitHMACKey)
 	digest.Write([]byte("checkout_ip\x00"))
-	digest.Write([]byte(clientIP.Unmap().String()))
+	digest.Write([]byte(clientIP.String()))
 	var result [sha256.Size]byte
 	copy(result[:], digest.Sum(nil))
 	return result
+}
+
+func (s *OrderService) acquireStripeSlot() bool {
+	select {
+	case s.stripeSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *OrderService) releaseStripeSlot() {
+	<-s.stripeSlots
 }
 
 func (s *OrderService) attachSession(ctx context.Context, orderID, sessionID string) error {
