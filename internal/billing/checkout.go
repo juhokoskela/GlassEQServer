@@ -38,7 +38,7 @@ type StripeRequestError struct {
 }
 
 func (e *StripeRequestError) Error() string {
-	return "Stripe Checkout request failed"
+	return "Stripe request failed"
 }
 
 type Plan string
@@ -132,6 +132,7 @@ func (c *CheckoutClient) Create(ctx context.Context, spec CheckoutSessionSpec, p
 		ConsentCollection: &stripe.CheckoutSessionCreateConsentCollectionParams{
 			TermsOfService: stripe.String(string(stripe.CheckoutSessionConsentCollectionTermsOfServiceRequired)),
 		},
+		Currency: stripe.String(string(stripe.CurrencyEUR)),
 		LineItems: []*stripe.CheckoutSessionCreateLineItemParams{{
 			Price:    stripe.String(priceID),
 			Quantity: stripe.Int64(1),

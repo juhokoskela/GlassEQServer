@@ -305,6 +305,9 @@ func assertCheckoutParams(t *testing.T, params *stripe.CheckoutSessionCreatePara
 	if *params.ClientReferenceID != spec.OrderID || *params.Mode != string(mode) {
 		t.Errorf("client reference and mode = %q, %q", *params.ClientReferenceID, *params.Mode)
 	}
+	if params.Currency == nil || *params.Currency != string(stripe.CurrencyEUR) {
+		t.Errorf("currency = %v, want %q", params.Currency, stripe.CurrencyEUR)
+	}
 	if params.IdempotencyKey == nil || *params.IdempotencyKey != "checkout-01K4D8P6WZCP7G9N4N7V0A9T8S" {
 		t.Errorf("idempotency key = %v", params.IdempotencyKey)
 	}
