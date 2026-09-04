@@ -71,12 +71,17 @@ type CheckoutSession struct {
 
 type CheckoutClient struct {
 	sessions checkoutSessionBackend
+	prices   stripePriceBackend
 	liveMode bool
 }
 
 type checkoutSessionBackend interface {
 	Create(context.Context, *stripe.CheckoutSessionCreateParams) (*stripe.CheckoutSession, error)
 	Retrieve(context.Context, string, *stripe.CheckoutSessionRetrieveParams) (*stripe.CheckoutSession, error)
+}
+
+type stripePriceBackend interface {
+	Retrieve(context.Context, string, *stripe.PriceRetrieveParams) (*stripe.Price, error)
 }
 
 func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
@@ -99,6 +104,7 @@ func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
 	client := stripe.NewClient(secretKey, stripe.WithBackends(backends))
 	return &CheckoutClient{
 		sessions: client.V1CheckoutSessions,
+		prices:   client.V1Prices,
 		liveMode: liveMode,
 	}, nil
 }
@@ -223,7 +229,15 @@ func validStripeKeyPrefix(key, prefix string) bool {
 }
 
 func validPriceID(value string) bool {
-	return len(value) > len("price_") && strings.HasPrefix(value, "price_") && strings.TrimSpace(value) == value
+	return validStripeID(value, "price_")
+}
+
+func validProductID(value string) bool {
+	return validStripeID(value, "prod_")
+}
+
+func validStripeID(value, prefix string) bool {
+	return len(value) > len(prefix) && strings.HasPrefix(value, prefix) && strings.TrimSpace(value) == value
 }
 
 func validateCheckoutSessionSpec(spec CheckoutSessionSpec) (stripe.CheckoutSessionMode, error) {
