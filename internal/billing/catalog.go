@@ -101,8 +101,11 @@ func validateCatalogPrice(price *stripe.Price, expected catalogPriceExpectation,
 	if price.Product.Livemode != liveMode {
 		return errors.New(name + " Product belongs to the wrong Stripe environment")
 	}
-	if price.Product.TaxCode == nil || price.Product.TaxCode.ID != glassEQTaxCode {
-		return fmt.Errorf("%s Product tax code must be %s", name, glassEQTaxCode)
+	if price.Product.TaxDetails == nil {
+		return errors.New(name + " Product has no tax details")
+	}
+	if price.Product.TaxDetails.TaxCode != glassEQTaxCode {
+		return fmt.Errorf("%s Product tax code is %q, want %q", name, price.Product.TaxDetails.TaxCode, glassEQTaxCode)
 	}
 
 	switch expected.plan {
