@@ -1,15 +1,43 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/juhokoskela/GlassEQServer/internal/billing"
 )
+
+func TestLogFailureIncludesSafeStripeDiagnostics(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	err := fmt.Errorf("check catalog: %w", &billing.StripeRequestError{
+		HTTPStatusCode: http.StatusForbidden,
+		Code:           "api_key_expired",
+		RequestID:      "req_example",
+	})
+
+	logFailure(logger, "catalog failed", err)
+
+	for _, field := range []string{
+		`"msg":"catalog failed"`,
+		`"stripe_http_status":403`,
+		`"stripe_code":"api_key_expired"`,
+		`"stripe_request_id":"req_example"`,
+	} {
+		if !strings.Contains(output.String(), field) {
+			t.Errorf("log = %q, want field %s", output.String(), field)
+		}
+	}
+}
 
 func TestServeStopsAfterCancellation(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

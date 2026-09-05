@@ -66,6 +66,59 @@ func TestLoadStripeConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadStripeCatalog(t *testing.T) {
+	values := map[string]string{
+		"GLASSEQ_STRIPE_SECRET_KEY":           "sk_test_secret",
+		"GLASSEQ_STRIPE_PERPETUAL_PRICE_ID":   "price_perpetual",
+		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID":     "price_monthly",
+		"GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID": "prod_perpetual",
+		"GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID":   "prod_monthly",
+	}
+
+	got, err := loadStripeCatalog(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load Stripe catalog: %v", err)
+	}
+	if got.SecretKey != values["GLASSEQ_STRIPE_SECRET_KEY"] ||
+		got.PerpetualPriceID != values["GLASSEQ_STRIPE_PERPETUAL_PRICE_ID"] ||
+		got.MonthlyPriceID != values["GLASSEQ_STRIPE_MONTHLY_PRICE_ID"] ||
+		got.PerpetualProductID != values["GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID"] ||
+		got.MonthlyProductID != values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] {
+		t.Errorf("Stripe catalog configuration = %+v", got)
+	}
+}
+
+func TestLoadStripeCatalogRejectsIncompleteConfigurationWithoutEchoingSecret(t *testing.T) {
+	values := map[string]string{
+		"GLASSEQ_STRIPE_SECRET_KEY":         "sk_test_do-not-echo",
+		"GLASSEQ_STRIPE_PERPETUAL_PRICE_ID": "price_perpetual",
+		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID":   "price_monthly",
+		"GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID": "prod_monthly",
+	}
+
+	_, err := loadStripeCatalog(mapLookup(values))
+	if err == nil || !strings.Contains(err.Error(), "GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID") {
+		t.Fatalf("error = %q, want missing Stripe Product ID", err)
+	}
+	if strings.Contains(err.Error(), "do-not-echo") {
+		t.Fatalf("error disclosed Stripe credentials: %q", err)
+	}
+}
+
+func TestLoadDoesNotEnableStripeFromCatalogOnlyConfiguration(t *testing.T) {
+	values := validValues()
+	values["GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID"] = "prod_perpetual"
+	values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] = "prod_monthly"
+
+	got, err := load(mapLookup(values))
+	if err != nil {
+		t.Fatalf("load configuration: %v", err)
+	}
+	if got.Stripe != nil {
+		t.Error("Stripe configuration was enabled without runtime Price settings")
+	}
+}
+
 func TestLoadRejectsIncompleteStripeConfigurationWithoutEchoingSecret(t *testing.T) {
 	values := validValues()
 	values["GLASSEQ_STRIPE_SECRET_KEY"] = "sk_test_do-not-echo"

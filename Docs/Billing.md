@@ -8,10 +8,10 @@ The first implementation targets Stripe Managed Payments and AWS `eu-north-1`. P
 
 ## Fixed product decisions
 
-| Plan | Price | Sandbox product | Sandbox price |
-| --- | --- | --- | --- |
-| `perpetual_v1` | EUR 29.99 plus tax | `prod_VBtSu7EmXGUrL8` | `price_1UBVfNEC4w9ZWN2YlB59OzfZ` |
-| `monthly` | EUR 2.99 per month plus tax | `prod_VBtQ3VslhU3Tgv` | `price_1UBVdzEC4w9ZWN2Y8pOBCyAE` |
+| Plan | Price | Tax code | Sandbox product | Sandbox price |
+| --- | --- | --- | --- | --- |
+| `perpetual_v1` | EUR 29.99 plus tax | `txcd_10202001` | `prod_VBtSu7EmXGUrL8` | `price_1UBVfNEC4w9ZWN2YlB59OzfZ` |
+| `monthly` | EUR 2.99 per month plus tax | `txcd_10202001` | `prod_VBtQ3VslhU3Tgv` | `price_1UBVdzEC4w9ZWN2Y8pOBCyAE` |
 
 - A license permits two active installations.
 - A perpetual license includes official v1.x releases.
@@ -242,7 +242,7 @@ Retention is explicit:
 
 ## Configuration and rollout gates
 
-Sandbox and production use separate Stripe accounts or modes, keys, Price IDs, EventBridge destinations, queues, and secrets. A deployment preflight validates that both configured Prices exist, use EUR, have the expected recurring shape, and belong to the expected Products. Runtime requests trust the pinned Price IDs and do not repeat that network validation.
+Sandbox and production use separate Stripe accounts or modes, keys, Price IDs, EventBridge destinations, queues, and secrets. The `glasseqserver check-stripe-catalog` deployment preflight validates that both configured Prices are active, belong to the key's environment and expected active Products, use the `txcd_10202001` downloadable-software tax code and fixed tax-exclusive EUR amounts, and have the expected one-time or monthly billing shape without a trial. Runtime Checkout requests pin EUR and trust the pinned Price IDs without repeating that network validation.
 
 The billing feature stays disabled until all of these are true:
 

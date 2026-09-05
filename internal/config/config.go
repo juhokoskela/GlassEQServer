@@ -32,8 +32,18 @@ type StripeConfig struct {
 	MonthlyPriceID   string
 }
 
+type StripeCatalogConfig struct {
+	StripeConfig
+	PerpetualProductID string
+	MonthlyProductID   string
+}
+
 func Load() (Config, error) {
 	return load(os.LookupEnv)
+}
+
+func LoadStripeCatalog() (StripeCatalogConfig, error) {
+	return loadStripeCatalog(os.LookupEnv)
 }
 
 func load(lookup func(string) (string, bool)) (Config, error) {
@@ -104,24 +114,51 @@ func loadStripe(lookup func(string) (string, bool)) (*StripeConfig, error) {
 	) {
 		return nil, nil
 	}
-
-	secretKey, err := required(lookup, "GLASSEQ_STRIPE_SECRET_KEY")
+	stripeConfig, err := loadRequiredStripe(lookup)
 	if err != nil {
 		return nil, err
+	}
+	return &stripeConfig, nil
+}
+
+func loadRequiredStripe(lookup func(string) (string, bool)) (StripeConfig, error) {
+	secretKey, err := required(lookup, "GLASSEQ_STRIPE_SECRET_KEY")
+	if err != nil {
+		return StripeConfig{}, err
 	}
 	perpetualPriceID, err := stripeID(lookup, "GLASSEQ_STRIPE_PERPETUAL_PRICE_ID", "price_")
 	if err != nil {
-		return nil, err
+		return StripeConfig{}, err
 	}
 	monthlyPriceID, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_PRICE_ID", "price_")
 	if err != nil {
-		return nil, err
+		return StripeConfig{}, err
 	}
 
-	return &StripeConfig{
+	return StripeConfig{
 		SecretKey:        secretKey,
 		PerpetualPriceID: perpetualPriceID,
 		MonthlyPriceID:   monthlyPriceID,
+	}, nil
+}
+
+func loadStripeCatalog(lookup func(string) (string, bool)) (StripeCatalogConfig, error) {
+	stripeConfig, err := loadRequiredStripe(lookup)
+	if err != nil {
+		return StripeCatalogConfig{}, err
+	}
+	perpetualProductID, err := stripeID(lookup, "GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID", "prod_")
+	if err != nil {
+		return StripeCatalogConfig{}, err
+	}
+	monthlyProductID, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID", "prod_")
+	if err != nil {
+		return StripeCatalogConfig{}, err
+	}
+	return StripeCatalogConfig{
+		StripeConfig:       stripeConfig,
+		PerpetualProductID: perpetualProductID,
+		MonthlyProductID:   monthlyProductID,
 	}, nil
 }
 
