@@ -172,7 +172,7 @@ func reconcileSubscription(previous subscriptionProjection, subscription *stripe
 	case stripe.SubscriptionStatusActive:
 		if subscription.CancelAtPeriodEnd {
 			next.state, next.recoveryUntil = "ending", next.periodEnd
-		} else if (!paidEnd.IsZero() && !paidEnd.Before(next.periodEnd)) || now.Before(next.periodEnd) {
+		} else if now.Before(next.periodEnd) {
 			next.state, next.recoveryUntil = "active", next.periodEnd.Add(14*24*time.Hour)
 		} else {
 			// A finalized renewal can precede Stripe's past_due transition.

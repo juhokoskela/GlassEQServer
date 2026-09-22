@@ -15,6 +15,7 @@ var errBillingSnapshotChanged = errors.New("billing order changed during Stripe 
 
 type monthlyOrder struct {
 	checkoutOrder
+	state          string
 	licenseID      sql.NullString
 	subscriptionID sql.NullString
 	revision       int64
@@ -26,7 +27,7 @@ type purchaseOrderReader interface {
 
 func readMonthlyOrder(ctx context.Context, database purchaseOrderReader, sessionID, referenceID, metadataID, subscriptionID string, lock bool) (monthlyOrder, bool, error) {
 	query := `SELECT id, plan, policy_version, stripe_price_id, stripe_checkout_session_id, created_at,
-		license_id, stripe_subscription_id, billing_revision FROM checkout_orders
+		state, license_id, stripe_subscription_id, billing_revision FROM checkout_orders
 		WHERE stripe_checkout_session_id = $1 OR id = $2 OR id = $3 OR stripe_subscription_id = $4 ORDER BY id`
 	if lock {
 		query += " FOR UPDATE"
@@ -44,7 +45,7 @@ func readMonthlyOrder(ctx context.Context, database purchaseOrderReader, session
 		}
 		found = true
 		if err := rows.Scan(&order.id, &order.plan, &order.policyVersion, &order.priceID, &order.sessionID, &order.createdAt,
-			&order.licenseID, &order.subscriptionID, &order.revision); err != nil {
+			&order.state, &order.licenseID, &order.subscriptionID, &order.revision); err != nil {
 			return monthlyOrder{}, false, fmt.Errorf("scan monthly order: %w", err)
 		}
 	}
@@ -256,12 +257,19 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 		}
 		return next.state, nil
 	}
-	if subscription != nil && initial.Status == stripe.InvoiceStatusPaid && latest.Status == stripe.InvoiceStatusPaid && subscription.Status == stripe.SubscriptionStatusActive {
+	if subscription != nil && initial.Status == stripe.InvoiceStatusPaid && subscription.Status == stripe.SubscriptionStatusActive {
 		paidEnd, err := monthlyInvoicePeriod(latest, subscription, order, p.products.Monthly)
 		if err != nil {
 			return "", err
 		}
-		next, err := reconcileSubscription(subscriptionProjection{}, subscription, latest.ID, paidEnd, now)
+		initialPaidEnd, err := monthlyInvoicePeriod(initial, subscription, order, p.products.Monthly)
+		if err != nil {
+			return "", err
+		}
+		previous := subscriptionProjection{
+			periodEnd: initialPaidEnd, recoveryUntil: initialPaidEnd.Add(14 * 24 * time.Hour), lastPaidInvoice: initial.ID,
+		}
+		next, err := reconcileSubscription(previous, subscription, latest.ID, paidEnd, now)
 		if err != nil {
 			return "", err
 		}
@@ -287,7 +295,7 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 	if subscription != nil {
 		failed = failed || subscription.Status == stripe.SubscriptionStatusCanceled || subscription.Status == stripe.SubscriptionStatusIncompleteExpired || subscription.Status == stripe.SubscriptionStatusUnpaid
 	}
-	state, outcome := "pending", "no_change"
+	state, outcome := order.state, "no_change"
 	if failed {
 		state, outcome = "failed", "failed"
 	}

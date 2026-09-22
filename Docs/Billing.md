@@ -178,7 +178,7 @@ A completed Checkout event is only a prompt to inspect the Session. The worker r
 - `customer_details.email` is present and valid;
 - the payment is complete.
 
-For a perpetual purchase, `payment_status` must be `paid`. For a monthly purchase, the initial Invoice must be paid and the Subscription must be active. A completed Session with delayed or incomplete payment stays pending until the asynchronous success or `invoice.paid` event reconciles it.
+For a perpetual purchase, `payment_status` must be `paid`. For a monthly purchase, the initial Invoice must be paid and the Subscription must be active. A later unpaid renewal does not block initial fulfillment: the worker seeds the projection from the paid initial period, then reconciles the renewal without granting its unpaid period. A completed Session with delayed or incomplete payment stays pending unless the order has already failed. Later no-change events preserve a failed order until current Stripe state proves payment succeeded.
 
 Fulfillment uses one database transaction to:
 

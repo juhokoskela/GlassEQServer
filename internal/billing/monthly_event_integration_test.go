@@ -218,6 +218,72 @@ func TestMonthlyAsyncPaymentFailureWithPostgreSQL(t *testing.T) {
 	assertFulfillmentCounts(t, p.database, 1, 2)
 }
 
+func TestMonthlyFailedOrderRemainsFailedUntilPaidWithPostgreSQL(t *testing.T) {
+	for _, failure := range []string{"async", "terminal_subscription"} {
+		t.Run(failure, func(t *testing.T) {
+			p, _, checkout := monthlyFixture(t)
+			checkout.session.PaymentStatus = stripe.CheckoutSessionPaymentStatusUnpaid
+			checkout.invoices["in_initial"].Status = stripe.InvoiceStatusOpen
+			checkout.subscription.Status = stripe.SubscriptionStatusIncomplete
+			kind := "checkout.session.async_payment_failed"
+			if failure == "terminal_subscription" {
+				checkout.subscription.Status = stripe.SubscriptionStatusIncompleteExpired
+				kind = "checkout.session.completed"
+			}
+			monthlyEvent(t, p, "evt_failed", kind, "")
+			checkout.subscription.Status = stripe.SubscriptionStatusIncomplete
+			for _, kind := range []string{"invoice.updated", "invoice.payment_failed", "customer.subscription.updated"} {
+				id := "evt_" + kind
+				monthlyEvent(t, p, id, kind, "in_initial")
+				var state, outcome string
+				if err := p.database.QueryRow(`SELECT state FROM checkout_orders`).Scan(&state); err != nil {
+					t.Fatal(err)
+				}
+				if err := p.database.QueryRow(`SELECT outcome FROM stripe_events WHERE stripe_event_id = $1`, id).Scan(&outcome); err != nil {
+					t.Fatal(err)
+				}
+				if state != "failed" || outcome != "no_change" {
+					t.Fatalf("%s: state=%s outcome=%s", kind, state, outcome)
+				}
+			}
+			assertFulfillmentCounts(t, p.database, 0, 4)
+			checkout.session.PaymentStatus = stripe.CheckoutSessionPaymentStatusPaid
+			checkout.invoices["in_initial"].Status = stripe.InvoiceStatusPaid
+			checkout.subscription.Status = stripe.SubscriptionStatusActive
+			monthlyEvent(t, p, "evt_paid", "invoice.paid", "in_initial")
+			assertFulfillmentCounts(t, p.database, 1, 5)
+		})
+	}
+}
+
+func TestMonthlyInitialFulfillmentWithOpenRenewalWithPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"checkout.session.completed", "invoice.updated", "invoice.paid"} {
+		t.Run(kind, func(t *testing.T) {
+			p, _, checkout := monthlyFixture(t)
+			end := testCheckoutNow.AddDate(0, 1, 0)
+			renewal := paidMonthlyInvoice("in_renewal", end, end.AddDate(0, 1, 0))
+			renewal.Status = stripe.InvoiceStatusOpen
+			checkout.invoices[renewal.ID] = renewal
+			checkout.subscription.LatestInvoice = &stripe.Invoice{ID: renewal.ID}
+			p.now = func() time.Time { return end.Add(time.Hour) }
+			if _, err := p.database.Exec(`UPDATE checkout_orders SET stripe_checkout_session_id = 'cs_purchase'`); err != nil {
+				t.Fatal(err)
+			}
+			invoiceID := renewal.ID
+			if kind == "invoice.paid" {
+				invoiceID = "in_initial"
+			}
+			monthlyEvent(t, p, "evt_delayed_fulfillment", kind, invoiceID)
+			assertFulfillmentCounts(t, p.database, 1, 1)
+			assertSubscription(t, p.database, "recovering", "in_initial", end, end.Add(14*24*time.Hour))
+			// A second event must reconcile the same projection without another key.
+			monthlyEvent(t, p, "evt_unpaid_renewal", "invoice.updated", renewal.ID)
+			assertFulfillmentCounts(t, p.database, 1, 2)
+			assertSubscription(t, p.database, "recovering", "in_initial", end, end.Add(14*24*time.Hour))
+		})
+	}
+}
+
 func TestMonthlyTerminalLicenseCannotBeRestoredWithPostgreSQL(t *testing.T) {
 	for _, state := range []string{"refunded", "charged_back", "revoked"} {
 		t.Run(state, func(t *testing.T) {
