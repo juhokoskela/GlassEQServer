@@ -22,6 +22,12 @@ func eventBody(t testing.TB, id, eventType string) []byte {
 	if strings.HasPrefix(eventType, "customer.subscription.") {
 		objectID, object = "sub_purchase", "subscription"
 	}
+	if strings.HasPrefix(eventType, "refund.") {
+		objectID, object = "re_purchase", "refund"
+	}
+	if strings.HasPrefix(eventType, "charge.dispute.") {
+		objectID, object = "du_purchase", "dispute"
+	}
 	body := map[string]any{
 		"version": "0", "source": testDestination.Source, "account": testDestination.Account,
 		"region": testDestination.Region, "detail-type": eventType,
@@ -40,6 +46,8 @@ func eventBody(t testing.TB, id, eventType string) []byte {
 
 func FuzzDecodeBillingEvent(f *testing.F) {
 	f.Add(eventBody(f, "evt_purchase", "checkout.session.completed"))
+	f.Add(eventBody(f, "evt_refund", "refund.updated"))
+	f.Add(eventBody(f, "evt_dispute", "charge.dispute.closed"))
 	f.Add([]byte(`{"detail":null}`))
 	f.Add([]byte(`[]`))
 	f.Fuzz(func(t *testing.T, body []byte) {

@@ -60,7 +60,7 @@ func invoiceSubscriptionID(invoice *stripe.Invoice) string {
 	return invoice.Parent.SubscriptionDetails.Subscription.ID
 }
 
-func validateMonthlySession(session *stripe.CheckoutSession, order monthlyOrder, productID string) error {
+func validateMonthlySession(session *stripe.CheckoutSession, order purchaseOrder, productID string) error {
 	if order.plan != PlanMonthly || session.Object != "checkout.session" || session.Mode != stripe.CheckoutSessionModeSubscription ||
 		session.ClientReferenceID != order.id || !matchingOrderMetadata(session.Metadata, order.checkoutOrder) ||
 		(order.sessionID.Valid && order.sessionID.String != session.ID) ||
@@ -104,7 +104,7 @@ func matchingMonthlyPrice(price *stripe.Price, priceID, productID string, liveMo
 		price.Product.Object == "product" && price.Product.Livemode == liveMode
 }
 
-func validateMonthlySubscription(subscription *stripe.Subscription, session *stripe.CheckoutSession, order monthlyOrder, productID string) error {
+func validateMonthlySubscription(subscription *stripe.Subscription, session *stripe.CheckoutSession, order purchaseOrder, productID string) error {
 	if subscription == nil || subscription.ID != session.Subscription.ID || subscription.Object != "subscription" ||
 		subscription.Livemode != session.Livemode || !matchingOrderMetadata(subscription.Metadata, order.checkoutOrder) ||
 		subscription.Customer == nil || subscription.Customer.ID != session.Customer.ID ||
@@ -128,7 +128,7 @@ func validateMonthlySubscription(subscription *stripe.Subscription, session *str
 
 // Invoice line periods describe paid service. The Subscription's current period
 // can already describe the next, unpaid renewal and must not grant access.
-func monthlyInvoicePeriod(invoice *stripe.Invoice, subscription *stripe.Subscription, order monthlyOrder, productID string) (time.Time, error) {
+func monthlyInvoicePeriod(invoice *stripe.Invoice, subscription *stripe.Subscription, order purchaseOrder, productID string) (time.Time, error) {
 	if invoice == nil || !validStripeID(invoice.ID, "in_") || invoice.Object != "invoice" || invoice.Livemode != subscription.Livemode ||
 		invoiceSubscriptionID(invoice) != subscription.ID || invoice.Customer == nil || invoice.Customer.ID != subscription.Customer.ID ||
 		(invoice.BillingReason != stripe.InvoiceBillingReasonSubscriptionCreate && invoice.BillingReason != stripe.InvoiceBillingReasonSubscriptionCycle) ||

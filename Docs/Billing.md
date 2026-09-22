@@ -8,11 +8,11 @@ The first implementation targets Stripe Managed Payments and AWS `eu-north-1`. P
 
 ## Implementation status
 
-The optional worker implements bounded EventBridge validation, current Stripe hydration, event deduplication, and transactional license/key/delivery creation for both plans. It handles the four Checkout Session events below, the three Invoice events, and Subscription updates/deletions. Monthly events reconcile paid renewals, payment recovery, cancellation, and removal of a pending cancellation while preserving terminal license states.
+The optional worker implements bounded EventBridge validation, current Stripe hydration, event deduplication, and transactional license/key/delivery creation for both plans. It handles all fourteen accepted events below: Checkout, Invoice, Subscription, Refund, and Dispute events. Monthly events reconcile paid renewals, payment recovery, cancellation, and removal of a pending cancellation while preserving terminal license states.
 
 Both purchase paths go directly to `fulfilled` in the transaction that records the processed event and creates the license and outbox. They leave no committed `paid` gap: transaction failure retries through SQS. The paid-order sweep below applies to any future path that persists an intermediate `paid` state. Dead-letter redrive and daily reconciliation remain necessary operational repair paths.
 
-Refund/dispute processing, daily reconciliation, billing retention, and email dispatch/consumption remain planned. Production purchases remain disabled until these and the rollout checks are complete. The remaining sections describe the complete target contract unless explicitly identified as implemented.
+Refunds and disputes now persist cancellation intent, apply terminal restrictions, and restore eligible paid access after dispute resolution. Daily reconciliation, billing retention, and email dispatch/consumption remain planned. Production purchases remain disabled until these and the rollout checks are complete. The remaining sections describe the complete target contract unless explicitly identified as implemented.
 
 ## Fixed product decisions
 
@@ -161,7 +161,7 @@ A valid accepted event may refer to a Checkout Session or payment that this depl
 
 The final transaction locks the event row and checks `processed_at` again before changing domain state. Two workers may fetch the same Stripe objects, but only one commits the transition. The `outcome` column stores a bounded code such as `paid`, `failed`, `active`, `recovering`, `ending`, `lapsed`, `refunded`, `charged_back`, `restored`, `no_change`, or `ignored_unowned`.
 
-For monthly orders, migration `00006_billing_revision.sql` adds `checkout_orders.billing_revision`. The worker resolves ownership, reads the revision, then retrieves the current Session, Subscription, and Invoices. In the final transaction it locks the order and checks that revision before applying the snapshot. A competing commit makes the attempt retry through SQS. Every successful monthly reconciliation increments the revision, including `no_change`. Future reconciliation and terminal-state writers must follow the same order-lock and revision protocol.
+Migration `00006_billing_revision.sql` adds `checkout_orders.billing_revision`. The worker resolves ownership, reads the revision, then retrieves the current Session, Subscription, and Invoices. In the final transaction it locks the order and checks that revision before applying the snapshot. A competing commit makes the attempt retry through SQS. Checkout, monthly reconciliation, and adjustment writers increment the revision, including `no_change`. Future reconciliation writers must follow the same order-lock and revision protocol.
 
 An Invoice or Subscription event can arrive before Checkout creation has attached the Session ID. It remains retryable until creation or the Checkout event attaches the ID; the Checkout event can recover the order through metadata. No database connection is held during Stripe requests.
 
@@ -233,13 +233,21 @@ Refund and dispute events are resolved through their current Stripe objects to t
 - A successful full refund of a perpetual purchase changes `licenses.state` to `refunded`. Perpetual licenses have no `terminal_at` because their entitlement logic has no terminal timeline.
 - A successful full refund of any monthly Invoice, including a renewal, terminates the license. Before committing `refunded`, the worker cancels an active Stripe Subscription without proration or a new Invoice. It then sets `subscriptions.terminal_at` to the refund's effective time.
 - A full monthly refund is therefore a terminating action. Use a partial refund or credit when the Subscription should continue.
-- An opened dispute changes the license to `charged_back`. For a monthly license, the worker also cancels an active Subscription and sets `subscriptions.terminal_at` to the dispute's effective time.
+- An opened formal dispute (`needs_response` or `under_review`), or a lost dispute, changes the license to `charged_back`. For a monthly license, the worker also cancels an active Subscription and sets `subscriptions.terminal_at` to the dispute's effective time.
 - A failed refund does not change entitlement state.
 - A partial refund requires an operator decision and never revokes a license automatically.
 - A won or withdrawn dispute restores access only after current Stripe payment and subscription objects confirm that the license is paid and eligible.
 - Manual revocation remains separate from billing state and is never reversed by a later Stripe event.
 
-Stripe cancellation happens outside a database transaction. If its response is lost, the retry first hydrates the Subscription and treats an already-canceled result as success. The worker commits the terminal license state only after it confirms that Stripe will not bill the Subscription again. A later `customer.subscription.deleted` event cannot overwrite `refunded`, `charged_back`, or `revoked` license state.
+Migration `00007_billing_adjustments.sql` stores one normalized record per Refund or Dispute, with its order and Charge IDs, effective time, state, and pending cancellation work. Separate records preserve other disputes and refunds when one dispute resolves. Pending adjustments hold ordinary fulfillment and reconciliation for retry. An applied restriction suppresses late Checkout and renewal events, including events received before initial fulfillment. A restricted unfulfilled order becomes failed without issuing a key.
+
+Stripe cancellation happens outside a database transaction. The worker first persists cancellation intent under the order lock and revision check. If its response is lost, the retry hydrates the Subscription and treats an already-canceled result as success. Once prepared, cancellation must finish even if the dispute resolves meanwhile; restoration cannot resume recurring billing. The final transaction confirms cancellation, applies restrictions or restoration, and records the processed event together. A failed commit retains the intent for retry. A later `customer.subscription.deleted` event cannot overwrite `refunded`, `charged_back`, or `revoked` license state.
+
+Refund processing requires a single succeeded Refund equal to its Charge amount, corroborated by the fully refunded Charge. Partial Refund objects, including several partial refunds that cumulatively cover the payment, require an operator decision. Monthly adjustments must resolve to one Invoice Payment covering the affected paid Invoice in full. Split payments, prorations, and changed catalog items are outside the fixed purchase contract and remain retryable for investigation.
+
+The effective time is the current Refund or Dispute object's immutable Stripe creation time. It is not the worker's receipt time or, for a delayed refund, its success time. Repeated and later terminal events cannot extend an existing terminal grace deadline. Inquiries (`warning_needs_response` and `warning_under_review`) do not restrict access; `won`, `warning_closed`, and `prevented` clear that dispute's restriction. A withdrawal is recognized when Stripe reports a resolved status.
+
+Restoration requires a still-paid Charge, no remaining blocking adjustment, and no refund or manual revocation. Monthly restoration also validates the initial, affected, and latest Invoices and retains only paid service dates. A canceled subscription remains canceled: eligible access is projected as `lapsed`, ending seven days after the paid period, without a new payment-recovery window. Expired access is not restored. If a dispute prevented initial fulfillment, resolution can issue the withheld license and delivery record using the original validated Checkout purchase.
 
 For a monthly license, these terminal transitions start the existing seven-day signed-entitlement grace period. A perpetual license becomes ineligible for new activations and official services, but its cached offline entitlement has no expiry and cannot be remotely disabled.
 
@@ -250,7 +258,8 @@ Events are the fast path, not the only repair mechanism. A bounded scheduled job
 Retention is explicit:
 
 - processed Stripe event records retain identifiers and outcomes for 30 days, longer than the 14-day billing-queue retention period, then are deleted in batches;
-- unprocessed events are never removed by age alone;
+- unprocessed events and pending cancellation intents are never removed by age alone;
+- orders with billing adjustments remain available while needed to enforce a restriction or complete pending work;
 - fulfilled order and license records are retained while required for license recovery and financial support;
 - abandoned and failed Checkout orders are removed after a bounded support window;
 - raw Stripe or SQS event bodies are not persisted;

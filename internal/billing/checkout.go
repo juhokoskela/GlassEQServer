@@ -70,11 +70,17 @@ type CheckoutSession struct {
 }
 
 type CheckoutClient struct {
-	sessions      checkoutSessionBackend
-	prices        stripePriceBackend
-	subscriptions stripeSubscriptionBackend
-	invoices      stripeInvoiceBackend
-	liveMode      bool
+	sessions           checkoutSessionBackend
+	prices             stripePriceBackend
+	subscriptions      stripeSubscriptionBackend
+	invoices           stripeInvoiceBackend
+	liveMode           bool
+	refunds            stripeRefundBackend
+	disputes           stripeDisputeBackend
+	charges            stripeChargeBackend
+	invoicePayments    stripeInvoicePaymentBackend
+	sessionList        stripeSessionListBackend
+	subscriptionCancel stripeSubscriptionCancelBackend
 }
 
 type checkoutSessionBackend interface {
@@ -109,11 +115,17 @@ func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
 	})
 	client := stripe.NewClient(secretKey, stripe.WithBackends(backends))
 	return &CheckoutClient{
-		sessions:      client.V1CheckoutSessions,
-		prices:        client.V1Prices,
-		subscriptions: client.V1Subscriptions,
-		invoices:      client.V1Invoices,
-		liveMode:      liveMode,
+		sessions:           client.V1CheckoutSessions,
+		prices:             client.V1Prices,
+		subscriptions:      client.V1Subscriptions,
+		invoices:           client.V1Invoices,
+		liveMode:           liveMode,
+		refunds:            client.V1Refunds,
+		disputes:           client.V1Disputes,
+		charges:            client.V1Charges,
+		invoicePayments:    client.V1InvoicePayments,
+		sessionList:        client.V1CheckoutSessions,
+		subscriptionCancel: client.V1Subscriptions,
 	}, nil
 }
 

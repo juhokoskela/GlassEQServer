@@ -418,7 +418,7 @@ func openBillingTestDatabase(t *testing.T) *sql.DB {
 
 func resetBillingData(t *testing.T, database *sql.DB) {
 	t.Helper()
-	if _, err := database.ExecContext(context.Background(), "TRUNCATE checkout_orders, activation_rate_limits"); err != nil {
+	if _, err := database.ExecContext(context.Background(), "TRUNCATE billing_adjustments, checkout_orders, activation_rate_limits"); err != nil {
 		t.Fatalf("reset billing data: %v", err)
 	}
 }

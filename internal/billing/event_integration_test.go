@@ -246,6 +246,7 @@ func purchaseFixture(t *testing.T) (*EventProcessor, *activation.Service, *fakeP
 }
 
 type fakePurchaseRetriever struct {
+	unsupportedAdjustments
 	session  *stripe.CheckoutSession
 	database *sql.DB
 	err      error

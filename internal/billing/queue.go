@@ -32,7 +32,7 @@ func RunEventConsumer(ctx context.Context, queue eventQueue, queueURL string, ha
 				code = "invalid_event"
 			case errors.Is(err, ErrUnsupportedPurchase):
 				code = "unsupported_purchase"
-			case errors.Is(err, ErrInvalidCheckoutSession), errors.Is(err, ErrInvalidSubscription):
+			case errors.Is(err, ErrInvalidCheckoutSession), errors.Is(err, ErrInvalidSubscription), errors.Is(err, ErrInvalidAdjustment):
 				code = "invalid_purchase"
 			case errors.Is(err, errBillingSnapshotChanged):
 				code = "snapshot_changed"
