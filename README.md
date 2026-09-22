@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, account recovery, and optional Stripe Checkout. It issues entitlements with an AWS KMS Ed25519 key. Stripe event processing, recovery-email consumption, and download endpoints are not implemented. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
+The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, account recovery, and optional Stripe Checkout. It issues entitlements with an AWS KMS Ed25519 key. An optional EventBridge/SQS worker fulfills perpetual Checkout purchases into a license and encrypted delivery outbox. Monthly billing, refund/dispute processing, license-email dispatch, recovery-email consumption, and download endpoints are not implemented. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
 
 ## Trust boundaries
 
@@ -72,6 +72,24 @@ glasseqserver check-stripe-catalog
 ```
 
 The command retrieves both configured Prices and their Products. It returns a nonzero status unless their environment, active Products, `txcd_10202001` tax code, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. Product IDs are required only by this command; they do not change whether the server enables Checkout at runtime.
+
+### Perpetual purchase worker
+
+The billing worker is disabled unless its queue/source configuration is supplied. To exercise the perpetual purchase slice in sandbox, configure Stripe Checkout as above and supply:
+
+| Variable | Purpose |
+| --- | --- |
+| `GLASSEQ_BILLING_QUEUE_URL` | SQS Standard queue URL in `eu-north-1`; its account ID binds accepted EventBridge envelopes |
+| `GLASSEQ_STRIPE_EVENT_SOURCE` | Exact `aws.partner/stripe.com/...` partner source from the configured destination |
+| `GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID` | Product expected on purchased perpetual line items |
+
+The queue policy must allow sends only from the exact EventBridge rule. The task needs receive/delete access to this queue. Configure encryption, TLS-only access, a dead-letter queue, bounded redrive attempts, and alarms according to `Docs/Billing.md` before enabling the worker.
+
+This slice handles the four Checkout Session events (`completed`, `async_payment_succeeded`, `async_payment_failed`, and `expired`) for perpetual orders. It retrieves the current Session, line items/Product, and PaymentIntent/latest Charge before opening the fulfillment transaction. Successful processing atomically records the event outcome, creates one license and hashed key with an encrypted seven-day delivery copy, inserts the delivery outbox row, and fulfills the order. An unattached order reservation can be recovered using its validated Session metadata. Already refunded or disputed purchases are rejected pending the terminal-state implementation.
+
+Messages are processed serially with bounded deadlines. Deletion occurs only after commit. Duplicate messages replay without creating another license; different events for one order serialize on that order. Unknown event types, owned monthly orders, and invalid owned purchases are not acknowledged and reach the configured dead-letter queue after retries. Unowned valid Checkout events are recorded as `ignored_unowned`.
+
+Keep production purchases disabled until the remaining monthly, refund/dispute, reconciliation, retention, and email-delivery work and the documented rollout checks are complete. The outbox is durable storage, not proof that an email has been sent. This slice neither starts a public webhook nor changes the existing Checkout currency request.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 

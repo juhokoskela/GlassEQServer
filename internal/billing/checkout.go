@@ -84,6 +84,10 @@ type stripePriceBackend interface {
 	Retrieve(context.Context, string, *stripe.PriceRetrieveParams) (*stripe.Price, error)
 }
 
+func (c *CheckoutClient) LiveMode() bool {
+	return c.liveMode
+}
+
 func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
 	liveMode, err := stripeLiveMode(secretKey)
 	if err != nil {
