@@ -190,6 +190,7 @@ type checkoutOrder struct {
 	policyVersion string
 	priceID       string
 	sessionID     sql.NullString
+	paymentID     sql.NullString
 	createdAt     time.Time
 }
 

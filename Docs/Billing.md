@@ -6,6 +6,14 @@ This document defines how GlassEQ Server creates Stripe Checkout Sessions, turns
 
 The first implementation targets Stripe Managed Payments and AWS `eu-north-1`. Product and price identifiers below are sandbox values. Production identifiers must be supplied separately and must never be inferred from the sandbox configuration.
 
+## Implementation status
+
+The optional perpetual worker implements bounded EventBridge validation, current Checkout hydration, event deduplication, and transactional license/key/delivery creation. It handles the four Checkout Session events listed below. Owned monthly orders and unsupported lifecycle events remain unacknowledged; production rollout remains blocked by the unfinished lifecycle and delivery work.
+
+For this perpetual path, the order goes directly to `fulfilled` in the same transaction that records the processed event and creates the license and outbox. It does not leave a committed `paid` order behind: transaction failure retries through SQS. The paid-order sweep described below remains planned for paths that persist an intermediate `paid` state.
+
+Subscription projection, refunds/disputes, daily reconciliation, billing retention, and email dispatch/consumption remain planned. The remaining sections describe the complete target contract unless explicitly identified as implemented.
+
 ## Fixed product decisions
 
 | Plan | Price | Tax code | Sandbox product | Sandbox price |
@@ -19,6 +27,8 @@ The first implementation targets Stripe Managed Payments and AWS `eu-north-1`. P
 - Monthly entitlements remain usable throughout that recovery schedule, followed by the existing seven-day client grace period.
 - Checkout returns to `https://glasseq.app/checkout/success` or `https://glasseq.app/checkout/cancel`.
 - License-delivery and recovery emails are sent from `glasseq.app` through Amazon SES.
+- Customers use Stripe Link to cancel subscriptions and update payment methods. GlassEQ links to that flow and owns license recovery and activation-slot management. A new purchase after a subscription has ended is verified separately.
+- EUR is the catalog/base currency; Managed Payments Adaptive Pricing provides supported local-currency payment. Verify the existing Checkout request in sandbox for both plans before changing currency parameters.
 
 ## Ownership and trust boundaries
 
@@ -181,7 +191,7 @@ The Checkout Session email is the recovery and delivery address. It wins if it d
 
 The transaction contains no Stripe, KMS, SQS, or SES call. A separate dispatcher publishes a `license_delivery` message to the same encrypted FIFO queue used by recovery email. The email consumer distinguishes the message type and deduplicates the stable delivery ID before sending through SES. Stripe remains responsible for receipts and billing emails; GlassEQ sends only the license credential and product-specific recovery messages.
 
-Fulfillment stores the minimum Stripe identifiers needed to resolve later invoices, refunds, and disputes. It does not store card data, billing addresses, Stripe payloads, or tax details. Before enabling the endpoint, the implementation migration must add the request ID and payment reference, allow `stripe_checkout_session_id` to be null while an order is reserved, and add the license-delivery outbox.
+Fulfillment stores the minimum Stripe identifiers needed to resolve later invoices, refunds, and disputes. It does not store card data, billing addresses, Stripe payloads, or tax details. Migration `00004_checkout_billing.sql` already adds the request ID and payment references, permits a null `stripe_checkout_session_id` while an order is reserved, and adds the license-delivery outbox.
 
 ## Monthly subscription projection
 
@@ -257,6 +267,7 @@ The billing feature stays disabled until all of these are true:
 
 ## References
 
+- [Managed Payments and Link customer management](https://docs.stripe.com/payments/managed-payments/how-it-works)
 - [Set up Stripe Managed Payments](https://docs.stripe.com/payments/managed-payments/set-up)
 - [Update Checkout for Managed Payments](https://docs.stripe.com/payments/managed-payments/update-checkout)
 - [Create a Checkout Session](https://docs.stripe.com/api/checkout/sessions/create)

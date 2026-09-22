@@ -120,6 +120,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("create activation service: %w", err)
 	}
 	var checkoutService *billing.OrderService
+	var eventProcessor *billing.EventProcessor
 	if settings.Stripe != nil {
 		checkoutClient, err := billing.NewCheckoutClient(settings.Stripe.SecretKey)
 		if err != nil {
@@ -131,6 +132,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}, settings.RateLimitHMACKey)
 		if err != nil {
 			return fmt.Errorf("create Checkout order service: %w", err)
+		}
+		if settings.Billing != nil {
+			// NewCheckoutClient already validates the key prefix and environment.
+			eventProcessor, err = billing.NewEventProcessor(database, checkoutClient, activationService, billing.EventDestination{
+				Source: settings.Billing.EventSource, Account: settings.Billing.AccountID,
+				Region: "eu-north-1", LiveMode: checkoutClient.LiveMode(),
+			}, settings.Billing.PerpetualProductID)
+			if err != nil {
+				return fmt.Errorf("create billing event processor: %w", err)
+			}
 		}
 	}
 
@@ -166,6 +177,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	var background sync.WaitGroup
 	background.Go(func() { runActivationCleanup(backgroundCtx, activationService, logger) })
 	background.Go(func() { runRecoveryEmailDispatch(backgroundCtx, activationService, logger) })
+	if eventProcessor != nil {
+		background.Go(func() {
+			queue := sqs.NewFromConfig(awsSettings, func(options *sqs.Options) { options.Region = "eu-north-1" })
+			billing.RunEventConsumer(backgroundCtx, queue, settings.Billing.QueueURL, eventProcessor, logger)
+		})
+	}
 	serveErr := serve(ctx, server, listener)
 	stopBackground()
 	background.Wait()

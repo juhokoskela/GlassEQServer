@@ -24,6 +24,7 @@ type Config struct {
 	DatabaseEncryptionKey   []byte
 	RecoveryQueueURL        string
 	Stripe                  *StripeConfig
+	Billing                 *BillingConfig
 }
 
 type StripeConfig struct {
@@ -91,6 +92,10 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	billingConfig, err := loadBilling(lookup, stripeConfig)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		HTTPAddress:             httpAddress,
@@ -103,6 +108,7 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		DatabaseEncryptionKey:   databaseEncryptionKey,
 		RecoveryQueueURL:        recoveryQueueURL,
 		Stripe:                  stripeConfig,
+		Billing:                 billingConfig,
 	}, nil
 }
 
