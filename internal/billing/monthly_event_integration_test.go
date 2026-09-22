@@ -84,12 +84,15 @@ func assertSubscription(t *testing.T, database *sql.DB, state, invoice string, e
 }
 
 func TestMonthlyFulfillmentAndEntitlementWithPostgreSQL(t *testing.T) {
-	p, service, _ := monthlyFixture(t)
+	p, service, checkout := monthlyFixture(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	end := now.AddDate(0, 1, 0)
+	p.now = func() time.Time { return now }
+	checkout.invoices["in_initial"] = paidMonthlyInvoice("in_initial", now, end)
 	p.database.SetMaxOpenConns(1)
 	monthlyEvent(t, p, "evt_initial", "checkout.session.completed", "")
 	monthlyEvent(t, p, "evt_initial", "checkout.session.completed", "")
 	monthlyEvent(t, p, "evt_invoice_initial", "invoice.paid", "in_initial")
-	end := testCheckoutNow.AddDate(0, 1, 0)
 	assertSubscription(t, p.database, "active", "in_initial", end, end.Add(14*24*time.Hour))
 	assertFulfillmentCounts(t, p.database, 1, 2)
 	var plan, subID string
