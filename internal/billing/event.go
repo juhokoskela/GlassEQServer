@@ -42,13 +42,14 @@ type ProductCatalog struct {
 type EventProcessor struct {
 	database    *sql.DB
 	checkout    purchaseRetriever
+	adjustments adjustmentClient
 	licenses    purchasedLicenseIssuer
 	destination EventDestination
 	products    ProductCatalog
 	now         func() time.Time
 }
 
-func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses purchasedLicenseIssuer, destination EventDestination, products ProductCatalog) (*EventProcessor, error) {
+func NewEventProcessor(database *sql.DB, checkout billingClient, licenses purchasedLicenseIssuer, destination EventDestination, products ProductCatalog) (*EventProcessor, error) {
 	if database == nil || checkout == nil || licenses == nil {
 		return nil, errors.New("billing event database, Checkout client, and license issuer are required")
 	}
@@ -64,7 +65,7 @@ func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses pu
 	if !validProductID(products.PerpetualV1) || !validProductID(products.Monthly) {
 		return nil, errors.New("perpetual and monthly Stripe Product IDs are required for fulfillment")
 	}
-	return &EventProcessor{database: database, checkout: checkout, licenses: licenses,
+	return &EventProcessor{database: database, checkout: checkout, adjustments: checkout, licenses: licenses,
 		destination: destination, products: products, now: time.Now}, nil
 }
 
@@ -114,6 +115,10 @@ func decodeBillingEvent(body []byte, destination EventDestination, now time.Time
 		prefix, object = "in_", "invoice"
 	case "customer.subscription.updated", "customer.subscription.deleted":
 		prefix, object = "sub_", "subscription"
+	case "refund.created", "refund.updated", "refund.failed":
+		prefix, object = "re_", "refund"
+	case "charge.dispute.created", "charge.dispute.closed":
+		prefix, object = "du_", "dispute"
 	default:
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
@@ -140,6 +145,9 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	processed, err := matchingBillingEvent(ctx, p.database, event, false)
 	if err != nil || processed {
 		return err
+	}
+	if event.Data.Object.Object == "refund" || event.Data.Object.Object == "dispute" {
+		return p.processAdjustment(ctx, event, now)
 	}
 	if event.Data.Object.Object != "checkout.session" {
 		return p.processMonthlyEvent(ctx, event, nil, now)
@@ -170,45 +178,43 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	}
 	outcome := "ignored_unowned"
 	if found {
-		if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1); err != nil {
+		blocked, err := billingRestriction(ctx, tx, order.id)
+		if err != nil {
 			return err
 		}
 		outcome = "no_change"
-		if state != "fulfilled" {
-			if session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid {
-				licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
-					Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID, Email: session.CustomerDetails.Email,
-				}, now)
-				if err != nil {
-					return err
-				}
-				// There is no committed paid-but-unfulfilled gap for this synchronous
-				// perpetual path. A rollback leaves the SQS message to retry all of it.
-				if _, err := tx.ExecContext(ctx, `
-					UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
-					    stripe_checkout_session_id = $4, stripe_payment_intent_id = $5
-					WHERE id = $1`, order.id, licenseID, now, session.ID, session.PaymentIntent.ID); err != nil {
-					return fmt.Errorf("fulfill purchase order: %w", err)
-				}
-				outcome = "fulfilled"
-			} else {
-				switch session.Status {
-				case stripe.CheckoutSessionStatusExpired:
-					outcome = "failed"
-				case stripe.CheckoutSessionStatusOpen, stripe.CheckoutSessionStatusComplete:
-					if event.Type == "checkout.session.async_payment_failed" {
-						outcome = "failed"
+		if !blocked {
+			if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1); err != nil {
+				return err
+			}
+			if state != "fulfilled" {
+				if session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid {
+					if err := p.issuePerpetualPurchase(ctx, tx, order, session, now); err != nil {
+						return err
 					}
-				default:
-					return ErrInvalidCheckoutSession
-				}
-				if outcome == "failed" && state != "paid" {
-					if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET state = 'failed',
+					outcome = "fulfilled"
+				} else {
+					switch session.Status {
+					case stripe.CheckoutSessionStatusExpired:
+						outcome = "failed"
+					case stripe.CheckoutSessionStatusOpen, stripe.CheckoutSessionStatusComplete:
+						if event.Type == "checkout.session.async_payment_failed" {
+							outcome = "failed"
+						}
+					default:
+						return ErrInvalidCheckoutSession
+					}
+					if outcome == "failed" && state != "paid" {
+						if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET state = 'failed',
 					    stripe_checkout_session_id = $2 WHERE id = $1`, order.id, session.ID); err != nil {
-						return fmt.Errorf("fail unpaid order: %w", err)
+							return fmt.Errorf("fail unpaid order: %w", err)
+						}
 					}
 				}
 			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET billing_revision = billing_revision + 1 WHERE id = $1`, order.id); err != nil {
+			return fmt.Errorf("advance billing revision: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE stripe_events SET processed_at = $2, outcome = $3
@@ -263,4 +269,22 @@ func lockPurchaseOrder(ctx context.Context, tx *sql.Tx, session *stripe.Checkout
 		return checkoutOrder{}, "", false, fmt.Errorf("read purchase orders: %w", err)
 	}
 	return order, state, count == 1, nil
+}
+
+func (p *EventProcessor) issuePerpetualPurchase(ctx context.Context, tx *sql.Tx, order checkoutOrder, session *stripe.CheckoutSession, now time.Time) error {
+	licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
+		Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID, Email: session.CustomerDetails.Email,
+	}, now)
+	if err != nil {
+		return err
+	}
+	// There is no committed paid-but-unfulfilled gap for this synchronous
+	// perpetual path. A rollback leaves the SQS message to retry all of it.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
+		    stripe_checkout_session_id = $4, stripe_payment_intent_id = $5
+		WHERE id = $1`, order.id, licenseID, now, session.ID, session.PaymentIntent.ID); err != nil {
+		return fmt.Errorf("fulfill purchase order: %w", err)
+	}
+	return nil
 }

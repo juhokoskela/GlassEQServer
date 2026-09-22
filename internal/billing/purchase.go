@@ -29,6 +29,16 @@ func (c *CheckoutClient) RetrievePurchase(ctx context.Context, sessionID string)
 }
 
 func validatePerpetualPurchase(session *stripe.CheckoutSession, order checkoutOrder, productID string) error {
+	if err := validatePerpetualPayment(session, order, productID); err != nil {
+		return err
+	}
+	if session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid && (session.PaymentIntent.LatestCharge.Refunded || session.PaymentIntent.LatestCharge.Disputed) {
+		return ErrInvalidCheckoutSession
+	}
+	return nil
+}
+
+func validatePerpetualPayment(session *stripe.CheckoutSession, order checkoutOrder, productID string) error {
 	if order.plan != PlanPerpetualV1 {
 		return ErrUnsupportedPurchase
 	}
@@ -69,7 +79,7 @@ func validatePerpetualPurchase(session *stripe.CheckoutSession, order checkoutOr
 	if !validStripeID(intent.ID, "pi_") || intent.Object != "payment_intent" || intent.Livemode != session.Livemode ||
 		intent.Status != stripe.PaymentIntentStatusSucceeded || intent.Metadata["order_id"] != order.id ||
 		intent.Metadata["plan"] != string(order.plan) || intent.Metadata["policy_version"] != order.policyVersion ||
-		intent.LatestCharge == nil || !intent.LatestCharge.Paid || intent.LatestCharge.Refunded || intent.LatestCharge.Disputed {
+		intent.LatestCharge == nil || !intent.LatestCharge.Paid {
 		return ErrInvalidCheckoutSession
 	}
 	return nil

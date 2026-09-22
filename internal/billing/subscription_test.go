@@ -46,7 +46,7 @@ func paidMonthlyInvoice(id string, start, end time.Time) *stripe.Invoice {
 }
 
 func TestMonthlyPurchaseValidation(t *testing.T) {
-	order := monthlyOrder{checkoutOrder: checkoutOrder{id: testCheckoutOrderID, plan: PlanMonthly, policyVersion: PolicyVersion, priceID: "price_monthly"}}
+	order := purchaseOrder{checkoutOrder: checkoutOrder{id: testCheckoutOrderID, plan: PlanMonthly, policyVersion: PolicyVersion, priceID: "price_monthly"}}
 	for name, change := range map[string]func(*stripe.CheckoutSession, *stripe.Subscription, *stripe.Invoice){
 		"consent": func(s *stripe.CheckoutSession, _ *stripe.Subscription, _ *stripe.Invoice) { s.Consent = nil },
 		"email": func(s *stripe.CheckoutSession, _ *stripe.Subscription, _ *stripe.Invoice) {
