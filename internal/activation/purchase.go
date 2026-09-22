@@ -10,18 +10,22 @@ import (
 	"time"
 )
 
-type PerpetualPurchase struct {
-	PolicyVersion string
-	CustomerID    string
-	Email         string
+type PurchasedLicense struct {
+	Plan           string
+	SubscriptionID string
+	PolicyVersion  string
+	CustomerID     string
+	Email          string
 }
 
 // IssuePurchasedLicense joins the billing owner's transaction. The caller locks
 // the order and commits its fulfilled state with this license and delivery record.
 // No credential leaves this method in plaintext, and no external service is called.
-func (s *Service) IssuePurchasedLicense(ctx context.Context, tx *sql.Tx, purchase PerpetualPurchase, now time.Time) (string, error) {
+func (s *Service) IssuePurchasedLicense(ctx context.Context, tx *sql.Tx, purchase PurchasedLicense, now time.Time) (string, error) {
 	email, valid := normalizeRecoveryEmail(purchase.Email)
-	if !valid || purchase.PolicyVersion == "" || purchase.CustomerID == "" {
+	if !valid || purchase.PolicyVersion == "" || purchase.CustomerID == "" ||
+		(purchase.Plan != "perpetual_v1" && purchase.Plan != "monthly") ||
+		(purchase.Plan == "monthly") != (purchase.SubscriptionID != "") {
 		return "", errors.New("invalid purchased license details")
 	}
 	licenseID, err := randomValue(s.random, "lic_", 16)
@@ -53,9 +57,9 @@ func (s *Service) IssuePurchasedLicense(ctx context.Context, tx *sql.Tx, purchas
 	keyHash := sha256.Sum256([]byte(normalizedKey))
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO licenses (id, plan, state, policy_version, recovery_email_ciphertext,
-		    recovery_email_lookup, stripe_customer_id, created_at, updated_at)
-		VALUES ($1, 'perpetual_v1', 'active', $2, $3, $4, $5, $6, $6)`,
-		licenseID, purchase.PolicyVersion, emailCiphertext, emailHash[:], purchase.CustomerID, now); err != nil {
+		    recovery_email_lookup, stripe_customer_id, stripe_subscription_id, created_at, updated_at)
+		VALUES ($1, $2, 'active', $3, $4, $5, $6, NULLIF($7, ''), $8, $8)`,
+		licenseID, purchase.Plan, purchase.PolicyVersion, emailCiphertext, emailHash[:], purchase.CustomerID, purchase.SubscriptionID, now); err != nil {
 		return "", fmt.Errorf("insert purchased license: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `

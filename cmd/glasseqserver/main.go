@@ -138,7 +138,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			eventProcessor, err = billing.NewEventProcessor(database, checkoutClient, activationService, billing.EventDestination{
 				Source: settings.Billing.EventSource, Account: settings.Billing.AccountID,
 				Region: "eu-north-1", LiveMode: checkoutClient.LiveMode(),
-			}, settings.Billing.PerpetualProductID)
+			}, billing.ProductCatalog{PerpetualV1: settings.Billing.PerpetualProductID, Monthly: settings.Billing.MonthlyProductID})
 			if err != nil {
 				return fmt.Errorf("create billing event processor: %w", err)
 			}

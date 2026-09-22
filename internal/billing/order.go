@@ -220,7 +220,7 @@ func (s *OrderService) reserveOrder(ctx context.Context, input preparedCheckoutO
 		INSERT INTO checkout_orders (
 		    id, request_id, plan, policy_version, stripe_price_id, state, created_at
 		) VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-		ON CONFLICT (request_id) DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		order.id, input.requestID, order.plan, order.policyVersion, order.priceID, order.createdAt)
 	if err != nil {
 		return checkoutOrder{}, fmt.Errorf("reserve Checkout order: %w", err)

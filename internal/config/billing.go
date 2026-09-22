@@ -11,6 +11,7 @@ type BillingConfig struct {
 	EventSource        string
 	AccountID          string
 	PerpetualProductID string
+	MonthlyProductID   string
 }
 
 func loadBilling(lookup func(string) (string, bool), stripe *StripeConfig) (*BillingConfig, error) {
@@ -55,5 +56,9 @@ func loadBilling(lookup func(string) (string, bool), stripe *StripeConfig) (*Bil
 	if err != nil {
 		return nil, err
 	}
-	return &BillingConfig{QueueURL: queueURL, EventSource: source, AccountID: parts[0], PerpetualProductID: product}, nil
+	monthlyProduct, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID", "prod_")
+	if err != nil {
+		return nil, err
+	}
+	return &BillingConfig{QueueURL: queueURL, EventSource: source, AccountID: parts[0], PerpetualProductID: product, MonthlyProductID: monthlyProduct}, nil
 }
