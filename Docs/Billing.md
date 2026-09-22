@@ -8,11 +8,11 @@ The first implementation targets Stripe Managed Payments and AWS `eu-north-1`. P
 
 ## Implementation status
 
-The optional perpetual worker implements bounded EventBridge validation, current Checkout hydration, event deduplication, and transactional license/key/delivery creation. It handles the four Checkout Session events listed below. Owned monthly orders and unsupported lifecycle events remain unacknowledged; production rollout remains blocked by the unfinished lifecycle and delivery work.
+The optional worker implements bounded EventBridge validation, current Stripe hydration, event deduplication, and transactional license/key/delivery creation for both plans. It handles the four Checkout Session events below, the three Invoice events, and Subscription updates/deletions. Monthly events reconcile paid renewals, payment recovery, cancellation, and removal of a pending cancellation while preserving terminal license states.
 
-For this perpetual path, the order goes directly to `fulfilled` in the same transaction that records the processed event and creates the license and outbox. It does not leave a committed `paid` order behind: transaction failure retries through SQS. The paid-order sweep described below remains planned for paths that persist an intermediate `paid` state.
+Both purchase paths go directly to `fulfilled` in the transaction that records the processed event and creates the license and outbox. They leave no committed `paid` gap: transaction failure retries through SQS. The paid-order sweep below applies to any future path that persists an intermediate `paid` state. Dead-letter redrive and daily reconciliation remain necessary operational repair paths.
 
-Subscription projection, refunds/disputes, daily reconciliation, billing retention, and email dispatch/consumption remain planned. The remaining sections describe the complete target contract unless explicitly identified as implemented.
+Refund/dispute processing, daily reconciliation, billing retention, and email dispatch/consumption remain planned. Production purchases remain disabled until these and the rollout checks are complete. The remaining sections describe the complete target contract unless explicitly identified as implemented.
 
 ## Fixed product decisions
 
@@ -161,6 +161,10 @@ A valid accepted event may refer to a Checkout Session or payment that this depl
 
 The final transaction locks the event row and checks `processed_at` again before changing domain state. Two workers may fetch the same Stripe objects, but only one commits the transition. The `outcome` column stores a bounded code such as `paid`, `failed`, `active`, `recovering`, `ending`, `lapsed`, `refunded`, `charged_back`, `restored`, `no_change`, or `ignored_unowned`.
 
+For monthly orders, migration `00006_billing_revision.sql` adds `checkout_orders.billing_revision`. The worker resolves ownership, reads the revision, then retrieves the current Session, Subscription, and Invoices. In the final transaction it locks the order and checks that revision before applying the snapshot. A competing commit makes the attempt retry through SQS. Every successful monthly reconciliation increments the revision, including `no_change`. Future reconciliation and terminal-state writers must follow the same order-lock and revision protocol.
+
+An Invoice or Subscription event can arrive before Checkout creation has attached the Session ID. It remains retryable until creation or the Checkout event attaches the ID; the Checkout event can recover the order through metadata. No database connection is held during Stripe requests.
+
 The worker performs no Stripe or KMS call while holding a database transaction, row lock, or advisory lock.
 
 ## Purchase fulfillment
@@ -206,6 +210,8 @@ The database has four billing states. The client receives the resulting state an
 | Customer canceled immediately, or a scheduled cancellation reached its end | `lapsed` | `billing_period_end` |
 | Stripe ended the Subscription after payment retries, or marked it unpaid | `lapsed` | Preserve the last payment-recovery deadline |
 | A later payment restores an eligible Subscription | `active` | New `billing_period_end + 14 days` |
+
+`billing_period_end` comes only from a validated paid invoice line for the pinned Price, Product, quantity, Subscription, and subscription item. The worker checks the latest Invoice and, for Invoice events, the event's current Invoice as well. This permits a late payment of an older renewal while refusing access for the newer unpaid period. Repeated paid Invoice IDs cannot extend the period, and older paid periods never move it backwards. Prorations, manual invoices, and changed catalog items are outside the fixed monthly product contract.
 
 The worker uses the hydrated Subscription's `cancel_at_period_end` and `cancellation_details.reason` to distinguish a customer request, payment failure, and dispute. A terminal license state takes precedence over the subscription projection.
 

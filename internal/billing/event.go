@@ -26,10 +26,17 @@ type EventDestination struct {
 
 type purchaseRetriever interface {
 	RetrievePurchase(context.Context, string) (*stripe.CheckoutSession, error)
+	RetrieveSubscription(context.Context, string) (*stripe.Subscription, error)
+	RetrieveInvoice(context.Context, string) (*stripe.Invoice, error)
 }
 
 type purchasedLicenseIssuer interface {
-	IssuePurchasedLicense(context.Context, *sql.Tx, activation.PerpetualPurchase, time.Time) (string, error)
+	IssuePurchasedLicense(context.Context, *sql.Tx, activation.PurchasedLicense, time.Time) (string, error)
+}
+
+type ProductCatalog struct {
+	PerpetualV1 string
+	Monthly     string
 }
 
 type EventProcessor struct {
@@ -37,11 +44,11 @@ type EventProcessor struct {
 	checkout    purchaseRetriever
 	licenses    purchasedLicenseIssuer
 	destination EventDestination
-	productID   string
+	products    ProductCatalog
 	now         func() time.Time
 }
 
-func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses purchasedLicenseIssuer, destination EventDestination, productID string) (*EventProcessor, error) {
+func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses purchasedLicenseIssuer, destination EventDestination, products ProductCatalog) (*EventProcessor, error) {
 	if database == nil || checkout == nil || licenses == nil {
 		return nil, errors.New("billing event database, Checkout client, and license issuer are required")
 	}
@@ -54,11 +61,11 @@ func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses pu
 			return nil, errors.New("invalid billing AWS account")
 		}
 	}
-	if !validProductID(productID) {
-		return nil, errors.New("perpetual Stripe Product ID is required for fulfillment")
+	if !validProductID(products.PerpetualV1) || !validProductID(products.Monthly) {
+		return nil, errors.New("perpetual and monthly Stripe Product IDs are required for fulfillment")
 	}
 	return &EventProcessor{database: database, checkout: checkout, licenses: licenses,
-		destination: destination, productID: productID, now: time.Now}, nil
+		destination: destination, products: products, now: time.Now}, nil
 }
 
 type billingEvent struct {
@@ -96,15 +103,24 @@ func decodeBillingEvent(body []byte, destination EventDestination, now time.Time
 	if !validStripeID(event.ID, "evt_") || len(event.ID) > 255 || event.Object != "event" ||
 		event.APIVersion != StripeAPIVersion || event.LiveMode == nil || *event.LiveMode != destination.LiveMode ||
 		event.Type != envelope.DetailType || event.Created <= 0 || event.Created > now.Add(5*time.Minute).Unix() ||
-		!validStripeID(event.Data.Object.ID, "cs_") || len(event.Data.Object.ID) > 255 || event.Data.Object.Object != "checkout.session" {
+		len(event.Data.Object.ID) > 255 {
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
+	var prefix, object string
 	switch event.Type {
 	case "checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed", "checkout.session.expired":
-		return event, nil
+		prefix, object = "cs_", "checkout.session"
+	case "invoice.paid", "invoice.payment_failed", "invoice.updated":
+		prefix, object = "in_", "invoice"
+	case "customer.subscription.updated", "customer.subscription.deleted":
+		prefix, object = "sub_", "subscription"
 	default:
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
+	if !validStripeID(event.Data.Object.ID, prefix) || event.Data.Object.Object != object {
+		return billingEvent{}, ErrInvalidBillingEvent
+	}
+	return event, nil
 }
 
 // Process commits the event outcome and any fulfillment together. The queue owner
@@ -125,6 +141,9 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	if err != nil || processed {
 		return err
 	}
+	if event.Data.Object.Object != "checkout.session" {
+		return p.processMonthlyEvent(ctx, event, nil, now)
+	}
 	// No database transaction or connection is retained while Stripe responds.
 	session, err := p.checkout.RetrievePurchase(ctx, event.Data.Object.ID)
 	if err != nil {
@@ -132,6 +151,9 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	}
 	if session == nil || session.ID != event.Data.Object.ID || session.Livemode != p.destination.LiveMode {
 		return ErrInvalidCheckoutSession
+	}
+	if session.Mode == stripe.CheckoutSessionModeSubscription {
+		return p.processMonthlyEvent(ctx, event, session, now)
 	}
 	tx, err := p.database.BeginTx(ctx, nil)
 	if err != nil {
@@ -148,14 +170,14 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	}
 	outcome := "ignored_unowned"
 	if found {
-		if err := validatePerpetualPurchase(session, order, p.productID); err != nil {
+		if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1); err != nil {
 			return err
 		}
 		outcome = "no_change"
 		if state != "fulfilled" {
 			if session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid {
-				licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PerpetualPurchase{
-					PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID, Email: session.CustomerDetails.Email,
+				licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
+					Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID, Email: session.CustomerDetails.Email,
 				}, now)
 				if err != nil {
 					return err

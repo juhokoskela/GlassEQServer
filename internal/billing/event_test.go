@@ -15,13 +15,20 @@ var testDestination = EventDestination{Source: "aws.partner/stripe.com/ed_test",
 
 func eventBody(t testing.TB, id, eventType string) []byte {
 	t.Helper()
+	objectID, object := "cs_purchase", "checkout.session"
+	if strings.HasPrefix(eventType, "invoice.") {
+		objectID, object = "in_initial", "invoice"
+	}
+	if strings.HasPrefix(eventType, "customer.subscription.") {
+		objectID, object = "sub_purchase", "subscription"
+	}
 	body := map[string]any{
 		"version": "0", "source": testDestination.Source, "account": testDestination.Account,
 		"region": testDestination.Region, "detail-type": eventType,
 		"detail": map[string]any{
 			"id": id, "object": "event", "api_version": StripeAPIVersion,
 			"type": eventType, "livemode": false, "created": testCheckoutNow.Unix(),
-			"data": map[string]any{"object": map[string]any{"id": "cs_purchase", "object": "checkout.session"}},
+			"data": map[string]any{"object": map[string]any{"id": objectID, "object": object}},
 		},
 	}
 	encoded, err := json.Marshal(body)

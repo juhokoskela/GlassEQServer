@@ -237,7 +237,7 @@ func purchaseFixture(t *testing.T) (*EventProcessor, *activation.Service, *fakeP
 		t.Fatal(err)
 	}
 	checkout := &fakePurchaseRetriever{session: paidPurchase()}
-	processor, err := NewEventProcessor(database, checkout, licenses, testDestination, "prod_perpetual")
+	processor, err := NewEventProcessor(database, checkout, licenses, testDestination, ProductCatalog{PerpetualV1: "prod_perpetual", Monthly: "prod_monthly"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func (c *fakePurchaseRetriever) RetrievePurchase(ctx context.Context, _ string) 
 
 type failingPurchaseIssuer struct{ service *activation.Service }
 
-func (f failingPurchaseIssuer) IssuePurchasedLicense(ctx context.Context, tx *sql.Tx, purchase activation.PerpetualPurchase, now time.Time) (string, error) {
+func (f failingPurchaseIssuer) IssuePurchasedLicense(ctx context.Context, tx *sql.Tx, purchase activation.PurchasedLicense, now time.Time) (string, error) {
 	if _, err := f.service.IssuePurchasedLicense(ctx, tx, purchase, now); err != nil {
 		return "", err
 	}
@@ -335,4 +335,17 @@ func deliveredKey(t *testing.T, database *sql.DB) string {
 		t.Fatal("email did not round-trip in the recovery format")
 	}
 	return string(key)
+}
+
+func (*fakePurchaseRetriever) RetrieveSubscription(context.Context, string) (*stripe.Subscription, error) {
+	return nil, ErrUnsupportedPurchase
+}
+func (*fakePurchaseRetriever) RetrieveInvoice(context.Context, string) (*stripe.Invoice, error) {
+	return nil, ErrUnsupportedPurchase
+}
+func (purchaseRetrieverFunc) RetrieveSubscription(context.Context, string) (*stripe.Subscription, error) {
+	return nil, ErrUnsupportedPurchase
+}
+func (purchaseRetrieverFunc) RetrieveInvoice(context.Context, string) (*stripe.Invoice, error) {
+	return nil, ErrUnsupportedPurchase
 }
