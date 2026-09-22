@@ -285,7 +285,7 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 	}
 	failed := session.Status == stripe.CheckoutSessionStatusExpired || event.Type == "checkout.session.async_payment_failed"
 	if subscription != nil {
-		failed = subscription.Status == stripe.SubscriptionStatusCanceled || subscription.Status == stripe.SubscriptionStatusIncompleteExpired || subscription.Status == stripe.SubscriptionStatusUnpaid
+		failed = failed || subscription.Status == stripe.SubscriptionStatusCanceled || subscription.Status == stripe.SubscriptionStatusIncompleteExpired || subscription.Status == stripe.SubscriptionStatusUnpaid
 	}
 	state, outcome := "pending", "no_change"
 	if failed {

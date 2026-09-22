@@ -192,6 +192,32 @@ func TestMonthlyInitialPaymentAndAttachmentRaceWithPostgreSQL(t *testing.T) {
 	assertFulfillmentCounts(t, p.database, 1, 2)
 }
 
+func TestMonthlyAsyncPaymentFailureWithPostgreSQL(t *testing.T) {
+	p, _, checkout := monthlyFixture(t)
+	checkout.session.PaymentStatus = stripe.CheckoutSessionPaymentStatusUnpaid
+	checkout.invoices["in_initial"].Status = stripe.InvoiceStatusOpen
+	checkout.subscription.Status = stripe.SubscriptionStatusIncomplete
+	monthlyEvent(t, p, "evt_async_failed", "checkout.session.async_payment_failed", "")
+	assertFulfillmentCounts(t, p.database, 0, 1)
+	var state, outcome string
+	if err := p.database.QueryRow(`SELECT state FROM checkout_orders`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.database.QueryRow(`SELECT outcome FROM stripe_events WHERE stripe_event_id = 'evt_async_failed'`).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed" || outcome != "failed" {
+		t.Fatalf("async failure with incomplete subscription: state=%s outcome=%s", state, outcome)
+	}
+
+	// A delayed failure notification must still honor a now-paid purchase.
+	checkout.session.PaymentStatus = stripe.CheckoutSessionPaymentStatusPaid
+	checkout.invoices["in_initial"].Status = stripe.InvoiceStatusPaid
+	checkout.subscription.Status = stripe.SubscriptionStatusActive
+	monthlyEvent(t, p, "evt_late_async_failed", "checkout.session.async_payment_failed", "")
+	assertFulfillmentCounts(t, p.database, 1, 2)
+}
+
 func TestMonthlyTerminalLicenseCannotBeRestoredWithPostgreSQL(t *testing.T) {
 	for _, state := range []string{"refunded", "charged_back", "revoked"} {
 		t.Run(state, func(t *testing.T) {
