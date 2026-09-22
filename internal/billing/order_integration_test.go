@@ -246,6 +246,7 @@ func TestConcurrentCheckoutOrderRetryCreatesOneReservationWithPostgreSQL(t *test
 	service := newTestOrderService(t, database, checkout)
 	input := checkoutOrderInput(testCheckoutRequestID, PlanMonthly)
 
+	early := make(chan error, 2)
 	results := make([]CheckoutSession, 2)
 	errorsByIndex := make([]error, 2)
 	var wait sync.WaitGroup
@@ -254,12 +255,19 @@ func TestConcurrentCheckoutOrderRetryCreatesOneReservationWithPostgreSQL(t *test
 		go func() {
 			defer wait.Done()
 			results[index], errorsByIndex[index] = service.CreateCheckoutSession(context.Background(), input)
+			early <- errorsByIndex[index]
 		}()
 	}
 	for range results {
 		select {
 		case <-checkout.createStarted:
+		case err := <-early:
+			close(checkout.releaseCreate)
+			wait.Wait()
+			t.Fatalf("concurrent request returned before Stripe: %v", err)
 		case <-time.After(time.Second):
+			close(checkout.releaseCreate)
+			wait.Wait()
 			t.Fatal("concurrent request did not reach Stripe")
 		}
 	}
