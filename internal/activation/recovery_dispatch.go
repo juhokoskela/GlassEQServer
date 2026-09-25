@@ -12,7 +12,7 @@ import (
 
 const (
 	recoveryDatabaseTimeout         = 3 * time.Second
-	recoveryQueueTimeout            = 10 * time.Second
+	recoveryEmailTimeout            = 10 * time.Second
 	recoveryRetryDelay              = time.Minute
 	recoveryMinimumDeliveryLifetime = 5 * time.Minute
 )
@@ -195,17 +195,15 @@ func (s *Service) dispatchRecoveryEmail(ctx context.Context, now time.Time) (boo
 		return false, fmt.Errorf("decrypt recovery token: %w", err)
 	}
 	message := RecoveryEmail{
-		Schema:        1,
-		DeliveryID:    deliveryID,
 		Email:         string(email),
 		RecoveryToken: string(token),
 		ExpiresAt:     expiresAt.Unix(),
 	}
-	queueCtx, cancel := context.WithTimeout(ctx, recoveryQueueTimeout)
-	err = s.recoveryEmails.SendRecoveryEmail(queueCtx, message)
+	emailCtx, cancel := context.WithTimeout(ctx, recoveryEmailTimeout)
+	err = s.emails.SendRecoveryEmail(emailCtx, message)
 	cancel()
 	if err != nil {
-		return false, fmt.Errorf("send recovery email to queue: %w", err)
+		return false, fmt.Errorf("send recovery email: %w", err)
 	}
 	ackCtx, cancel := context.WithTimeout(ctx, recoveryDatabaseTimeout)
 	result, err := s.database.ExecContext(ackCtx, `

@@ -123,28 +123,20 @@ func TestDelayedPurchaseAndReorderedEventsWithPostgreSQL(t *testing.T) {
 }
 
 func TestPurchaseRejectsOwnedMismatchWithPostgreSQL(t *testing.T) {
-	for _, kind := range []string{"price", "session", "metadata", "monthly", "email", "payment_reference"} {
+	for _, kind := range []string{"price", "link", "mode", "email", "payment_reference"} {
 		t.Run(kind, func(t *testing.T) {
 			p, _, checkout := purchaseFixture(t)
 			switch kind {
 			case "price":
 				checkout.session.LineItems.Data[0].Price.ID = "price_other"
-			case "session":
-				if _, err := p.database.Exec(`UPDATE checkout_orders SET stripe_checkout_session_id = 'cs_other'`); err != nil {
-					t.Fatal(err)
-				}
-			case "metadata":
-				checkout.session.Metadata["order_id"] = "ord_other"
-			case "monthly":
-				if _, err := p.database.Exec(`UPDATE checkout_orders SET plan = 'monthly'`); err != nil {
-					t.Fatal(err)
-				}
+			case "link":
+				checkout.session.PaymentLink.ID = "plink_monthly"
+			case "mode":
+				checkout.session.Mode = stripe.CheckoutSessionModeSubscription
 			case "email":
 				checkout.session.CustomerDetails.Email = "not an email"
 			case "payment_reference":
-				if _, err := p.database.Exec(`UPDATE checkout_orders SET stripe_checkout_session_id = 'cs_purchase', stripe_payment_intent_id = 'pi_other'`); err != nil {
-					t.Fatal(err)
-				}
+				checkout.session.PaymentIntent.LatestCharge.Paid = false
 			}
 			if err := p.Process(context.Background(), eventBody(t, "evt_invalid", "checkout.session.completed")); err == nil {
 				t.Fatal("owned mismatch was acknowledged")
@@ -198,8 +190,7 @@ func (f purchaseRetrieverFunc) RetrievePurchase(ctx context.Context, id string) 
 
 func TestUnownedPurchaseAndEventCollisionWithPostgreSQL(t *testing.T) {
 	p, _, checkout := purchaseFixture(t)
-	checkout.session.ClientReferenceID = "ord_unknown"
-	checkout.session.Metadata["order_id"] = "ord_unknown"
+	checkout.session.PaymentLink.ID = "plink_other"
 	body := eventBody(t, "evt_unowned", "checkout.session.completed")
 	if err := p.Process(context.Background(), body); err != nil {
 		t.Fatal(err)
@@ -220,11 +211,7 @@ func purchaseFixture(t *testing.T) (*EventProcessor, *activation.Service, *fakeP
 	if _, err := database.Exec(`TRUNCATE licenses, checkout_orders, stripe_events, activation_rate_limits CASCADE`); err != nil {
 		t.Fatal(err)
 	}
-	_, err := database.Exec(`INSERT INTO checkout_orders (id, request_id, plan, policy_version, stripe_price_id, state, created_at)
-		VALUES ($1, $2, 'perpetual_v1', 'v1', 'price_perpetual', 'pending', $3)`, testCheckoutOrderID, testCheckoutRequestID, testCheckoutNow)
-	if err != nil {
-		t.Fatal(err)
-	}
+	var err error
 	issuer, err := entitlement.NewIssuer("test-purchase", purchaseSigner(ed25519.NewKeyFromSeed(bytes.Repeat([]byte{9}, 32))))
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +224,10 @@ func purchaseFixture(t *testing.T) (*EventProcessor, *activation.Service, *fakeP
 		t.Fatal(err)
 	}
 	checkout := &fakePurchaseRetriever{session: paidPurchase()}
-	processor, err := NewEventProcessor(database, checkout, licenses, testDestination, ProductCatalog{PerpetualV1: "prod_perpetual", Monthly: "prod_monthly"})
+	processor, err := NewEventProcessor(database, checkout, licenses, testLiveMode, BillingCatalog{
+		PerpetualV1: "prod_perpetual", Monthly: "prod_monthly", PerpetualPriceID: "price_perpetual", MonthlyPriceID: "price_monthly",
+		PerpetualLinkID: "plink_perpetual", MonthlyLinkID: "plink_monthly",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,6 +270,10 @@ func (s purchaseSigner) Sign(_ context.Context, message []byte) ([]byte, error) 
 type purchaseEmailQueue struct{}
 
 func (purchaseEmailQueue) SendRecoveryEmail(context.Context, activation.RecoveryEmail) error {
+	return errors.New("unexpected email dispatch")
+}
+
+func (purchaseEmailQueue) SendLicenseEmail(context.Context, activation.LicenseEmail) error {
 	return errors.New("unexpected email dispatch")
 }
 

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/juhokoskela/GlassEQServer/internal/activation"
@@ -15,14 +14,7 @@ import (
 
 const maximumBillingEventBytes = 256 * 1024
 
-var ErrInvalidBillingEvent = errors.New("invalid or unsupported Stripe EventBridge message")
-
-type EventDestination struct {
-	Source   string
-	Account  string
-	Region   string
-	LiveMode bool
-}
+var ErrInvalidBillingEvent = errors.New("invalid or unsupported Stripe webhook event")
 
 type purchaseRetriever interface {
 	RetrievePurchase(context.Context, string) (*stripe.CheckoutSession, error)
@@ -34,38 +26,49 @@ type purchasedLicenseIssuer interface {
 	IssuePurchasedLicense(context.Context, *sql.Tx, activation.PurchasedLicense, time.Time) (string, error)
 }
 
-type ProductCatalog struct {
-	PerpetualV1 string
-	Monthly     string
+type BillingCatalog struct {
+	PerpetualV1      string
+	Monthly          string
+	PerpetualPriceID string
+	MonthlyPriceID   string
+	PerpetualLinkID  string
+	MonthlyLinkID    string
+}
+
+type checkoutOrder struct {
+	id            string
+	plan          Plan
+	policyVersion string
+	priceID       string
+	sessionID     sql.NullString
+	paymentID     sql.NullString
+	createdAt     time.Time
+}
+
+type checkoutOrderQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 type EventProcessor struct {
-	database    *sql.DB
-	checkout    purchaseRetriever
-	licenses    purchasedLicenseIssuer
-	destination EventDestination
-	products    ProductCatalog
-	now         func() time.Time
+	database *sql.DB
+	checkout purchaseRetriever
+	licenses purchasedLicenseIssuer
+	liveMode bool
+	products BillingCatalog
+	now      func() time.Time
 }
 
-func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses purchasedLicenseIssuer, destination EventDestination, products ProductCatalog) (*EventProcessor, error) {
+func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses purchasedLicenseIssuer, liveMode bool, products BillingCatalog) (*EventProcessor, error) {
 	if database == nil || checkout == nil || licenses == nil {
 		return nil, errors.New("billing event database, Checkout client, and license issuer are required")
 	}
-	if !strings.HasPrefix(destination.Source, "aws.partner/stripe.com/") || len(destination.Source) > 256 ||
-		len(destination.Source) == len("aws.partner/stripe.com/") || len(destination.Account) != 12 || destination.Region != "eu-north-1" {
-		return nil, errors.New("invalid billing EventBridge destination")
-	}
-	for _, digit := range destination.Account {
-		if digit < '0' || digit > '9' {
-			return nil, errors.New("invalid billing AWS account")
-		}
-	}
-	if !validProductID(products.PerpetualV1) || !validProductID(products.Monthly) {
-		return nil, errors.New("perpetual and monthly Stripe Product IDs are required for fulfillment")
+	if !validProductID(products.PerpetualV1) || !validProductID(products.Monthly) ||
+		!validPriceID(products.PerpetualPriceID) || !validPriceID(products.MonthlyPriceID) ||
+		!validStripeID(products.PerpetualLinkID, "plink_") || !validStripeID(products.MonthlyLinkID, "plink_") {
+		return nil, errors.New("Stripe product, price, and payment link IDs are required for fulfillment")
 	}
 	return &EventProcessor{database: database, checkout: checkout, licenses: licenses,
-		destination: destination, products: products, now: time.Now}, nil
+		liveMode: liveMode, products: products, now: time.Now}, nil
 }
 
 type billingEvent struct {
@@ -83,26 +86,17 @@ type billingEvent struct {
 	} `json:"data"`
 }
 
-func decodeBillingEvent(body []byte, destination EventDestination, now time.Time) (billingEvent, error) {
+func decodeBillingEvent(body []byte, liveMode bool, now time.Time) (billingEvent, error) {
 	if len(body) > maximumBillingEventBytes {
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
-	var envelope struct {
-		Version    string       `json:"version"`
-		Source     string       `json:"source"`
-		Account    string       `json:"account"`
-		Region     string       `json:"region"`
-		DetailType string       `json:"detail-type"`
-		Detail     billingEvent `json:"detail"`
-	}
-	if json.Unmarshal(body, &envelope) != nil || envelope.Version != "0" || envelope.Source != destination.Source ||
-		envelope.Account != destination.Account || envelope.Region != destination.Region {
+	var event billingEvent
+	if json.Unmarshal(body, &event) != nil {
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
-	event := envelope.Detail
 	if !validStripeID(event.ID, "evt_") || len(event.ID) > 255 || event.Object != "event" ||
-		event.APIVersion != StripeAPIVersion || event.LiveMode == nil || *event.LiveMode != destination.LiveMode ||
-		event.Type != envelope.DetailType || event.Created <= 0 || event.Created > now.Add(5*time.Minute).Unix() ||
+		event.APIVersion != StripeAPIVersion || event.LiveMode == nil || *event.LiveMode != liveMode ||
+		event.Created <= 0 || event.Created > now.Add(5*time.Minute).Unix() ||
 		len(event.Data.Object.ID) > 255 {
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
@@ -123,11 +117,11 @@ func decodeBillingEvent(body []byte, destination EventDestination, now time.Time
 	return event, nil
 }
 
-// Process commits the event outcome and any fulfillment together. The queue owner
-// may acknowledge only a nil result; unsupported lifecycle events remain retryable.
+// Process commits the event outcome and any fulfillment together. The webhook
+// acknowledges only a nil result; unsupported lifecycle events remain retryable.
 func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	now := p.now().UTC().Truncate(time.Microsecond)
-	event, err := decodeBillingEvent(body, p.destination, now)
+	event, err := decodeBillingEvent(body, p.liveMode, now)
 	if err != nil {
 		return err
 	}
@@ -149,8 +143,15 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	if err != nil {
 		return err
 	}
-	if session == nil || session.ID != event.Data.Object.ID || session.Livemode != p.destination.LiveMode {
+	if session == nil || session.ID != event.Data.Object.ID || session.Livemode != p.liveMode {
 		return ErrInvalidCheckoutSession
+	}
+	owned, err := p.ensurePaymentLinkOrder(ctx, session, now)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return p.commitMonthlyEvent(ctx, event, monthlyOrder{}, nil, nil, nil, nil, now)
 	}
 	if session.Mode == stripe.CheckoutSessionModeSubscription {
 		return p.processMonthlyEvent(ctx, event, session, now)
@@ -170,7 +171,7 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	}
 	outcome := "ignored_unowned"
 	if found {
-		if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1); err != nil {
+		if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1, p.products.PerpetualLinkID); err != nil {
 			return err
 		}
 		outcome = "no_change"
@@ -183,7 +184,7 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 					return err
 				}
 				// There is no committed paid-but-unfulfilled gap for this synchronous
-				// perpetual path. A rollback leaves the SQS message to retry all of it.
+				// perpetual path. A rollback leaves Stripe to retry all of it.
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
 					    stripe_checkout_session_id = $4, stripe_payment_intent_id = $5
@@ -238,11 +239,56 @@ func matchingBillingEvent(ctx context.Context, database checkoutOrderQuerier, ev
 	return processed.Valid, nil
 }
 
+// A Payment Link has no preceding server order. Bind its immutable session ID
+// to the configured link and catalog before creating the local purchase row.
+func (p *EventProcessor) ensurePaymentLinkOrder(ctx context.Context, session *stripe.CheckoutSession, now time.Time) (bool, error) {
+	if session.PaymentLink == nil {
+		return false, nil
+	}
+	var plan Plan
+	var priceID, productID string
+	var mode stripe.CheckoutSessionMode
+	switch session.PaymentLink.ID {
+	case p.products.PerpetualLinkID:
+		plan, priceID, productID, mode = PlanPerpetualV1, p.products.PerpetualPriceID, p.products.PerpetualV1, stripe.CheckoutSessionModePayment
+	case p.products.MonthlyLinkID:
+		plan, priceID, productID, mode = PlanMonthly, p.products.MonthlyPriceID, p.products.Monthly, stripe.CheckoutSessionModeSubscription
+	default:
+		return false, nil
+	}
+	if session.Object != "checkout.session" || session.Mode != mode ||
+		session.ManagedPayments == nil || !session.ManagedPayments.Enabled ||
+		session.LineItems == nil || session.LineItems.HasMore || len(session.LineItems.Data) != 1 {
+		return false, ErrInvalidCheckoutSession
+	}
+	item := session.LineItems.Data[0]
+	if item == nil || item.Quantity != 1 || !matchingMonthlyPrice(item.Price, priceID, productID, session.Livemode) {
+		return false, ErrInvalidCheckoutSession
+	}
+	_, err := p.database.ExecContext(ctx, `
+		INSERT INTO checkout_orders (id, plan, policy_version, stripe_price_id, stripe_checkout_session_id, state, created_at)
+		VALUES ($1, $2, $3, $4, $1, 'pending', $5)
+		ON CONFLICT (id) DO NOTHING`, session.ID, plan, PolicyVersion, priceID, now)
+	if err != nil {
+		return false, fmt.Errorf("record payment link purchase: %w", err)
+	}
+	var storedPlan, storedPrice, storedSession string
+	if err := p.database.QueryRowContext(ctx, `
+		SELECT plan, stripe_price_id, stripe_checkout_session_id FROM checkout_orders WHERE id = $1`, session.ID).
+		Scan(&storedPlan, &storedPrice, &storedSession); err != nil {
+		return false, fmt.Errorf("load payment link purchase: %w", err)
+	}
+	if storedPlan != string(plan) || storedPrice != priceID || storedSession != session.ID {
+		return false, ErrInvalidCheckoutSession
+	}
+	return true, nil
+}
+
 func lockPurchaseOrder(ctx context.Context, tx *sql.Tx, session *stripe.CheckoutSession) (checkoutOrder, string, bool, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, plan, policy_version, stripe_price_id, stripe_checkout_session_id, stripe_payment_intent_id, created_at, state
-		FROM checkout_orders WHERE stripe_checkout_session_id = $1 OR id = $2 OR id = $3
-		ORDER BY id FOR UPDATE`, session.ID, session.ClientReferenceID, session.Metadata["order_id"])
+		FROM checkout_orders WHERE stripe_checkout_session_id = $1
+		FOR UPDATE`, session.ID)
 	if err != nil {
 		return checkoutOrder{}, "", false, fmt.Errorf("lock purchase order: %w", err)
 	}

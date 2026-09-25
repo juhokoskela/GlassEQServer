@@ -2,14 +2,14 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, account recovery, and optional Stripe Checkout. It issues entitlements with an AWS KMS Ed25519 key. An optional EventBridge/SQS worker fulfills perpetual and monthly Checkout purchases into a license and encrypted delivery outbox, and reconciles monthly renewals, payment recovery, and cancellation. Refund/dispute processing, daily reconciliation, billing retention, license-email dispatch, recovery-email consumption, and download endpoints are not implemented. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
+The project is under active development. The service exposes liveness, database readiness, license activation, entitlement refresh, license management, and email recovery. When Stripe is configured, a signed webhook fulfills purchases from the two configured Payment Links and reconciles monthly renewals, payment recovery, and cancellation. GlassEQ sends license keys and recovery tokens through Amazon SES; Stripe sends receipts and billing emails. Refund/dispute processing, daily billing reconciliation, billing retention, and download endpoints are not implemented. The billing contract and rollout gaps are documented in [Docs/Billing.md](Docs/Billing.md).
 
 ## Trust boundaries
 
 - AWS KMS holds the entitlement private key. The service can request Ed25519 signatures but cannot export the private key.
 - The Sparkle and Apple release keys do not belong to this service. The GlassEQ release workflow builds and signs updates separately.
 - The ECS task role must not be able to upload, replace, or delete update artifacts.
-- The ECS task role may send messages only to the email FIFO queue used for recovery and license delivery. The queue must use server-side encryption.
+- The ECS task role may send email through SES only from the verified GlassEQ sender identity.
 - The ECS task security group must accept public HTTP traffic only through the Application Load Balancer. The load balancer must use its default `append` mode for `X-Forwarded-For`, with client-port preservation disabled. Activation rate limits use the rightmost address appended by the load balancer.
 - Logs must not contain credentials, entitlement bodies, email addresses, Stripe payloads, or download authorization headers.
 
@@ -42,13 +42,13 @@ The server requires these environment variables:
 | `GLASSEQ_IDEMPOTENCY_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts replay responses |
 | `GLASSEQ_RATE_LIMIT_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key that hashes client IP addresses |
 | `GLASSEQ_EMAIL_LOOKUP_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key used for recovery-email lookups |
-| `GLASSEQ_DATABASE_ENCRYPTION_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts recovery emails and queued tokens |
-| `GLASSEQ_RECOVERY_QUEUE_URL` | HTTPS URL of the recovery-email SQS FIFO queue |
+| `GLASSEQ_DATABASE_ENCRYPTION_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts email addresses and delivery credentials |
+| `GLASSEQ_EMAIL_FROM` | Verified SES sender address, such as `licenses@glasseq.app` |
 | `GLASSEQ_HTTP_ADDRESS` | Listen address, defaults to `:8080` |
 
 Keep the encryption and HMAC keys stable across deployments. Store them in the deployment's secret manager; do not commit them.
 
-Stripe Checkout is optional. Supplying any of these variables requires all three and enables the public Checkout endpoint:
+Stripe API access is optional. Supplying any of these variables requires all three:
 
 | Variable | Purpose |
 | --- | --- |
@@ -56,43 +56,44 @@ Stripe Checkout is optional. Supplying any of these variables requires all three
 | `GLASSEQ_STRIPE_PERPETUAL_PRICE_ID` | Environment-specific perpetual Price ID |
 | `GLASSEQ_STRIPE_MONTHLY_PRICE_ID` | Environment-specific monthly Price ID |
 
-The Checkout client derives test or live mode from the API key and rejects a response from the other environment. The configured Price IDs remain server-owned and are never accepted from callers.
+The Stripe client derives test or live mode from the API key and rejects a response from the other environment. The configured IDs remain server-owned and are never accepted from callers.
 
-Before enabling Checkout or changing its Stripe catalog, add these variables to the preflight task's environment:
+Before enabling billing or changing its Stripe catalog, add these variables to the preflight task's environment:
 
 | Variable | Purpose |
 | --- | --- |
 | `GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID` | Environment-specific perpetual Product ID |
 | `GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID` | Environment-specific monthly Product ID |
 
-The preflight task also needs the three Stripe Checkout variables above. Run it with the same server image:
+The preflight task also needs the three Stripe API variables above. Run it with the same server image:
 
 ```sh
 glasseqserver check-stripe-catalog
 ```
 
-The command retrieves both configured Prices and their Products. It returns a nonzero status unless their environment, active Products, `txcd_10202001` tax code, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. Product IDs are required by this command and the optional billing worker. They do not change whether the server enables the Checkout endpoint.
+The command retrieves both configured Prices and their Products. It returns a nonzero status unless their environment, active Products, `txcd_10202001` tax code, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. It does not validate the Payment Links.
 
-### Billing worker
+### Stripe webhook
 
-The billing worker is disabled unless its queue/source configuration is supplied. To exercise purchase fulfillment and monthly events in sandbox, configure Stripe Checkout as above and supply:
+The webhook is disabled unless all of these variables are supplied alongside the Stripe API variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `GLASSEQ_BILLING_QUEUE_URL` | SQS Standard queue URL in `eu-north-1`; its account ID binds accepted EventBridge envelopes |
-| `GLASSEQ_STRIPE_EVENT_SOURCE` | Exact `aws.partner/stripe.com/...` partner source from the configured destination |
+| `GLASSEQ_STRIPE_WEBHOOK_SECRET` | Signing secret for the Stripe webhook endpoint |
+| `GLASSEQ_STRIPE_PERPETUAL_LINK_ID` | Payment Link ID for the perpetual plan |
+| `GLASSEQ_STRIPE_MONTHLY_LINK_ID` | Payment Link ID for the monthly plan |
 | `GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID` | Product expected on purchased perpetual line items |
 | `GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID` | Product expected on monthly Checkout, Subscription, and Invoice line items |
 
-The queue policy must allow sends only from the exact EventBridge rule. The task needs receive/delete access to this queue. Configure encryption, TLS-only access, a dead-letter queue, bounded redrive attempts, and alarms according to `Docs/Billing.md` before enabling the worker.
+Point the Stripe event destination to `POST /v1/stripe/webhook` with the pinned Stripe API version. The handler accepts the raw signed body, enforces a 256 KiB limit and Stripe's five-minute signature tolerance, and returns a non-2xx response when processing fails so Stripe can retry. Configure only the supported events listed in `Docs/Billing.md`.
 
-The worker handles the four Checkout Session events (`completed`, `async_payment_succeeded`, `async_payment_failed`, and `expired`), `invoice.paid`, `invoice.payment_failed`, `invoice.updated`, and `customer.subscription.updated` / `deleted`. Fulfillment atomically records the event outcome, creates one license and hashed key with an encrypted seven-day delivery copy, inserts the delivery outbox row, and fulfills the order. Monthly fulfillment also creates the subscription projection. An unattached order reservation can be recovered through validated Checkout metadata; an Invoice or Subscription event that arrives first retries until the Session is attached.
+The webhook handles the four Checkout Session events (`completed`, `async_payment_succeeded`, `async_payment_failed`, and `expired`), `invoice.paid`, `invoice.payment_failed`, `invoice.updated`, and `customer.subscription.updated` / `deleted`. A Checkout Session from one of the configured Payment Links establishes the local purchase row. Fulfillment atomically records the event outcome, creates one license and hashed key with an encrypted seven-day delivery copy, inserts the delivery outbox row, and fulfills the purchase. Monthly fulfillment also creates the subscription projection. An Invoice or Subscription event received before its Checkout Session is recorded as unowned; the later Checkout event hydrates current Stripe state.
 
 Monthly events retrieve the current Checkout, Subscription, and relevant Invoices outside transactions. Access uses paid invoice line periods, not an unpaid renewal's Subscription period. Payment recovery retains the fourteen-day window, customer cancellation removes that window, and existing terminal license states cannot be restored by renewal events. Migration `00006_billing_revision.sql` adds an order revision: if another reconciliation commits during the Stripe reads, the stale attempt rolls back and retries. Every monthly reconciliation, including a no-change result, advances that revision.
 
-Messages are processed serially with bounded deadlines and are deleted only after commit. Unknown event types and invalid owned purchases remain unacknowledged and reach the configured dead-letter queue after retries. Valid accepted events for unowned objects are recorded as `ignored_unowned`. Perpetual purchases already refunded or disputed remain rejected pending terminal-state processing.
+Duplicate and concurrent webhook events are safe to retry. Invalid owned purchases return a retryable response and require investigation. Valid events for unowned objects are recorded as `ignored_unowned`. Perpetual purchases already refunded or disputed remain rejected pending terminal-state processing.
 
-Apply migrations and supply both Product IDs before starting the updated worker. Keep production purchases disabled until refund/dispute processing, daily reconciliation, retention, email delivery, and the documented rollout checks are complete. The outbox is durable storage, not proof that an email has been sent. There is no public Stripe webhook.
+Apply migrations before enabling the webhook. Keep production purchases disabled until refund/dispute processing, daily reconciliation, retention, and the documented rollout checks are complete. SES acceptance and sender verification remain deployment checks.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 
@@ -111,7 +112,7 @@ The service exposes:
 - `POST /v1/management/license-key-rotations` for replacing the license key.
 - `POST /v1/recovery-requests` for requesting email recovery. Requires an `Idempotency-Key` header.
 - `POST /v1/recovery-sessions` for exchanging a one-time bearer recovery token for a management session. Requires an `Idempotency-Key` header.
-- `POST /v1/checkout-sessions` for creating or replaying a Stripe-hosted Checkout Session when Stripe is configured. Requires an `Idempotency-Key` header.
+- `POST /v1/stripe/webhook` for signed Stripe purchase and subscription events when billing is configured.
 
 Successful activation responses remain replayable for 24 hours. Failed requests are evaluated again rather than cached. The service removes expired replay and rate-limit rows in bounded background batches.
 
@@ -123,7 +124,9 @@ License-key rotation requires a management session and an idempotency UUID. A li
 
 Well-formed recovery requests always return the same `202` response for known, unknown, invalid, and rate-limited email addresses. Requests are limited to three attempts per normalized email and 20 attempts per IP address each hour. Every non-limited address produces the same small lookup job, and the service stores that job with the encrypted idempotency replay in one transaction. The HTTP path does not look up licenses or create tokens.
 
-A background worker resolves lookup jobs and atomically creates hashed 30-minute tokens with encrypted delivery data for matching licenses. Failed preparation jobs are deferred for one minute so they cannot block later lookups or existing deliveries. The dispatcher then claims pending deliveries without holding a database connection during the SQS call. It does not send tokens with less than five minutes remaining. After publishing the decrypted email and recovery token, it deletes the outbox row. The outbox ID is both the message deduplication ID and message group ID. A separate consumer must deduplicate that stable delivery ID before calling the email provider because SQS FIFO deduplication lasts five minutes. The consumer and email template are not implemented yet.
+A background worker resolves lookup jobs and atomically creates hashed 30-minute tokens with encrypted delivery data for matching licenses. Failed preparation jobs are deferred for one minute so they cannot block later lookups or existing deliveries. The dispatcher claims pending deliveries without holding a database connection during the SES call. It does not send tokens with less than five minutes remaining. After SES accepts the message, it deletes the outbox row. A crash after SES accepts a message but before the database acknowledgement can send the same token again.
+
+A separate dispatcher sends the initial license key from the encrypted delivery outbox through SES. After SES accepts it, the dispatcher removes the outbox row and encrypted delivery copy. A retry after an ambiguous SES response can send the same key twice. Expired undelivered copies are cleared by the cleanup worker.
 
 Recovery tokens can be exchanged once while the associated license remains active. The exchange consumes the recovery token, creates a 15-minute management session, and stores an encrypted response atomically. Successful exchanges can be replayed with the same idempotency key for 24 hours, including after the recovery token expires.
 

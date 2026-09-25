@@ -11,7 +11,7 @@ import (
 	"github.com/stripe/stripe-go/v86"
 )
 
-var testDestination = EventDestination{Source: "aws.partner/stripe.com/ed_test", Account: "123456789012", Region: "eu-north-1"}
+const testLiveMode = false
 
 func eventBody(t testing.TB, id, eventType string) []byte {
 	t.Helper()
@@ -23,13 +23,9 @@ func eventBody(t testing.TB, id, eventType string) []byte {
 		objectID, object = "sub_purchase", "subscription"
 	}
 	body := map[string]any{
-		"version": "0", "source": testDestination.Source, "account": testDestination.Account,
-		"region": testDestination.Region, "detail-type": eventType,
-		"detail": map[string]any{
-			"id": id, "object": "event", "api_version": StripeAPIVersion,
-			"type": eventType, "livemode": false, "created": testCheckoutNow.Unix(),
-			"data": map[string]any{"object": map[string]any{"id": objectID, "object": object}},
-		},
+		"id": id, "object": "event", "api_version": StripeAPIVersion,
+		"type": eventType, "livemode": false, "created": testCheckoutNow.Unix(),
+		"data": map[string]any{"object": map[string]any{"id": objectID, "object": object}},
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -40,23 +36,20 @@ func eventBody(t testing.TB, id, eventType string) []byte {
 
 func FuzzDecodeBillingEvent(f *testing.F) {
 	f.Add(eventBody(f, "evt_purchase", "checkout.session.completed"))
-	f.Add([]byte(`{"detail":null}`))
+	f.Add([]byte(`{"data":null}`))
 	f.Add([]byte(`[]`))
 	f.Fuzz(func(t *testing.T, body []byte) {
-		_, _ = decodeBillingEvent(body, testDestination, testCheckoutNow)
+		_, _ = decodeBillingEvent(body, testLiveMode, testCheckoutNow)
 	})
 }
 
 func TestBillingEventBoundary(t *testing.T) {
 	valid := string(eventBody(t, "evt_purchase", "checkout.session.completed"))
-	if _, err := decodeBillingEvent([]byte(valid), testDestination, testCheckoutNow); err != nil {
+	if _, err := decodeBillingEvent([]byte(valid), testLiveMode, testCheckoutNow); err != nil {
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{
 		"malformed": "{", "oversized": strings.Repeat(" ", maximumBillingEventBytes+1),
-		"wrong source":  strings.ReplaceAll(valid, testDestination.Source, "aws.partner/stripe.com/foreign"),
-		"wrong account": strings.ReplaceAll(valid, testDestination.Account, "999999999999"),
-		"wrong region":  strings.ReplaceAll(valid, "eu-north-1", "us-east-1"),
 		"wrong mode":    strings.ReplaceAll(valid, `"livemode":false`, `"livemode":true`),
 		"missing mode":  strings.ReplaceAll(valid, `"livemode":false,`, ""),
 		"wrong API":     strings.ReplaceAll(valid, StripeAPIVersion, "2020-01-01"),
@@ -66,7 +59,7 @@ func TestBillingEventBoundary(t *testing.T) {
 		"trailing JSON": valid + "{}",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeBillingEvent([]byte(body), testDestination, testCheckoutNow); !errors.Is(err, ErrInvalidBillingEvent) {
+			if _, err := decodeBillingEvent([]byte(body), testLiveMode, testCheckoutNow); !errors.Is(err, ErrInvalidBillingEvent) {
 				t.Fatalf("error = %v", err)
 			}
 		})
@@ -79,6 +72,7 @@ func paidPurchase() *stripe.CheckoutSession {
 		ID: "cs_purchase", Object: "checkout.session", Mode: stripe.CheckoutSessionModePayment,
 		Status: stripe.CheckoutSessionStatusComplete, PaymentStatus: stripe.CheckoutSessionPaymentStatusPaid,
 		ClientReferenceID: testCheckoutOrderID, Metadata: metadata,
+		PaymentLink:     &stripe.PaymentLink{ID: "plink_perpetual"},
 		ManagedPayments: &stripe.CheckoutSessionManagedPayments{Enabled: true},
 		Consent:         &stripe.CheckoutSessionConsent{TermsOfService: stripe.CheckoutSessionConsentTermsOfServiceAccepted},
 		Customer:        &stripe.Customer{ID: "cus_buyer"}, CustomerDetails: &stripe.CheckoutSessionCustomerDetails{Email: "Buyer@Example.com"},
@@ -96,10 +90,8 @@ func TestPerpetualPurchaseValidation(t *testing.T) {
 	order := checkoutOrder{id: testCheckoutOrderID, plan: PlanPerpetualV1, policyVersion: PolicyVersion,
 		priceID: "price_perpetual", sessionID: sql.NullString{String: "cs_purchase", Valid: true}}
 	for name, mutate := range map[string]func(*stripe.CheckoutSession){
-		"another order":      func(s *stripe.CheckoutSession) { s.ClientReferenceID = "ord_other" },
+		"missing link":       func(s *stripe.CheckoutSession) { s.PaymentLink = nil },
 		"another session":    func(s *stripe.CheckoutSession) { s.ID = "cs_other" },
-		"wrong plan":         func(s *stripe.CheckoutSession) { s.Metadata["plan"] = "monthly" },
-		"wrong policy":       func(s *stripe.CheckoutSession) { s.Metadata["policy_version"] = "other" },
 		"not managed":        func(s *stripe.CheckoutSession) { s.ManagedPayments.Enabled = false },
 		"missing consent":    func(s *stripe.CheckoutSession) { s.Consent = nil },
 		"missing email":      func(s *stripe.CheckoutSession) { s.CustomerDetails = nil },
@@ -121,23 +113,23 @@ func TestPerpetualPurchaseValidation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			session := paidPurchase()
 			mutate(session)
-			if err := validatePerpetualPurchase(session, order, "prod_perpetual"); !errors.Is(err, ErrInvalidCheckoutSession) {
+			if err := validatePerpetualPurchase(session, order, "prod_perpetual", "plink_perpetual"); !errors.Is(err, ErrInvalidCheckoutSession) {
 				t.Fatalf("error = %v", err)
 			}
 		})
 	}
 	session := paidPurchase()
 	session.Currency = stripe.CurrencyUSD
-	if err := validatePerpetualPurchase(session, order, "prod_perpetual"); err != nil {
+	if err := validatePerpetualPurchase(session, order, "prod_perpetual", "plink_perpetual"); err != nil {
 		t.Fatalf("local currency purchase rejected: %v", err)
 	}
 	session.PaymentStatus = stripe.CheckoutSessionPaymentStatusUnpaid
 	session.PaymentIntent = nil
-	if err := validatePerpetualPurchase(session, order, "prod_perpetual"); err != nil {
+	if err := validatePerpetualPurchase(session, order, "prod_perpetual", "plink_perpetual"); err != nil {
 		t.Fatalf("delayed payment rejected: %v", err)
 	}
 	order.plan = PlanMonthly
-	if err := validatePerpetualPurchase(session, order, "prod_perpetual"); !errors.Is(err, ErrUnsupportedPurchase) {
+	if err := validatePerpetualPurchase(session, order, "prod_perpetual", "plink_perpetual"); !errors.Is(err, ErrUnsupportedPurchase) {
 		t.Fatalf("monthly purchase error = %v", err)
 	}
 }

@@ -30,15 +30,14 @@ type RecoveryRequestInput struct {
 }
 
 type RecoveryEmail struct {
-	Schema        int    `json:"schema"`
-	DeliveryID    string `json:"delivery_id"`
-	Email         string `json:"email"`
-	RecoveryToken string `json:"recovery_token"`
-	ExpiresAt     int64  `json:"expires_at"`
+	Email         string
+	RecoveryToken string
+	ExpiresAt     int64
 }
 
-type RecoveryEmailQueue interface {
+type EmailSender interface {
 	SendRecoveryEmail(context.Context, RecoveryEmail) error
+	SendLicenseEmail(context.Context, LicenseEmail) error
 }
 
 func (s *Service) RequestRecovery(ctx context.Context, input RecoveryRequestInput) (Response, error) {
