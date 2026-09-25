@@ -12,6 +12,7 @@ import (
 func monthlyPurchase() (*stripe.CheckoutSession, *stripe.Subscription, *stripe.Invoice) {
 	session := paidPurchase()
 	session.Mode = stripe.CheckoutSessionModeSubscription
+	session.PaymentLink.ID = "plink_monthly"
 	session.Metadata["plan"] = string(PlanMonthly)
 	session.PaymentIntent = nil
 	session.Subscription = &stripe.Subscription{ID: "sub_purchase"}
@@ -55,8 +56,8 @@ func TestMonthlyPurchaseValidation(t *testing.T) {
 		"managed payments": func(s *stripe.CheckoutSession, _ *stripe.Subscription, _ *stripe.Invoice) {
 			s.ManagedPayments.Enabled = false
 		},
-		"plan": func(s *stripe.CheckoutSession, _ *stripe.Subscription, _ *stripe.Invoice) {
-			s.Metadata["plan"] = "perpetual_v1"
+		"link": func(s *stripe.CheckoutSession, _ *stripe.Subscription, _ *stripe.Invoice) {
+			s.PaymentLink.ID = "plink_other"
 		},
 		"subscription price": func(_ *stripe.CheckoutSession, s *stripe.Subscription, _ *stripe.Invoice) {
 			s.Items.Data[0].Price.ID = "price_other"
@@ -93,7 +94,7 @@ func TestMonthlyPurchaseValidation(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			session, subscription, invoice := monthlyPurchase()
-			if err := validateMonthlySession(session, order, "prod_monthly"); err != nil {
+			if err := validateMonthlySession(session, order, "prod_monthly", "plink_monthly"); err != nil {
 				t.Fatal(err)
 			}
 			if err := validateMonthlySubscription(subscription, session, order, "prod_monthly"); err != nil {
@@ -103,7 +104,7 @@ func TestMonthlyPurchaseValidation(t *testing.T) {
 				t.Fatal(err)
 			}
 			change(session, subscription, invoice)
-			err := validateMonthlySession(session, order, "prod_monthly")
+			err := validateMonthlySession(session, order, "prod_monthly", "plink_monthly")
 			if err == nil {
 				err = validateMonthlySubscription(subscription, session, order, "prod_monthly")
 			}

@@ -8,7 +8,8 @@ import (
 
 const cleanupBatchSize = 1000
 
-// CleanupExpired deletes one bounded batch of stale transient state.
+// CleanupExpired removes one bounded batch of stale transient state and
+// clears expired encrypted license-delivery copies.
 func (s *Service) CleanupExpired(ctx context.Context, now time.Time) (int64, error) {
 	return s.cleanupExpired(ctx, now.UTC(), cleanupBatchSize)
 }
@@ -117,5 +118,38 @@ func (s *Service) cleanupExpired(ctx context.Context, now time.Time, batchSize i
 	if err != nil {
 		return idempotencyCount + rateLimitCount + accessTokenCount + requestCount, fmt.Errorf("read deleted recovery-email count: %w", err)
 	}
-	return idempotencyCount + rateLimitCount + accessTokenCount + requestCount + outboxCount, nil
+	licenseOutboxResult, err := s.database.ExecContext(ctx, `
+		WITH expired AS (
+			SELECT id FROM license_delivery_outbox
+			WHERE expires_at <= $1
+			ORDER BY expires_at, id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM license_delivery_outbox AS outbox
+		USING expired WHERE outbox.id = expired.id`, now, batchSize)
+	if err != nil {
+		return idempotencyCount + rateLimitCount + accessTokenCount + requestCount + outboxCount, fmt.Errorf("delete expired license emails: %w", err)
+	}
+	licenseOutboxCount, err := licenseOutboxResult.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read deleted license-email count: %w", err)
+	}
+	keyResult, err := s.database.ExecContext(ctx, `
+		WITH expired AS (
+			SELECT id FROM license_keys
+			WHERE delivery_expires_at <= $1
+			ORDER BY delivery_expires_at, id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE license_keys AS keys
+		SET delivery_ciphertext = NULL, delivery_expires_at = NULL
+		FROM expired WHERE keys.id = expired.id`, now, batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("clear expired license delivery keys: %w", err)
+	}
+	keyCount, err := keyResult.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read cleared delivery-key count: %w", err)
+	}
+	return idempotencyCount + rateLimitCount + accessTokenCount + requestCount + outboxCount + licenseOutboxCount + keyCount, nil
 }

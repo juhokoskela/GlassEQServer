@@ -1,289 +1,73 @@
-# Billing protocol
+# Billing and license delivery
 
-## Purpose
+## Ownership
 
-This document defines how GlassEQ Server creates Stripe Checkout Sessions, turns Stripe events into licenses, and projects subscription state into the entitlement model. It is the server-side companion to the client entitlement protocol in the GlassEQ repository.
+Stripe Managed Payments owns Checkout, tax, receipts, invoices, refunds, billing email, and customer billing management. The public site links directly to two Stripe Payment Links, one for the EUR 29.99 perpetual license and one for the EUR 2.99 monthly subscription. GlassEQ Server owns license issuance, entitlements, activation slots, initial license-key email, and purchase-email recovery. Audio, profiles, and diagnostics stay on the Mac.
 
-The first implementation targets Stripe Managed Payments and AWS `eu-north-1`. Product and price identifiers below are sandbox values. Production identifiers must be supplied separately and must never be inferred from the sandbox configuration.
+The base catalog is in EUR. Managed Payments Adaptive Pricing may present and charge another currency. Fulfillment binds to the configured Stripe Price and Product IDs, not the displayed currency or converted amount. Both Products must use tax code `txcd_10202001` and tax-exclusive pricing. The monthly plan has no trial. The subscription uses eight Smart Retry attempts over two weeks and cancels after the final failure; the entitlement projection relies on that schedule.
 
-## Implementation status
+Stripe Link handles subscription cancellation, payment methods, billing addresses, order history, and billing email. A Stripe receipt is not a GlassEQ recovery credential. The purchase inbox remains the authority for a one-time recovery token, which grants a short management session that can rotate the license key and manage activation slots.
 
-The optional worker implements bounded EventBridge validation, current Stripe hydration, event deduplication, and transactional license/key/delivery creation for both plans. It handles the four Checkout Session events below, the three Invoice events, and Subscription updates/deletions. Monthly events reconcile paid renewals, payment recovery, cancellation, and removal of a pending cancellation while preserving terminal license states.
+## Current implementation
 
-Both purchase paths go directly to `fulfilled` in the transaction that records the processed event and creates the license and outbox. They leave no committed `paid` gap: transaction failure retries through SQS. The paid-order sweep below applies to any future path that persists an intermediate `paid` state. Dead-letter redrive and daily reconciliation remain necessary operational repair paths.
+The service accepts a raw Stripe webhook at `POST /v1/stripe/webhook` when its Stripe API key, catalog IDs, Payment Link IDs, and webhook signing secret are configured. It checks the `Stripe-Signature` header with Stripe's five-minute tolerance before parsing the body. The body is limited to 256 KiB. The event API version must match the pinned `stripe-go` preview version, and test/live mode must match the API key. Stripe object retrieval has a 15-second deadline, 1 MiB response limit, and no redirects.
 
-Refund/dispute processing, daily reconciliation, billing retention, and email dispatch/consumption remain planned. Production purchases remain disabled until these and the rollout checks are complete. The remaining sections describe the complete target contract unless explicitly identified as implemented.
+The webhook accepts these snapshot event types:
 
-## Fixed product decisions
-
-| Plan | Price | Tax code | Sandbox product | Sandbox price |
-| --- | --- | --- | --- | --- |
-| `perpetual_v1` | EUR 29.99 plus tax | `txcd_10202001` | `prod_VBtSu7EmXGUrL8` | `price_1UBVfNEC4w9ZWN2YlB59OzfZ` |
-| `monthly` | EUR 2.99 per month plus tax | `txcd_10202001` | `prod_VBtQ3VslhU3Tgv` | `price_1UBVdzEC4w9ZWN2Y8pOBCyAE` |
-
-- A license permits two active installations.
-- A perpetual license includes official v1.x releases.
-- The monthly subscription uses eight Smart Retry attempts over two weeks. Stripe cancels the subscription after the final failed attempt.
-- Monthly entitlements remain usable throughout that recovery schedule, followed by the existing seven-day client grace period.
-- Checkout returns to `https://glasseq.app/checkout/success` or `https://glasseq.app/checkout/cancel`.
-- License-delivery and recovery emails are sent from `glasseq.app` through Amazon SES.
-- Customers use Stripe Link to cancel subscriptions and update payment methods. GlassEQ links to that flow and owns license recovery and activation-slot management. A new purchase after a subscription has ended is verified separately.
-- EUR is the catalog/base currency; Managed Payments Adaptive Pricing provides supported local-currency payment. Verify the existing Checkout request in sandbox for both plans before changing currency parameters.
-
-## Ownership and trust boundaries
-
-Stripe is authoritative for payment, refund, dispute, and subscription state. PostgreSQL stores the normalized state used by GlassEQ. Event payloads are notifications, not authoritative snapshots.
-
-The public website may request a Checkout Session, but it does not choose a Stripe Price ID, amount, currency, policy version, mode, or return URL. GlassEQ Server derives those values from the selected plan and its environment-specific configuration.
-
-Stripe events enter AWS through an EventBridge partner event source. There is no public Stripe webhook endpoint and no Stripe webhook signing secret. The event path is:
-
-```text
-Stripe -> EventBridge partner source -> EventBridge rule -> SQS Standard queue -> GlassEQ Server worker
-```
-
-A Standard queue is sufficient. Stripe does not guarantee event ordering, so FIFO ordering would not remove the need for idempotent processing and current-state reconciliation.
-
-AWS must enforce these boundaries:
-
-- The EventBridge partner source, rule, billing queue, and dead-letter queue live in `eu-north-1`.
-- The billing queue policy permits `SendMessage` only from the exact EventBridge rule ARN.
-- The GlassEQ Server task role may receive and delete messages only from the billing queue. It may not publish Stripe events or consume the dead-letter queue.
-- The billing queue and dead-letter queue use the 14-day SQS retention maximum, server-side encryption, and policies that reject non-TLS access.
-- The Stripe secret key lives in AWS Secrets Manager. It must not appear in source, task definitions, command arguments, URLs, or logs.
-- The event destination pins one Stripe API version. Deployments reject envelopes from a different environment or unexpected source.
-
-Stripe's EventBridge source must be associated in AWS within seven days of creating the event destination. Create both sides together when the infrastructure is ready, not during application development.
-
-## Checkout Session API
-
-`POST /v1/checkout-sessions` creates a hosted Checkout Session.
-
-Request headers:
-
-```http
-Content-Type: application/json
-Idempotency-Key: <random UUID v4>
-```
-
-Request body:
-
-```json
-{"plan":"perpetual_v1"}
-```
-
-The only accepted plans are `perpetual_v1` and `monthly`. A successful request returns `201 Created`:
-
-```json
-{
-  "checkout_url": "https://checkout.stripe.com/..."
-}
-```
-
-The caller generates a cryptographically random UUID v4 and sends it in canonical lowercase form. The server rejects other UUID versions. Treat the key as a bearer capability until the Session expires. It authorizes replay of only that Checkout URL, not license or account access.
-
-The server applies a short request deadline, permits 60 valid attempts per client IP per minute, and permits 20 new order reservations per client IP per hour. IPv6 addresses are grouped by `/64` for both limits. It uses the caller's idempotency UUID to derive a stable internal order ID and Stripe idempotency key. Repeating the same UUID and plan returns the same Stripe Session. Reusing it for another plan returns `409 Conflict`. Reusing it after that Session expires returns `409 Conflict` with `checkout_session_expired`; the caller must generate a new key.
-
-The route exists only when all Stripe configuration is present. Browser requests permit the exact origin `https://glasseq.app`. Preflight permits only `POST`, `Content-Type`, and `Idempotency-Key`. Requests without an `Origin` header remain available to non-browser clients. CORS is not authentication; server-owned parameters, validation, idempotency, and rate limits remain the security boundary.
-
-Malformed JSON and invalid fields return `400`, oversized request bodies return `413`, and missing or unsupported content types return `415`. A foreign browser origin returns `403`. Reusing one idempotency key for another plan, an expired Session, or a completed Session returns `409` with `checkout_idempotency_conflict`, `checkout_session_expired`, or `checkout_session_complete`. Rate limits return `429` with `Retry-After`, which the trusted browser origin may read. Temporary database, Stripe, and concurrency failures return `503` and are safe to retry with the same idempotency key.
-
-Creating a Session follows this sequence:
-
-1. Validate the request and enforce the all-attempt IP rate limit.
-2. Look for an existing order created with the idempotency key.
-3. For a new request, enforce the reservation IP rate limit and insert a pending order reservation in one short database transaction.
-4. Build the complete Stripe request from server-owned configuration.
-5. Create or retrieve the Checkout Session outside any database transaction and within the task's four-request Stripe concurrency limit.
-6. Attach a newly created Stripe Session ID to the reserved order in a short transaction.
-7. Return the Stripe-hosted URL.
-
-The stable order reservation and Stripe idempotency key make a retry safe if Stripe creates the Session but the process fails before its ID is attached. The order identifier is also sent as `client_reference_id` and metadata, so an event can recover the association and fulfillment can reject an unrelated Session. The schema must allow a reserved order to exist briefly without a Stripe Session ID.
-
-Once an order has a Session ID, a replay retrieves that exact Session instead of repeating the create request. An unattached reservation repeats the idempotent create only until five minutes before Stripe's 24-hour idempotency boundary. After that cutoff, the reservation is treated as expired so a pruned Stripe key cannot create a replacement Session. Simultaneous requests using one idempotency key may receive a transient upstream or busy result; the caller retries the same request rather than generating a new key.
-
-Stripe's `expired` and `complete` Session statuses are valid terminal states. An expired Session returns `checkout_session_expired`; a complete Session returns `checkout_session_complete` while fulfillment proceeds from Stripe events. Only an open, unexpired Session returns a Checkout URL.
-
-Every Session has:
-
-- exactly one line item with quantity one;
-- the configured environment-specific Price ID;
-- `payment` mode for `perpetual_v1` or `subscription` mode for `monthly`;
-- Stripe Managed Payments enabled;
-- the fixed success and cancel URLs;
-- `client_reference_id`, `order_id`, `plan`, and `policy_version` set by the server;
-- terms-of-service consent required.
-
-The Stripe API version is the source-level constant `2026-07-29.preview`, pinned by the exact `stripe-go` preview release used by the server and shared with the EventBridge destination. Managed Payments is still a public preview, so that version must be verified with a sandbox purchase before production rollout. Production must not silently use Stripe's latest version.
-
-## Accepted Stripe events
-
-The EventBridge destination sends only the events in this table. The worker hydrates the current Stripe object before choosing the outcome.
-
-| Event | Normalized outcome |
+| Event | Use |
 | --- | --- |
-| `checkout.session.completed` | A valid paid Session moves its order to `paid`. A valid delayed payment stays `pending`. |
-| `checkout.session.async_payment_succeeded` | A valid paid Session moves a `pending` or `failed` order to `paid`. |
-| `checkout.session.async_payment_failed` | A still-unpaid Session moves its unfulfilled order to `failed`. |
-| `checkout.session.expired` | A still-unpaid Session moves its unfulfilled order to `failed`. |
-| `invoice.paid` | A paid initial Invoice moves its order to `paid`. A paid renewal moves the subscription to `active` and advances its period once. |
-| `invoice.payment_failed` | An initial recoverable payment stays `pending`. A failed renewal moves the subscription to `recovering`. A terminal initial failure moves its order to `failed`. |
-| `invoice.updated` | Reconciles the same paid, pending, failed, or recovering outcomes from the current Invoice. An update with no access effect records `no_change`. |
-| `customer.subscription.updated` | A terminal initial Subscription moves its unfulfilled order to `failed`. Otherwise it reconciles `active`, `recovering`, `ending`, or `lapsed`. Removing a pending cancellation restores `active` when the paid Subscription is eligible. |
-| `customer.subscription.deleted` | An unfulfilled initial Subscription moves its order to `failed`. A customer-requested cancellation becomes `lapsed` at the paid period end. Retry exhaustion preserves the payment-recovery deadline. A dispute leaves the terminal license state unchanged. |
-| `refund.created` | Applies a successful full refund. Pending and partial refunds record `no_change`. |
-| `refund.updated` | Applies a refund that has become successful. Other updates record `no_change`. |
-| `refund.failed` | Records `no_change` and leaves access unchanged. |
-| `charge.dispute.created` | Moves the affected license to `charged_back`. |
-| `charge.dispute.closed` | A lost dispute leaves `charged_back` unchanged. A won or withdrawn dispute follows the restoration rules below. |
+| `checkout.session.completed`, `checkout.session.async_payment_succeeded` | Establish a Payment Link purchase and fulfill when current Stripe state proves payment |
+| `checkout.session.async_payment_failed`, `checkout.session.expired` | Record an unpaid purchase failure without revoking a later successful payment |
+| `invoice.paid`, `invoice.payment_failed`, `invoice.updated` | Reconcile a known monthly subscription against current Stripe state |
+| `customer.subscription.updated`, `customer.subscription.deleted` | Reconcile a known monthly subscription, cancellation, or retry exhaustion |
 
-An order starts `pending` and may move to `failed` or `paid`. A `failed` order moves to `paid` only when current Stripe state later proves payment succeeded. A `paid` order is durable work waiting for license fulfillment. The event worker attempts fulfillment immediately, and a bounded background sweep retries paid orders. `fulfilled` is terminal.
+Events are notifications, not authoritative snapshots. The processor retrieves the current Checkout Session and, for monthly events, its Subscription and relevant Invoices. It accepts a Checkout Session only when its `payment_link`, mode, single line item, quantity, configured Price and Product, and Managed Payments state match the selected plan. A Payment Link purchase has no server-created order or caller-supplied metadata. The first accepted Session event inserts a local purchase row keyed by the Stripe Session ID. An unrelated Payment Link or API-created Checkout Session is ignored.
 
-Adding an event type is a code and infrastructure change. Unknown, malformed, or untrusted messages are rejected and eventually moved to the dead-letter queue so configuration drift cannot pass silently.
+For a paid perpetual purchase, the Session must be complete, contain an accepted terms consent and purchase email, identify a Customer, and have a succeeded PaymentIntent with a paid, undisputed, unrefunded Charge. For a paid monthly purchase, the Session must identify a Customer and Subscription, and the initial Invoice must be paid. Subscription and Invoice line items must match the fixed monthly Price, Product, quantity, and Subscription item. A payment can be delayed; an unpaid Session does not issue a license.
 
-## Event processing
+Fulfillment happens in one PostgreSQL transaction. It records the event outcome, creates one license and active key, stores a hashed key plus an encrypted delivery copy, creates an outbox row, and marks the purchase fulfilled. Monthly fulfillment also creates the subscription projection. Stripe and SES calls happen outside database transactions. Duplicate events and concurrent deliveries cannot issue a second license for the same Session. A competing monthly reconciliation changes the order revision; stale hydration rolls back and retries.
 
-SQS delivery and Stripe events are both at least once. Processing must be safe under duplication, concurrency, delay, and reordering.
+The purchase email from `customer_details.email` is the license-delivery and recovery address. The service does not silently substitute the Stripe Customer email. It stores the address encrypted and an HMAC for recovery lookup. The license key and recovery token are encrypted while waiting for SES delivery. The service sends only these two product emails; Stripe sends receipts and billing email. SES acceptance removes the outbox row, and successful license delivery also clears the encrypted key copy. A crash after SES accepts an email but before the database acknowledgement can send the same credential twice. Expired delivery copies are removed in bounded cleanup batches.
 
-For each message, the worker:
+An Invoice or Subscription event that arrives before its Session is recorded as unowned. When the Session event arrives, the processor retrieves current state and can fulfill the purchase or apply cancellation. This still depends on receiving the Session event; daily reconciliation is required before production rollout to repair events missed beyond Stripe's retry window.
 
-1. Parses a bounded EventBridge envelope and validates its source, account environment, event API version, event ID, event type, object ID, and creation time.
-2. Inserts an unprocessed event ID into `stripe_events`, or recognizes an already completed event.
-3. Fetches the current Checkout Session, Invoice, Subscription, Refund, Dispute, Charge, or PaymentIntent needed to resolve the affected order or license. Stripe calls happen outside database transactions.
-4. Applies one normalized state transition and marks the event processed in a short database transaction.
-5. Deletes the SQS message only after the transaction commits.
+## Monthly entitlement projection
 
-Transient Stripe, database, or network failures leave the message for retry. A permanently invalid message reaches the dead-letter queue after a small bounded receive count. Operators must have a documented command to inspect and redrive a corrected dead-letter message without logging its body.
-
-A valid accepted event may refer to a Checkout Session or payment that this deployment never created, including a Dashboard test purchase. The worker marks it processed with `ignored_unowned` and deletes the SQS message. An owned object with broken metadata or a violated invariant is not ignored; it retries and reaches the dead-letter queue for investigation.
-
-`stripe_events` prevents duplicate work but does not establish ordering. Every transition compares hydrated current Stripe objects with stored identifiers and timestamps. An older event may trigger reconciliation, but it must not overwrite newer normalized state.
-
-The final transaction locks the event row and checks `processed_at` again before changing domain state. Two workers may fetch the same Stripe objects, but only one commits the transition. The `outcome` column stores a bounded code such as `paid`, `failed`, `active`, `recovering`, `ending`, `lapsed`, `refunded`, `charged_back`, `restored`, `no_change`, or `ignored_unowned`.
-
-For monthly orders, migration `00006_billing_revision.sql` adds `checkout_orders.billing_revision`. The worker resolves ownership, reads the revision, then retrieves the current Session, Subscription, and Invoices. In the final transaction it locks the order and checks that revision before applying the snapshot. A competing commit makes the attempt retry through SQS. Every successful monthly reconciliation increments the revision, including `no_change`. Future reconciliation and terminal-state writers must follow the same order-lock and revision protocol.
-
-An Invoice or Subscription event can arrive before Checkout creation has attached the Session ID. It remains retryable until creation or the Checkout event attaches the ID; the Checkout event can recover the order through metadata. No database connection is held during Stripe requests.
-
-The worker performs no Stripe or KMS call while holding a database transaction, row lock, or advisory lock.
-
-## Purchase fulfillment
-
-A completed Checkout event is only a prompt to inspect the Session. The worker retrieves the Session and line items and verifies:
-
-- `client_reference_id` and metadata identify the pending order;
-- plan, policy version, mode, Product ID, Price ID, and quantity match that order;
-- the Session belongs to the configured Stripe environment;
-- the Session was created with Managed Payments and records acceptance of the expected terms;
-- `customer_details.email` is present and valid;
-- the payment is complete.
-
-For a perpetual purchase, `payment_status` must be `paid`. For a monthly purchase, the initial Invoice must be paid and the Subscription must be active. A later unpaid renewal does not block initial fulfillment: the worker seeds the projection from the paid initial period, then reconciles the renewal without granting its unpaid period. A completed Session with delayed or incomplete payment stays pending unless the order has already failed. Later no-change events preserve a failed order until current Stripe state proves payment succeeded.
-
-Fulfillment uses one database transaction to:
-
-1. lock the paid order;
-2. normalize `customer_details.email`, encrypt it with the database encryption key, and compute its lookup HMAC with the email lookup key;
-3. create exactly one license with that recovery email ciphertext and lookup hash;
-4. create exactly one active license key;
-5. store only the key hash plus an encrypted delivery copy that expires within seven days;
-6. create the monthly subscription projection when applicable;
-7. mark the order fulfilled;
-8. enqueue a durable license-delivery email record.
-
-The Checkout Session email is the recovery and delivery address. It wins if it differs from the email currently stored on the Stripe Customer. The service does not silently fall back to the Customer email because fulfillment already requires the Session email.
-
-The transaction contains no Stripe, KMS, SQS, or SES call. A separate dispatcher publishes a `license_delivery` message to the same encrypted FIFO queue used by recovery email. The email consumer distinguishes the message type and deduplicates the stable delivery ID before sending through SES. Stripe remains responsible for receipts and billing emails; GlassEQ sends only the license credential and product-specific recovery messages.
-
-Fulfillment stores the minimum Stripe identifiers needed to resolve later invoices, refunds, and disputes. It does not store card data, billing addresses, Stripe payloads, or tax details. Migration `00004_checkout_billing.sql` already adds the request ID and payment references, permits a null `stripe_checkout_session_id` while an order is reserved, and adds the license-delivery outbox.
-
-## Monthly subscription projection
-
-The database has four billing states. The client receives the resulting state and times in its signed entitlement.
+The client receives the stored monthly state and times in its signed entitlement. Its `billing_period_end` comes from a validated paid Invoice line, never from an unpaid Subscription period.
 
 | Stripe observation | Stored state | `recovery_until` |
 | --- | --- | --- |
 | Initial or renewal Invoice paid and Subscription active | `active` | `billing_period_end + 14 days` |
-| Renewal payment failed while Stripe can still recover it | `recovering` | Keep at least `billing_period_end + 14 days` |
+| Renewal payment failed while Stripe can recover it | `recovering` | At least `billing_period_end + 14 days` |
 | Customer requested cancellation at period end | `ending` | `billing_period_end` |
-| Customer removed a pending cancellation while the Subscription remains paid | `active` | `billing_period_end + 14 days` |
-| Customer canceled immediately, or a scheduled cancellation reached its end | `lapsed` | `billing_period_end` |
-| Stripe ended the Subscription after payment retries, or marked it unpaid | `lapsed` | Preserve the last payment-recovery deadline |
+| Customer removed pending cancellation while paid | `active` | `billing_period_end + 14 days` |
+| Customer canceled, or scheduled cancellation reached its end | `lapsed` | `billing_period_end` |
+| Stripe ended the Subscription after retries or marked it unpaid | `lapsed` | Preserve the last payment-recovery deadline |
 | A later payment restores an eligible Subscription | `active` | New `billing_period_end + 14 days` |
 
-`billing_period_end` comes only from a validated paid invoice line for the pinned Price, Product, quantity, Subscription, and subscription item. The worker checks the latest Invoice and, for Invoice events, the event's current Invoice as well. This permits a late payment of an older renewal while refusing access for the newer unpaid period. Repeated paid Invoice IDs cannot extend the period, and older paid periods never move it backwards. Prorations, manual invoices, and changed catalog items are outside the fixed monthly product contract.
+The processor checks the latest Invoice and, for Invoice events, the event's current Invoice. A late payment of an older renewal can restore access, but an unpaid newer period cannot extend it. A canceled monthly Subscription remains paid through its paid period. A terminal `refunded`, `charged_back`, or `revoked` license state takes precedence over later subscription events. GlassEQ's signed monthly entitlement retains its separate seven-day client grace period.
 
-The worker uses the hydrated Subscription's `cancel_at_period_end` and `cancellation_details.reason` to distinguish a customer request, payment failure, and dispute. A terminal license state takes precedence over the subscription projection.
+## Work before production purchases
 
-Smart Retries are an operational dependency of this model. The production Stripe account must retain eight attempts over two weeks with cancellation as the final action. Any change to that schedule requires reviewing the projection and client grace period together.
+Refund and dispute processing is not merged into this branch. The intended rule is that a full successful refund or opened dispute terminates the affected license. Before terminating a monthly license, the service must confirm Stripe will not bill that Subscription again. A partial refund requires an operator decision. A won or withdrawn dispute may restore access only after current Stripe state proves payment and eligibility. Manual revocation is never reversed by a later billing event.
 
-An older event never shortens a recovery deadline. A current customer cancellation deliberately shortens it to the paid period end, while a refund or chargeback deliberately replaces it with the terminal event time. The service records `last_paid_invoice_id` so the same paid Invoice cannot extend the period twice. It also records the reconciliation time and the Stripe event that prompted the current projection.
+The service also needs a bounded daily reconciliation of monthly subscriptions, retention for processed Stripe events and abandoned purchases, and operator alerts for repeated webhook or SES failures. Webhook delivery retries are useful but are not a durable substitute for reconciliation.
 
-Monthly entitlement issuance remains unchanged:
+Before switching production links on:
 
-- refresh is requested at most seven days after the last successful refresh;
-- `exp` is exactly seven days after `recovery_until`;
-- a refunded or charged-back license uses its terminal event time as `recovery_until`;
-- a revoked license receives no entitlement.
+1. Verify Managed Payments terms, public terms/privacy links, tax code, Price/Product IDs, Payment Link settings, and the pinned webhook API version in the production Stripe account. Run `glasseqserver check-stripe-catalog`; it checks Prices and Products but does not inspect Payment Links.
+2. Verify the SES domain identity and production sending access in `eu-north-1`. Give the ECS task role only the required `ses:SendEmail` permission for the verified sender, plus its existing KMS permissions.
+3. Deploy the public webhook through the Application Load Balancer with TLS. Store the Stripe API key, webhook signing secret, encryption keys, and HMAC keys in the secret manager. Do not log Stripe payloads, email addresses, license keys, or recovery tokens.
+4. Verify sandbox and production separately: one-time and monthly purchases, delayed payment, renewal failure and recovery, cancellation, refund, dispute, duplicate and out-of-order events, SES delivery, and recovery-token exchange. Confirm that retries after database or SES failure neither lose a purchase nor issue a second license.
 
-## Refunds and disputes
-
-Refund and dispute events are resolved through their current Stripe objects to the affected payment and license.
-
-- A successful full refund of a perpetual purchase changes `licenses.state` to `refunded`. Perpetual licenses have no `terminal_at` because their entitlement logic has no terminal timeline.
-- A successful full refund of any monthly Invoice, including a renewal, terminates the license. Before committing `refunded`, the worker cancels an active Stripe Subscription without proration or a new Invoice. It then sets `subscriptions.terminal_at` to the refund's effective time.
-- A full monthly refund is therefore a terminating action. Use a partial refund or credit when the Subscription should continue.
-- An opened dispute changes the license to `charged_back`. For a monthly license, the worker also cancels an active Subscription and sets `subscriptions.terminal_at` to the dispute's effective time.
-- A failed refund does not change entitlement state.
-- A partial refund requires an operator decision and never revokes a license automatically.
-- A won or withdrawn dispute restores access only after current Stripe payment and subscription objects confirm that the license is paid and eligible.
-- Manual revocation remains separate from billing state and is never reversed by a later Stripe event.
-
-Stripe cancellation happens outside a database transaction. If its response is lost, the retry first hydrates the Subscription and treats an already-canceled result as success. The worker commits the terminal license state only after it confirms that Stripe will not bill the Subscription again. A later `customer.subscription.deleted` event cannot overwrite `refunded`, `charged_back`, or `revoked` license state.
-
-For a monthly license, these terminal transitions start the existing seven-day signed-entitlement grace period. A perpetual license becomes ineligible for new activations and official services, but its cached offline entitlement has no expiry and cannot be remotely disabled.
-
-## Reconciliation and retention
-
-Events are the fast path, not the only repair mechanism. A bounded scheduled job must reconcile due monthly licenses against Stripe at least daily. It processes a small batch, performs Stripe requests without database connections, and updates each license in a short transaction. This repairs missed events and detects configuration drift without loading all subscriptions at once.
-
-Retention is explicit:
-
-- processed Stripe event records retain identifiers and outcomes for 30 days, longer than the 14-day billing-queue retention period, then are deleted in batches;
-- unprocessed events are never removed by age alone;
-- fulfilled order and license records are retained while required for license recovery and financial support;
-- abandoned and failed Checkout orders are removed after a bounded support window;
-- raw Stripe or SQS event bodies are not persisted;
-- expired encrypted license-delivery copies and delivered email outbox rows are deleted in bounded background batches.
-
-## Configuration and rollout gates
-
-Sandbox and production use separate Stripe accounts or modes, keys, Price IDs, EventBridge destinations, queues, and secrets. The `glasseqserver check-stripe-catalog` deployment preflight validates that both configured Prices are active, belong to the key's environment and expected active Products, use the `txcd_10202001` downloadable-software tax code and fixed tax-exclusive EUR amounts, and have the expected one-time or monthly billing shape without a trial. Runtime Checkout requests pin EUR and trust the pinned Price IDs without repeating that network validation.
-
-The billing feature stays disabled until all of these are true:
-
-- Stripe Managed Payments terms are accepted and the selected API version is verified in sandbox.
-- The public terms and privacy URLs are configured in Stripe Checkout settings.
-- Production Product and Price IDs are recorded.
-- Smart Retries and its final cancellation action are verified in production.
-- Route 53 has finished publishing the `glasseq.app` records.
-- The SES domain identity is verified in `eu-north-1` and SES production access is approved.
-- EventBridge, SQS, dead-letter handling, Secrets Manager, IAM, and alarms are deployed from infrastructure as code.
-- A sandbox purchase, delayed payment, renewal failure and recovery, cancellation, refund, dispute, duplicate event, out-of-order event, and dead-letter redrive have passed end-to-end verification.
+Do not reuse sandbox keys, link IDs, catalog IDs, or webhook signing secrets in production. Database migrations run before replacing the ECS service. The Goose image and its digest are pinned in `compose.yaml` for local use; resolve and pin the deployment image digest separately.
 
 ## References
 
 - [Managed Payments and Link customer management](https://docs.stripe.com/payments/managed-payments/how-it-works)
-- [Set up Stripe Managed Payments](https://docs.stripe.com/payments/managed-payments/set-up)
-- [Update Checkout for Managed Payments](https://docs.stripe.com/payments/managed-payments/update-checkout)
-- [Create a Checkout Session](https://docs.stripe.com/api/checkout/sessions/create)
+- [Payment Links](https://docs.stripe.com/payment-links)
 - [Fulfill Checkout orders](https://docs.stripe.com/checkout/fulfillment)
-- [Use Stripe events with Amazon EventBridge](https://docs.stripe.com/event-destinations/eventbridge)
-- [Use webhooks with subscriptions](https://docs.stripe.com/billing/subscriptions/webhooks)
-- [Cancel subscriptions](https://docs.stripe.com/billing/subscriptions/cancel)
-- [Configure Smart Retries](https://docs.stripe.com/billing/revenue-recovery/smart-retries)
-- [Handle refunds](https://docs.stripe.com/refunds)
-- [Respond to disputes](https://docs.stripe.com/disputes/responding)
-- [Amazon EventBridge targets](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-targets.html)
-- [Set Amazon SQS queue attributes](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SetQueueAttributes.html)
-- [Request Amazon SES production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
+- [Verify webhook signatures](https://docs.stripe.com/webhooks/signature)
+- [Subscription webhooks](https://docs.stripe.com/billing/subscriptions/webhooks)
+- [Smart Retries](https://docs.stripe.com/billing/revenue-recovery/smart-retries)
+- [Amazon SES production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)

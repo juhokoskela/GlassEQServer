@@ -18,7 +18,7 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/juhokoskela/GlassEQServer/internal/activation"
@@ -33,7 +33,7 @@ const (
 	shutdownTimeout           = 10 * time.Second
 	activationCleanupTimeout  = 5 * time.Second
 	activationCleanupInterval = time.Minute
-	recoveryDispatchInterval  = time.Second
+	emailDispatchInterval     = time.Second
 )
 
 func main() {
@@ -106,42 +106,34 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := database.PingContext(startupCtx); err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
-	recoveryEmails, err := activation.NewSQSRecoveryEmailQueue(sqs.NewFromConfig(awsSettings), settings.RecoveryQueueURL)
+	emails, err := activation.NewSESEmailSender(sesv2.NewFromConfig(awsSettings), settings.EmailFrom)
 	if err != nil {
-		return fmt.Errorf("create recovery email queue: %w", err)
+		return fmt.Errorf("create email sender: %w", err)
 	}
 	activationService, err := activation.NewService(database, issuer, activation.Secrets{
 		IdempotencyKey:        settings.IdempotencyKey,
 		RateLimitHMACKey:      settings.RateLimitHMACKey,
 		EmailLookupHMACKey:    settings.EmailLookupHMACKey,
 		DatabaseEncryptionKey: settings.DatabaseEncryptionKey,
-	}, recoveryEmails)
+	}, emails)
 	if err != nil {
 		return fmt.Errorf("create activation service: %w", err)
 	}
-	var checkoutService *billing.OrderService
 	var eventProcessor *billing.EventProcessor
-	if settings.Stripe != nil {
+	if settings.Billing != nil {
 		checkoutClient, err := billing.NewCheckoutClient(settings.Stripe.SecretKey)
 		if err != nil {
-			return fmt.Errorf("create Stripe Checkout client: %w", err)
+			return fmt.Errorf("create Stripe client: %w", err)
 		}
-		checkoutService, err = billing.NewOrderService(database, checkoutClient, billing.PriceCatalog{
-			PerpetualV1: settings.Stripe.PerpetualPriceID,
-			Monthly:     settings.Stripe.MonthlyPriceID,
-		}, settings.RateLimitHMACKey)
+		eventProcessor, err = billing.NewEventProcessor(database, checkoutClient, activationService,
+			checkoutClient.LiveMode(),
+			billing.BillingCatalog{
+				PerpetualV1: settings.Billing.PerpetualProductID, Monthly: settings.Billing.MonthlyProductID,
+				PerpetualPriceID: settings.Stripe.PerpetualPriceID, MonthlyPriceID: settings.Stripe.MonthlyPriceID,
+				PerpetualLinkID: settings.Billing.PerpetualLinkID, MonthlyLinkID: settings.Billing.MonthlyLinkID,
+			})
 		if err != nil {
-			return fmt.Errorf("create Checkout order service: %w", err)
-		}
-		if settings.Billing != nil {
-			// NewCheckoutClient already validates the key prefix and environment.
-			eventProcessor, err = billing.NewEventProcessor(database, checkoutClient, activationService, billing.EventDestination{
-				Source: settings.Billing.EventSource, Account: settings.Billing.AccountID,
-				Region: "eu-north-1", LiveMode: checkoutClient.LiveMode(),
-			}, billing.ProductCatalog{PerpetualV1: settings.Billing.PerpetualProductID, Monthly: settings.Billing.MonthlyProductID})
-			if err != nil {
-				return fmt.Errorf("create billing event processor: %w", err)
-			}
+			return fmt.Errorf("create billing event processor: %w", err)
 		}
 	}
 
@@ -151,11 +143,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer listener.Close()
 
-	var handler http.Handler
-	if checkoutService == nil {
-		handler = httpapi.New(database, activationService, logger)
-	} else {
-		handler = httpapi.NewWithCheckout(database, activationService, checkoutService, logger)
+	var handler http.Handler = httpapi.New(database, activationService, logger)
+	if eventProcessor != nil {
+		handler = httpapi.NewWithWebhook(database, activationService, eventProcessor, settings.Billing.WebhookSecret, logger)
 	}
 	server := &http.Server{
 		Handler:           handler,
@@ -171,18 +161,13 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"address", listener.Addr().String(),
 		"entitlement_key_id", settings.EntitlementSigningKeyID,
 		"entitlement_public_key_sha256", hex.EncodeToString(fingerprint[:]),
-		"checkout_enabled", checkoutService != nil,
+		"stripe_webhook_enabled", eventProcessor != nil,
 	)
 	backgroundCtx, stopBackground := context.WithCancel(ctx)
 	var background sync.WaitGroup
 	background.Go(func() { runActivationCleanup(backgroundCtx, activationService, logger) })
 	background.Go(func() { runRecoveryEmailDispatch(backgroundCtx, activationService, logger) })
-	if eventProcessor != nil {
-		background.Go(func() {
-			queue := sqs.NewFromConfig(awsSettings, func(options *sqs.Options) { options.Region = "eu-north-1" })
-			billing.RunEventConsumer(backgroundCtx, queue, settings.Billing.QueueURL, eventProcessor, logger)
-		})
-	}
+	background.Go(func() { runLicenseEmailDispatch(backgroundCtx, activationService, logger) })
 	serveErr := serve(ctx, server, listener)
 	stopBackground()
 	background.Wait()
@@ -216,16 +201,28 @@ type recoveryEmailDispatcher interface {
 }
 
 func runRecoveryEmailDispatch(ctx context.Context, dispatcher recoveryEmailDispatcher, logger *slog.Logger) {
+	runEmailDispatch(ctx, dispatcher.DispatchRecoveryEmail, "recovery email dispatch failed", logger)
+}
+
+type licenseEmailDispatcher interface {
+	DispatchLicenseEmail(context.Context, time.Time) (bool, error)
+}
+
+func runLicenseEmailDispatch(ctx context.Context, dispatcher licenseEmailDispatcher, logger *slog.Logger) {
+	runEmailDispatch(ctx, dispatcher.DispatchLicenseEmail, "license email dispatch failed", logger)
+}
+
+func runEmailDispatch(ctx context.Context, dispatch func(context.Context, time.Time) (bool, error), failureMessage string, logger *slog.Logger) {
 	for {
-		worked, err := dispatcher.DispatchRecoveryEmail(ctx, time.Now())
+		worked, err := dispatch(ctx, time.Now())
 		if err != nil && ctx.Err() == nil {
-			logger.WarnContext(ctx, "recovery email dispatch failed", "error", err)
+			logger.WarnContext(ctx, failureMessage)
 		}
 		if err == nil && worked {
 			continue
 		}
 
-		timer := time.NewTimer(recoveryDispatchInterval)
+		timer := time.NewTimer(emailDispatchInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

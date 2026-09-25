@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.2
 	github.com/aws/aws-sdk-go-v2/service/kms v1.58.0
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.50.0
+	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.57.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/stripe/stripe-go/v86 v86.3.0-beta.1
 )

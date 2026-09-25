@@ -13,13 +13,14 @@ func TestBillingConfiguration(t *testing.T) {
 	if err != nil || got.Billing != nil {
 		t.Fatalf("unexpected billing worker: %+v, %v", got.Billing, err)
 	}
-	values["GLASSEQ_BILLING_QUEUE_URL"] = "https://sqs.eu-north-1.amazonaws.com/123456789012/billing"
-	values["GLASSEQ_STRIPE_EVENT_SOURCE"] = "aws.partner/stripe.com/ed_test"
+	values["GLASSEQ_STRIPE_WEBHOOK_SECRET"] = "whsec_test"
+	values["GLASSEQ_STRIPE_PERPETUAL_LINK_ID"] = "plink_perpetual"
+	values["GLASSEQ_STRIPE_MONTHLY_LINK_ID"] = "plink_monthly"
 	got, err = load(mapLookup(values))
-	if err != nil || got.Billing == nil || got.Billing.AccountID != "123456789012" || got.Billing.PerpetualProductID != "prod_perpetual" || got.Billing.MonthlyProductID != "prod_monthly" {
+	if err != nil || got.Billing == nil || got.Billing.PerpetualLinkID != "plink_perpetual" || got.Billing.MonthlyLinkID != "plink_monthly" || got.Billing.PerpetualProductID != "prod_perpetual" || got.Billing.MonthlyProductID != "prod_monthly" {
 		t.Fatalf("billing configuration: %+v, %v", got.Billing, err)
 	}
-	for _, key := range []string{"GLASSEQ_STRIPE_SECRET_KEY", "GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID", "GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID", "GLASSEQ_STRIPE_EVENT_SOURCE", "GLASSEQ_BILLING_QUEUE_URL"} {
+	for _, key := range []string{"GLASSEQ_STRIPE_SECRET_KEY", "GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID", "GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID", "GLASSEQ_STRIPE_WEBHOOK_SECRET", "GLASSEQ_STRIPE_PERPETUAL_LINK_ID", "GLASSEQ_STRIPE_MONTHLY_LINK_ID"} {
 		t.Run(key, func(t *testing.T) {
 			original := values[key]
 			delete(values, key)
@@ -29,17 +30,12 @@ func TestBillingConfiguration(t *testing.T) {
 			}
 		})
 	}
-	for _, queue := range []string{
-		"http://sqs.eu-north-1.amazonaws.com/123456789012/billing",
-		"https://sqs.us-east-1.amazonaws.com/123456789012/billing",
-		"https://sqs.eu-north-1.amazonaws.com/abcdefghijkl/billing",
-		"https://sqs.eu-north-1.amazonaws.com/123456789012/billing.fifo",
-		"https://sqs.eu-north-1.amazonaws.com/123456789012/billing?token=x",
-		"https://user@sqs.eu-north-1.amazonaws.com/123456789012/billing",
+	for _, secret := range []string{
+		"bad", "whsec_", "whsec_ with spaces",
 	} {
-		values["GLASSEQ_BILLING_QUEUE_URL"] = queue
+		values["GLASSEQ_STRIPE_WEBHOOK_SECRET"] = secret
 		if _, err := load(mapLookup(values)); err == nil {
-			t.Errorf("invalid queue accepted: %s", queue)
+			t.Errorf("invalid webhook secret accepted: %s", secret)
 		}
 	}
 }
