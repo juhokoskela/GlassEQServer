@@ -18,8 +18,8 @@ func TestCheckoutClientChecksCatalog(t *testing.T) {
 		catalog.Monthly.PriceID:   testCatalogPrice(catalog.Monthly, 299, true),
 	}}
 	links := &fakeStripeLinks{responses: map[string]*stripe.PaymentLink{
-		catalog.Perpetual.LinkID: testCatalogLink(catalog.Perpetual),
-		catalog.Monthly.LinkID:   testCatalogLink(catalog.Monthly),
+		catalog.Perpetual.LinkID: testCatalogLink(catalog.Perpetual, PlanPerpetualV1),
+		catalog.Monthly.LinkID:   testCatalogLink(catalog.Monthly, PlanMonthly),
 	}}
 	client := &CheckoutClient{prices: prices, links: links}
 
@@ -134,7 +134,7 @@ func TestCatalogPriceValidationAcceptsPerpetualPrice(t *testing.T) {
 func TestCatalogLinkValidation(t *testing.T) {
 	configured := testCatalogSpec().Perpetual
 	expected := catalogPriceExpectation{plan: PlanPerpetualV1, configured: configured}
-	if err := validateCatalogLink(testCatalogLink(configured), expected, false); err != nil {
+	if err := validateCatalogLink(testCatalogLink(configured, PlanPerpetualV1), expected, false); err != nil {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*stripe.PaymentLink){
@@ -154,12 +154,25 @@ func TestCatalogLinkValidation(t *testing.T) {
 		"extra item":     func(link *stripe.PaymentLink) { link.LineItems.Data = append(link.LineItems.Data, &stripe.LineItem{}) },
 	} {
 		t.Run(name, func(t *testing.T) {
-			link := testCatalogLink(configured)
+			link := testCatalogLink(configured, PlanPerpetualV1)
 			mutate(link)
 			if err := validateCatalogLink(link, expected, false); err == nil {
 				t.Fatal("drifted link was accepted")
 			}
 		})
+	}
+}
+
+func TestCatalogLinkValidationAcceptsMonthlyCustomerCreation(t *testing.T) {
+	configured := testCatalogSpec().Monthly
+	expected := catalogPriceExpectation{plan: PlanMonthly, configured: configured}
+	link := testCatalogLink(configured, PlanMonthly)
+	if err := validateCatalogLink(link, expected, false); err != nil {
+		t.Fatal(err)
+	}
+	link.CustomerCreation = stripe.PaymentLinkCustomerCreationAlways
+	if err := validateCatalogLink(link, expected, false); err == nil {
+		t.Fatal("unsupported monthly customer creation was accepted")
 	}
 }
 
@@ -192,10 +205,14 @@ func testCatalogSpec() CatalogSpec {
 	}
 }
 
-func testCatalogLink(configured CatalogPrice) *stripe.PaymentLink {
+func testCatalogLink(configured CatalogPrice, plan Plan) *stripe.PaymentLink {
+	customerCreation := stripe.PaymentLinkCustomerCreationAlways
+	if plan == PlanMonthly {
+		customerCreation = stripe.PaymentLinkCustomerCreationIfRequired
+	}
 	return &stripe.PaymentLink{
 		ID: configured.LinkID, Object: "payment_link", Active: true, Currency: stripe.CurrencyEUR,
-		CustomerCreation:  stripe.PaymentLinkCustomerCreationAlways,
+		CustomerCreation:  customerCreation,
 		ConsentCollection: &stripe.PaymentLinkConsentCollection{TermsOfService: stripe.PaymentLinkConsentCollectionTermsOfServiceRequired},
 		ManagedPayments:   &stripe.PaymentLinkManagedPayments{Enabled: true},
 		LineItems: &stripe.LineItemList{Data: []*stripe.LineItem{{Quantity: 1, Price: &stripe.Price{
