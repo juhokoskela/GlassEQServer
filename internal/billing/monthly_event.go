@@ -280,7 +280,11 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 		}
 		return next.state, nil
 	}
-	if subscription != nil && initial.Status == stripe.InvoiceStatusPaid && subscription.Status == stripe.SubscriptionStatusActive {
+	paidCancellation := subscription != nil && subscription.Status == stripe.SubscriptionStatusCanceled &&
+		subscription.CancellationDetails != nil &&
+		subscription.CancellationDetails.Reason == stripe.SubscriptionCancellationDetailsReasonCancellationRequested
+	if subscription != nil && initial.Status == stripe.InvoiceStatusPaid &&
+		(subscription.Status == stripe.SubscriptionStatusActive || paidCancellation) {
 		paidEnd, err := monthlyInvoicePeriod(latest, subscription, order, p.products.Monthly)
 		if err != nil {
 			return "", err
@@ -288,6 +292,9 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 		initialPaidEnd, err := monthlyInvoicePeriod(initial, subscription, order, p.products.Monthly)
 		if err != nil {
 			return "", err
+		}
+		if paidCancellation && !now.Before(initialPaidEnd) {
+			return "no_change", nil
 		}
 		previous := subscriptionProjection{
 			periodEnd: initialPaidEnd, recoveryUntil: initialPaidEnd.Add(14 * 24 * time.Hour), lastPaidInvoice: initial.ID,
