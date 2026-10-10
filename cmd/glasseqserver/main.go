@@ -120,6 +120,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return fmt.Errorf("create activation service: %w", err)
 	}
 	var eventProcessor *billing.EventProcessor
+	var reconciler *billing.Reconciler
 	if settings.Billing != nil {
 		checkoutClient, err := billing.NewCheckoutClient(settings.Stripe.SecretKey)
 		if err != nil {
@@ -134,6 +135,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			})
 		if err != nil {
 			return fmt.Errorf("create billing event processor: %w", err)
+		}
+		reconciler, err = billing.NewReconciler(eventProcessor, checkoutClient)
+		if err != nil {
+			return fmt.Errorf("create Payment Link reconciler: %w", err)
 		}
 	}
 
@@ -170,11 +175,32 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	background.Go(func() { runLicenseEmailDispatch(backgroundCtx, activationService, logger) })
 	if eventProcessor != nil {
 		background.Go(func() { runAdjustmentRepair(backgroundCtx, eventProcessor, logger) })
+		background.Go(func() { runPaymentLinkReconciliation(backgroundCtx, reconciler, logger) })
 	}
 	serveErr := serve(ctx, server, listener)
 	stopBackground()
 	background.Wait()
 	return serveErr
+}
+
+func runPaymentLinkReconciliation(ctx context.Context, reconciler *billing.Reconciler, logger *slog.Logger) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		runCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+		recovered, err := reconciler.Run(runCtx, time.Now())
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			logger.WarnContext(ctx, "Payment Link reconciliation failed", "recovered", recovered, "error", err)
+		} else if recovered > 0 {
+			logger.InfoContext(ctx, "Payment Link purchases recovered", "count", recovered)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func runAdjustmentRepair(ctx context.Context, processor *billing.EventProcessor, logger *slog.Logger) {
