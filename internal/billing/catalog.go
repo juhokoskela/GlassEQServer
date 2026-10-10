@@ -79,11 +79,19 @@ func validateCatalogLink(link *stripe.PaymentLink, expected catalogPriceExpectat
 		!link.Active || link.Livemode != liveMode || link.ManagedPayments == nil || !link.ManagedPayments.Enabled {
 		return errors.New(name + " is inactive, has the wrong identity or environment, or has Managed Payments disabled")
 	}
-	if link.Currency != stripe.CurrencyEUR || link.AllowPromotionCodes ||
-		link.CustomerCreation != stripe.PaymentLinkCustomerCreationAlways ||
-		link.ConsentCollection == nil || link.ConsentCollection.TermsOfService != stripe.PaymentLinkConsentCollectionTermsOfServiceRequired ||
-		len(link.OptionalItems) != 0 {
-		return errors.New(name + " must use EUR, require terms and customer creation, and disable promo and optional items")
+	customerCreation := stripe.PaymentLinkCustomerCreationAlways
+	if expected.plan == PlanMonthly {
+		// Stripe requires if_required for recurring prices and creates a Customer for subscriptions.
+		customerCreation = stripe.PaymentLinkCustomerCreationIfRequired
+	}
+	if link.Currency != stripe.CurrencyEUR || link.AllowPromotionCodes || len(link.OptionalItems) != 0 {
+		return errors.New(name + " must use EUR and disable promo and optional items")
+	}
+	if link.CustomerCreation != customerCreation {
+		return fmt.Errorf("%s customer creation is %q, want %q", name, link.CustomerCreation, customerCreation)
+	}
+	if link.ConsentCollection == nil || link.ConsentCollection.TermsOfService != stripe.PaymentLinkConsentCollectionTermsOfServiceRequired {
+		return errors.New(name + " must require terms consent")
 	}
 	if link.LineItems == nil || link.LineItems.HasMore || len(link.LineItems.Data) != 1 {
 		return errors.New(name + " must have exactly one line item")
