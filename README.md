@@ -2,14 +2,14 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The current service exposes liveness, database readiness, license activation, entitlement refresh, license management, account recovery, and optional Stripe Checkout. It issues entitlements with an AWS KMS Ed25519 key. An optional EventBridge/SQS worker fulfills perpetual and monthly Checkout purchases into a license and encrypted delivery outbox, and reconciles monthly renewals, payment recovery, and cancellation. Refund/dispute processing, daily reconciliation, billing retention, license-email dispatch, recovery-email consumption, and download endpoints are not implemented. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
+The project is under active development. The service exposes liveness, database readiness, license activation, entitlement refresh, license management, account recovery, and optional Stripe Checkout. It issues entitlements with an AWS KMS Ed25519 key. An optional EventBridge/SQS worker fulfills perpetual and monthly Checkout purchases into a license and encrypted delivery outbox, and reconciles monthly renewals, payment recovery, and cancellation. GlassEQ sends license keys and recovery tokens through Amazon SES; Stripe sends receipts and billing email. Refund/dispute processing, daily reconciliation, billing retention, and download endpoints are not implemented. The planned Stripe and AWS billing contract is documented in [Docs/Billing.md](Docs/Billing.md).
 
 ## Trust boundaries
 
 - AWS KMS holds the entitlement private key. The service can request Ed25519 signatures but cannot export the private key.
 - The Sparkle and Apple release keys do not belong to this service. The GlassEQ release workflow builds and signs updates separately.
 - The ECS task role must not be able to upload, replace, or delete update artifacts.
-- The ECS task role may send messages only to the email FIFO queue used for recovery and license delivery. The queue must use server-side encryption.
+- The ECS task role may send email through SES only from the verified GlassEQ sender identity.
 - The ECS task security group must accept public HTTP traffic only through the Application Load Balancer. The load balancer must use its default `append` mode for `X-Forwarded-For`, with client-port preservation disabled. Activation rate limits use the rightmost address appended by the load balancer.
 - Logs must not contain credentials, entitlement bodies, email addresses, Stripe payloads, or download authorization headers.
 
@@ -42,8 +42,8 @@ The server requires these environment variables:
 | `GLASSEQ_IDEMPOTENCY_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts replay responses |
 | `GLASSEQ_RATE_LIMIT_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key that hashes client IP addresses |
 | `GLASSEQ_EMAIL_LOOKUP_HMAC_KEY` | Unpadded Base64URL encoding of the 32-byte key used for recovery-email lookups |
-| `GLASSEQ_DATABASE_ENCRYPTION_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts recovery emails and queued tokens |
-| `GLASSEQ_RECOVERY_QUEUE_URL` | HTTPS URL of the recovery-email SQS FIFO queue |
+| `GLASSEQ_DATABASE_ENCRYPTION_KEY` | Unpadded Base64URL encoding of the 32-byte key that encrypts email addresses and delivery credentials |
+| `GLASSEQ_EMAIL_FROM` | Verified SES sender address, such as `licenses@glasseq.app` |
 | `GLASSEQ_HTTP_ADDRESS` | Listen address, defaults to `:8080` |
 
 Keep the encryption and HMAC keys stable across deployments. Store them in the deployment's secret manager; do not commit them.
@@ -123,7 +123,7 @@ License-key rotation requires a management session and an idempotency UUID. A li
 
 Well-formed recovery requests always return the same `202` response for known, unknown, invalid, and rate-limited email addresses. Requests are limited to three attempts per normalized email and 20 attempts per IP address each hour. Every non-limited address produces the same small lookup job, and the service stores that job with the encrypted idempotency replay in one transaction. The HTTP path does not look up licenses or create tokens.
 
-A background worker resolves lookup jobs and atomically creates hashed 30-minute tokens with encrypted delivery data for matching licenses. Failed preparation jobs are deferred for one minute so they cannot block later lookups or existing deliveries. The dispatcher then claims pending deliveries without holding a database connection during the SQS call. It does not send tokens with less than five minutes remaining. After publishing the decrypted email and recovery token, it deletes the outbox row. The outbox ID is both the message deduplication ID and message group ID. A separate consumer must deduplicate that stable delivery ID before calling the email provider because SQS FIFO deduplication lasts five minutes. The consumer and email template are not implemented yet.
+A background worker resolves lookup jobs and atomically creates hashed 30-minute tokens with encrypted delivery data for matching licenses. Failed preparation jobs are deferred for one minute so they cannot block later lookups or existing deliveries. The dispatcher claims pending deliveries without holding a database connection during the SES call. It does not send tokens with less than five minutes remaining. After SES accepts an email, it deletes the outbox row. A crash after SES acceptance but before the database acknowledgement can resend the same credential. Expired encrypted delivery copies are removed in bounded cleanup batches.
 
 Recovery tokens can be exchanged once while the associated license remains active. The exchange consumes the recovery token, creates a 15-minute management session, and stores an encrypted response atomically. Successful exchanges can be replayed with the same idempotency key for 24 hours, including after the recovery token expires.
 

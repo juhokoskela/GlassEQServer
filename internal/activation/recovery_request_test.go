@@ -57,8 +57,8 @@ func TestRecoveryRequestRejectsInvalidProtocolInput(t *testing.T) {
 func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{}
-	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	sender := &recordingEmailSender{}
+	service := newTestServiceWithEmailSender(t, database, localIssuer(t), sender)
 	seedRecoverableLicense(t, service, "lic_recovery_request", testLicenseKey, testRecoveryEmail)
 
 	response, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
@@ -86,7 +86,7 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 		t.Errorf("replay = (%d, %s), want (%d, %s)", replay.Status, replay.Body, response.Status, response.Body)
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
-	queue.onSend = func(message RecoveryEmail) {
+	sender.onSend = func(message RecoveryEmail) {
 		if strings.Contains(string(recoveryTokenCiphertext(t, database)), message.RecoveryToken) {
 			t.Error("recovery outbox contains the plaintext token")
 		}
@@ -99,22 +99,19 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 	if !dispatched {
 		t.Fatal("recovery email was not dispatched")
 	}
-	messages := queue.snapshot()
+	messages := sender.snapshot()
 	if len(messages) != 1 {
-		t.Fatalf("queued messages = %d, want 1", len(messages))
+		t.Fatalf("sent messages = %d, want 1", len(messages))
 	}
 	message := messages[0]
-	if message.Schema != 1 {
-		t.Errorf("recovery message schema = %d, want 1", message.Schema)
-	}
 	if message.Email != testRecoveryEmail {
-		t.Errorf("queued email = %q", message.Email)
+		t.Errorf("sent email = %q", message.Email)
 	}
 	if message.ExpiresAt != service.now().Add(recoveryTokenLifetime).Unix() {
 		t.Errorf("recovery expiry = %d", message.ExpiresAt)
 	}
 	if _, valid := recoveryTokenHash(message.RecoveryToken); !valid {
-		t.Errorf("queued recovery token is invalid: %q", message.RecoveryToken)
+		t.Errorf("sent recovery token is invalid: %q", message.RecoveryToken)
 	}
 
 	session, err := service.ExchangeRecoveryToken(context.Background(), RecoverySessionInput{
@@ -122,7 +119,7 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 		IdempotencyKey: "a1f1fd76-4ac4-4bf7-a154-4a179d1dabed",
 	})
 	if err != nil {
-		t.Fatalf("exchange queued recovery token: %v", err)
+		t.Fatalf("exchange sent recovery token: %v", err)
 	}
 	if session.Status != http.StatusCreated {
 		t.Errorf("recovery session status = %d, want %d", session.Status, http.StatusCreated)
@@ -142,8 +139,8 @@ func TestRecoveryRequestAndDispatchWithPostgreSQL(t *testing.T) {
 func TestRecoveryRequestDoesNotRevealUnknownEmailWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{}
-	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	sender := &recordingEmailSender{}
+	service := newTestServiceWithEmailSender(t, database, localIssuer(t), sender)
 	seedRecoverableLicense(t, service, "lic_recovery_private", testLicenseKey, testRecoveryEmail)
 
 	known, err := service.RequestRecovery(context.Background(), RecoveryRequestInput{
@@ -185,8 +182,8 @@ func TestRecoveryRequestDoesNotRevealUnknownEmailWithPostgreSQL(t *testing.T) {
 		}
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 0)
-	if len(queue.snapshot()) != 1 {
-		t.Errorf("queued messages = %d, want 1", len(queue.snapshot()))
+	if len(sender.snapshot()) != 1 {
+		t.Errorf("sent messages = %d, want 1", len(sender.snapshot()))
 	}
 }
 
@@ -366,8 +363,8 @@ func TestRecoveryRequestRollsBackWhenReplayEncryptionFailsWithPostgreSQL(t *test
 func TestFailedRecoveryRequestPreparationDoesNotStarveDeliveriesWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{}
-	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	sender := &recordingEmailSender{}
+	service := newTestServiceWithEmailSender(t, database, localIssuer(t), sender)
 	seedRecoverableLicense(t, service, "lic_recovery_prepare_rollback", testLicenseKey, testRecoveryEmail)
 	now := service.now()
 
@@ -396,8 +393,8 @@ func TestFailedRecoveryRequestPreparationDoesNotStarveDeliveriesWithPostgreSQL(t
 	if !worked {
 		t.Error("existing recovery email was not dispatched after preparation failed")
 	}
-	if len(queue.snapshot()) != 1 {
-		t.Errorf("queued messages = %d, want 1", len(queue.snapshot()))
+	if len(sender.snapshot()) != 1 {
+		t.Errorf("sent messages = %d, want 1", len(sender.snapshot()))
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 1)
 	assertRowCount(t, database, "SELECT count(*) FROM access_tokens WHERE purpose = 'recovery'", nil, 1)
@@ -424,8 +421,8 @@ func TestFailedRecoveryRequestPreparationDoesNotStarveDeliveriesWithPostgreSQL(t
 	} else if !worked {
 		t.Error("failed recovery request was not retried")
 	}
-	if len(queue.snapshot()) != 2 {
-		t.Errorf("queued messages = %d, want 2", len(queue.snapshot()))
+	if len(sender.snapshot()) != 2 {
+		t.Errorf("sent messages = %d, want 2", len(sender.snapshot()))
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_request_jobs", nil, 0)
 }
@@ -433,42 +430,42 @@ func TestFailedRecoveryRequestPreparationDoesNotStarveDeliveriesWithPostgreSQL(t
 func TestRecoveryEmailDispatchRetriesAfterQueueFailureWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{err: errors.New("queue unavailable")}
-	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	sender := &recordingEmailSender{err: errors.New("sender unavailable")}
+	service := newTestServiceWithEmailSender(t, database, localIssuer(t), sender)
 	seedRecoverableLicense(t, service, "lic_recovery_retry", testLicenseKey, testRecoveryEmail)
 	requestRecovery(t, service, testRecoveryEmail, "192.0.2.56")
 	now := service.now()
 
 	if _, err := service.DispatchRecoveryEmail(context.Background(), now); err == nil {
-		t.Fatal("dispatch with unavailable queue succeeded")
+		t.Fatal("dispatch with unavailable sender succeeded")
 	}
 	if dispatched, err := service.DispatchRecoveryEmail(context.Background(), now.Add(30*time.Second)); err != nil {
 		t.Fatalf("dispatch before retry time: %v", err)
 	} else if dispatched {
 		t.Error("recovery email retried before its delay")
 	}
-	queue.setError(nil)
+	sender.setError(nil)
 	if dispatched, err := service.DispatchRecoveryEmail(context.Background(), now.Add(recoveryRetryDelay)); err != nil {
 		t.Fatalf("retry recovery email: %v", err)
 	} else if !dispatched {
 		t.Error("recovery email was not retried")
 	}
-	if len(queue.snapshot()) != 2 {
-		t.Errorf("queue attempts = %d, want 2", len(queue.snapshot()))
+	if len(sender.snapshot()) != 2 {
+		t.Errorf("sender attempts = %d, want 2", len(sender.snapshot()))
 	}
 }
 
 func TestRecoveryEmailDispatchSkipsNearExpiryTokenWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{err: errors.New("queue unavailable")}
-	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	sender := &recordingEmailSender{err: errors.New("sender unavailable")}
+	service := newTestServiceWithEmailSender(t, database, localIssuer(t), sender)
 	seedRecoverableLicense(t, service, "lic_recovery_expiring", testLicenseKey, testRecoveryEmail)
 	requestRecovery(t, service, testRecoveryEmail, "192.0.2.61")
 	if _, err := service.DispatchRecoveryEmail(context.Background(), service.now()); err == nil {
 		t.Fatal("initial recovery email dispatch succeeded")
 	}
-	queue.setError(nil)
+	sender.setError(nil)
 	now := service.now().Add(recoveryTokenLifetime - recoveryMinimumDeliveryLifetime)
 
 	dispatched, err := service.DispatchRecoveryEmail(context.Background(), now)
@@ -478,8 +475,8 @@ func TestRecoveryEmailDispatchSkipsNearExpiryTokenWithPostgreSQL(t *testing.T) {
 	if dispatched {
 		t.Error("dispatched a near-expiry recovery email")
 	}
-	if len(queue.snapshot()) != 1 {
-		t.Errorf("queue attempts = %d, want 1", len(queue.snapshot()))
+	if len(sender.snapshot()) != 1 {
+		t.Errorf("sender attempts = %d, want 1", len(sender.snapshot()))
 	}
 	assertRowCount(t, database, "SELECT count(*) FROM recovery_email_outbox", nil, 1)
 }
@@ -487,8 +484,8 @@ func TestRecoveryEmailDispatchSkipsNearExpiryTokenWithPostgreSQL(t *testing.T) {
 func TestConcurrentRecoveryDispatchClaimsOneEmailWithPostgreSQL(t *testing.T) {
 	database := openTestDatabase(t)
 	resetActivationData(t, database)
-	queue := &recordingRecoveryEmailQueue{}
-	service := newTestServiceWithRecoveryQueue(t, database, localIssuer(t), queue)
+	sender := &recordingEmailSender{}
+	service := newTestServiceWithEmailSender(t, database, localIssuer(t), sender)
 	seedRecoverableLicense(t, service, "lic_recovery_claim", testLicenseKey, testRecoveryEmail)
 	requestRecovery(t, service, testRecoveryEmail, "192.0.2.57")
 
@@ -508,8 +505,8 @@ func TestConcurrentRecoveryDispatchClaimsOneEmailWithPostgreSQL(t *testing.T) {
 			t.Fatalf("dispatch recovery email concurrently: %v", err)
 		}
 	}
-	if len(queue.snapshot()) != 1 {
-		t.Errorf("queued messages = %d, want 1", len(queue.snapshot()))
+	if len(sender.snapshot()) != 1 {
+		t.Errorf("sent messages = %d, want 1", len(sender.snapshot()))
 	}
 }
 
@@ -620,14 +617,14 @@ func (r *blockingReader) Read(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 
-type recordingRecoveryEmailQueue struct {
+type recordingEmailSender struct {
 	mu       sync.Mutex
 	messages []RecoveryEmail
 	err      error
 	onSend   func(RecoveryEmail)
 }
 
-func (q *recordingRecoveryEmailQueue) SendRecoveryEmail(_ context.Context, message RecoveryEmail) error {
+func (q *recordingEmailSender) SendRecoveryEmail(_ context.Context, message RecoveryEmail) error {
 	q.mu.Lock()
 	q.messages = append(q.messages, message)
 	err := q.err
@@ -639,13 +636,17 @@ func (q *recordingRecoveryEmailQueue) SendRecoveryEmail(_ context.Context, messa
 	return err
 }
 
-func (q *recordingRecoveryEmailQueue) snapshot() []RecoveryEmail {
+func (q *recordingEmailSender) SendLicenseEmail(context.Context, LicenseEmail) error {
+	return nil
+}
+
+func (q *recordingEmailSender) snapshot() []RecoveryEmail {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return append([]RecoveryEmail(nil), q.messages...)
 }
 
-func (q *recordingRecoveryEmailQueue) setError(err error) {
+func (q *recordingEmailSender) setError(err error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.err = err

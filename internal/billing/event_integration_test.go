@@ -283,6 +283,10 @@ func (purchaseEmailQueue) SendRecoveryEmail(context.Context, activation.Recovery
 	return errors.New("unexpected email dispatch")
 }
 
+func (purchaseEmailQueue) SendLicenseEmail(context.Context, activation.LicenseEmail) error {
+	return errors.New("unexpected email dispatch")
+}
+
 func assertFulfillmentCounts(t *testing.T, database *sql.DB, licenses, events int) {
 	t.Helper()
 	for _, check := range []struct {
