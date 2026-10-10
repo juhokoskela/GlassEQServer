@@ -13,7 +13,7 @@ import (
 
 func adjustmentHTTPClient(t *testing.T, respond func(*http.Request) (int, string)) *CheckoutClient {
 	t.Helper()
-	transport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+	transport := stripeRoundTripper(func(r *http.Request) (*http.Response, error) {
 		if _, ok := r.Context().Deadline(); !ok {
 			t.Error("Stripe request has no deadline")
 		}

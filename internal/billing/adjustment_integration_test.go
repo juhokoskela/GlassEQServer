@@ -158,6 +158,10 @@ func TestRefundRevokesOnlyFullSuccessfulPaymentsWithPostgreSQL(t *testing.T) {
 			assertLicenseState(t, p, "refunded", terminal)
 			monthlyEvent(t, p, "evt_refunded", "refund.updated", "")
 			monthlyEvent(t, p, "evt_refund_duplicate", "refund.created", "")
+			var pending bool
+			if err := p.database.QueryRow(`SELECT pending FROM billing_adjustments WHERE stripe_object_id = 're_purchase'`).Scan(&pending); err != nil || pending {
+				t.Fatalf("duplicate reopened adjustment: pending=%t error=%v", pending, err)
+			}
 			monthlyEvent(t, p, "evt_late_checkout", "checkout.session.completed", "")
 			assertLicenseState(t, p, "refunded", terminal)
 			if plan == PlanMonthly && f.cancelCalls != 1 {
@@ -200,6 +204,25 @@ func TestMonthlyRefundLostCancellationResponseWithPostgreSQL(t *testing.T) {
 	}
 	if err := p.Process(t.Context(), eventBody(t, "evt_renewal_race", "customer.subscription.updated")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPendingAdjustmentRepairsWithoutWebhookRedeliveryWithPostgreSQL(t *testing.T) {
+	p, f := adjustmentFixture(t, PlanMonthly, true)
+	f.fullRefund()
+	f.cancelError = errors.New("lost cancellation response")
+	if err := p.Process(t.Context(), eventBody(t, "evt_refund", "refund.created")); err == nil {
+		t.Fatal("lost cancellation response acknowledged")
+	}
+	f.cancelError = nil
+	worked, err := p.RepairPendingAdjustment(t.Context(), f.now.Add(time.Minute))
+	if err != nil || !worked {
+		t.Fatalf("repair: worked=%t error=%v", worked, err)
+	}
+	assertLicenseState(t, p, "refunded", f.now)
+	worked, err = p.RepairPendingAdjustment(t.Context(), f.now.Add(2*time.Minute))
+	if err != nil || worked {
+		t.Fatalf("second repair: worked=%t error=%v", worked, err)
 	}
 }
 
@@ -330,8 +353,24 @@ func TestMonthlyRenewalRefundAndExpiredDisputeWithPostgreSQL(t *testing.T) {
 	})
 }
 
+func TestLateMonthlyRefundDoesNotReopenExpiredAccessWithPostgreSQL(t *testing.T) {
+	p, f := adjustmentFixture(t, PlanMonthly, true)
+	late := f.now.AddDate(0, 3, 0)
+	p.now = func() time.Time { return late }
+	f.refund.Created = late.Unix()
+	f.fullRefund()
+	monthlyEvent(t, p, "evt_late_refund", "refund.created", "")
+	var terminalAt, recoveryUntil time.Time
+	if err := p.database.QueryRow(`SELECT terminal_at, recovery_until FROM subscriptions`).Scan(&terminalAt, &recoveryUntil); err != nil {
+		t.Fatal(err)
+	}
+	if !terminalAt.Equal(recoveryUntil) || !late.After(recoveryUntil.Add(7*24*time.Hour)) {
+		t.Fatalf("late refund reopened access: terminal=%s recovery=%s refund=%s", terminalAt, recoveryUntil, late)
+	}
+}
+
 func TestAdjustmentBindingsBeforeCancellationWithPostgreSQL(t *testing.T) {
-	for _, mismatch := range []string{"environment", "customer", "invoice payment", "price", "order metadata"} {
+	for _, mismatch := range []string{"environment", "customer", "invoice payment", "price", "payment link"} {
 		t.Run(mismatch, func(t *testing.T) {
 			p, f := adjustmentFixture(t, PlanMonthly, true)
 			f.fullRefund()
@@ -344,8 +383,8 @@ func TestAdjustmentBindingsBeforeCancellationWithPostgreSQL(t *testing.T) {
 				f.payment.AmountPaid--
 			case "price":
 				f.subscription.Items.Data[0].Price.ID = "price_other"
-			case "order metadata":
-				f.subscription.Metadata = map[string]string{"order_id": "other"}
+			case "payment link":
+				f.session.PaymentLink.ID = "plink_other"
 			}
 			if err := p.Process(t.Context(), eventBody(t, "evt_refund", "refund.created")); err == nil {
 				t.Fatal("invalid adjustment acknowledged")
@@ -406,9 +445,7 @@ func TestDisputeStatusesAndUnownedAdjustmentsWithPostgreSQL(t *testing.T) {
 	for _, plan := range []Plan{PlanMonthly, PlanPerpetualV1} {
 		t.Run("unowned/"+string(plan), func(t *testing.T) {
 			p, f := adjustmentFixture(t, plan, false)
-			if _, err := p.database.Exec(`DELETE FROM checkout_orders`); err != nil {
-				t.Fatal(err)
-			}
+			f.session.PaymentLink.ID = "plink_other"
 			f.fullRefund()
 			monthlyEvent(t, p, "evt_refund", "refund.created", "")
 			var outcome string

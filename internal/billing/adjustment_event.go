@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/juhokoskela/GlassEQServer/internal/activation"
 	"github.com/stripe/stripe-go/v86"
 )
 
@@ -36,6 +37,36 @@ func (p *EventProcessor) processAdjustment(ctx context.Context, event billingEve
 	order, found, err := readPurchaseOrder(ctx, p.database, identity, false)
 	if err != nil {
 		return err
+	}
+	if !found && a.charge.PaymentIntent != nil {
+		var session *stripe.CheckoutSession
+		if identity.subscriptionID != "" {
+			session, err = p.adjustments.FindPurchase(ctx, "", identity.subscriptionID)
+		} else {
+			session, err = p.adjustments.FindPurchase(ctx, identity.paymentID, "")
+		}
+		if err != nil {
+			return err
+		}
+		if session != nil {
+			if identity.subscriptionID != "" {
+				if session.Subscription == nil || session.Subscription.ID != identity.subscriptionID {
+					return ErrInvalidAdjustment
+				}
+			} else if session.PaymentIntent == nil || session.PaymentIntent.ID != identity.paymentID {
+				return ErrInvalidAdjustment
+			}
+			owned, err := p.ensurePaymentLinkOrder(ctx, session, now)
+			if err != nil {
+				return err
+			}
+			if owned {
+				order, found, err = readPurchaseOrder(ctx, p.database, purchaseIdentity{sessionID: session.ID}, false)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if !found {
 		_, _, err := p.prepareAdjustment(ctx, event, adjustmentSnapshot{}, now)
@@ -78,6 +109,44 @@ func subscriptionCanBill(subscription *stripe.Subscription) bool {
 	return subscription.Status != stripe.SubscriptionStatusCanceled && subscription.Status != stripe.SubscriptionStatusIncompleteExpired
 }
 
+func (p *EventProcessor) RepairPendingAdjustment(ctx context.Context, now time.Time) (bool, error) {
+	var objectID, kind string
+	var eventID, eventType sql.NullString
+	var created sql.NullTime
+	err := p.database.QueryRowContext(ctx, `SELECT adjustment.stripe_object_id, adjustment.kind,
+		event.stripe_event_id, event.event_type, event.stripe_created_at
+		FROM billing_adjustments AS adjustment
+		LEFT JOIN LATERAL (
+			SELECT stripe_event_id, event_type, stripe_created_at FROM stripe_events
+			WHERE object_id = adjustment.stripe_object_id AND processed_at IS NULL
+			ORDER BY stripe_created_at, stripe_event_id LIMIT 1
+		) AS event ON true
+		WHERE adjustment.pending
+		ORDER BY adjustment.updated_at, adjustment.stripe_object_id LIMIT 1`).Scan(&objectID, &kind, &eventID, &eventType, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("find pending billing adjustment: %w", err)
+	}
+	if !eventID.Valid || !eventType.Valid || !created.Valid {
+		return false, fmt.Errorf("pending billing adjustment %s has no retryable event", objectID)
+	}
+	event := billingEvent{ID: eventID.String, Type: eventType.String, Created: created.Time.Unix()}
+	event.Data.Object.ID, event.Data.Object.Object = objectID, kind
+	if err := p.processAdjustment(ctx, event, now.UTC().Truncate(time.Microsecond)); err != nil {
+		return true, fmt.Errorf("repair billing adjustment %s: %w", objectID, err)
+	}
+	var pending bool
+	if err := p.database.QueryRowContext(ctx, `SELECT pending FROM billing_adjustments WHERE stripe_object_id = $1`, objectID).Scan(&pending); err != nil {
+		return true, fmt.Errorf("check repaired billing adjustment %s: %w", objectID, err)
+	}
+	if pending {
+		return true, fmt.Errorf("billing adjustment %s remains pending", objectID)
+	}
+	return true, nil
+}
+
 func (p *EventProcessor) prepareAdjustment(ctx context.Context, event billingEvent, view adjustmentSnapshot, now time.Time) (purchaseOrder, bool, error) {
 	tx, err := p.database.BeginTx(ctx, nil)
 	if err != nil {
@@ -116,17 +185,23 @@ func (p *EventProcessor) prepareAdjustment(ctx context.Context, event billingEve
 				VALUES ($1, $2, $3, $4, $5, true, $8, $6, $7) ON CONFLICT (stripe_object_id) DO NOTHING`, a.id, order.id, a.kind, a.chargeID, a.state, a.effectiveAt, now, a.state == "blocking" && order.plan == PlanMonthly); err != nil {
 				return order, false, err
 			}
-			var storedOrder, kind, charge string
+			var storedOrder, kind, charge, storedState string
+			var pending, cancelRequired bool
 			var effectiveAt time.Time
-			if err := tx.QueryRowContext(ctx, `SELECT order_id, kind, stripe_charge_id, effective_at FROM billing_adjustments WHERE stripe_object_id = $1 FOR UPDATE`, a.id).
-				Scan(&storedOrder, &kind, &charge, &effectiveAt); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT order_id, kind, stripe_charge_id, effective_at, state, pending, cancel_required
+				FROM billing_adjustments WHERE stripe_object_id = $1 FOR UPDATE`, a.id).
+				Scan(&storedOrder, &kind, &charge, &effectiveAt, &storedState, &pending, &cancelRequired); err != nil {
 				return order, false, err
 			}
 			if storedOrder != order.id || kind != a.kind || charge != a.chargeID || !effectiveAt.Equal(a.effectiveAt) {
 				return order, false, ErrInvalidAdjustment
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE billing_adjustments SET state = $2, pending = true, cancel_required = cancel_required OR $4, updated_at = $3 WHERE stripe_object_id = $1`, a.id, a.state, now, a.state == "blocking" && order.plan == PlanMonthly); err != nil {
-				return order, false, err
+			if storedState == a.state && !pending && !cancelRequired {
+				a.state = ""
+			} else {
+				if _, err := tx.ExecContext(ctx, `UPDATE billing_adjustments SET state = $2, pending = true, cancel_required = cancel_required OR $4, updated_at = $3 WHERE stripe_object_id = $1`, a.id, a.state, now, a.state == "blocking" && order.plan == PlanMonthly); err != nil {
+					return order, false, err
+				}
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET billing_revision = billing_revision + 1 WHERE id = $1`, order.id); err != nil {
@@ -248,7 +323,7 @@ func (p *EventProcessor) applyAdjustments(ctx context.Context, tx *sql.Tx, event
 			if !effectiveAt.Valid {
 				return "", errors.New("blocking adjustment has no effective time")
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE subscriptions SET terminal_at = LEAST(COALESCE(terminal_at, $2), $2),
+			if _, err := tx.ExecContext(ctx, `UPDATE subscriptions SET terminal_at = LEAST(COALESCE(terminal_at, $2), $2, recovery_until),
 				last_stripe_event_id = $3, last_reconciled_at = $4, updated_at = $4 WHERE license_id = $1`, order.licenseID.String, effectiveAt.Time, event.ID, now); err != nil {
 				return "", err
 			}
@@ -329,4 +404,38 @@ func (p *EventProcessor) restorationProjection(view adjustmentSnapshot, previous
 		next.recoveryUntil = next.periodEnd
 	}
 	return next, now.Before(next.recoveryUntil.Add(7 * 24 * time.Hour)), nil
+}
+
+func (p *EventProcessor) issuePerpetualPurchase(ctx context.Context, tx *sql.Tx, order checkoutOrder, session *stripe.CheckoutSession, now time.Time) error {
+	licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
+		Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID, Email: session.CustomerDetails.Email,
+	}, now)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
+		stripe_checkout_session_id = $4, stripe_payment_intent_id = $5 WHERE id = $1`, order.id, licenseID, now, session.ID, session.PaymentIntent.ID); err != nil {
+		return fmt.Errorf("fulfill perpetual adjustment order: %w", err)
+	}
+	return nil
+}
+
+func (p *EventProcessor) issueMonthlyPurchase(ctx context.Context, tx *sql.Tx, order purchaseOrder, session *stripe.CheckoutSession, next subscriptionProjection, eventID string, now time.Time) error {
+	licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
+		Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID,
+		SubscriptionID: session.Subscription.ID, Email: session.CustomerDetails.Email,
+	}, now)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO subscriptions (license_id, state, billing_period_end, recovery_until,
+		last_paid_invoice_id, last_stripe_event_id, last_reconciled_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
+		licenseID, next.state, next.periodEnd, next.recoveryUntil, next.lastPaidInvoice, eventID, now); err != nil {
+		return fmt.Errorf("create adjusted subscription: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
+		stripe_checkout_session_id = $4, stripe_subscription_id = $5 WHERE id = $1`, order.id, licenseID, now, session.ID, session.Subscription.ID); err != nil {
+		return fmt.Errorf("fulfill monthly adjustment order: %w", err)
+	}
+	return nil
 }

@@ -21,6 +21,7 @@ type monthlyRetriever struct {
 	invoices           map[string]*stripe.Invoice
 	database           *sql.DB
 	beforeSubscription func(context.Context) error
+	findPurchase       bool
 }
 
 func (f *monthlyRetriever) RetrievePurchase(ctx context.Context, _ string) (*stripe.CheckoutSession, error) {
@@ -28,6 +29,12 @@ func (f *monthlyRetriever) RetrievePurchase(ctx context.Context, _ string) (*str
 		return nil, err
 	}
 	return f.session, nil
+}
+func (f *monthlyRetriever) FindPurchaseBySubscription(ctx context.Context, _ string) (*stripe.CheckoutSession, error) {
+	if !f.findPurchase {
+		return nil, nil
+	}
+	return f.RetrievePurchase(ctx, f.session.ID)
 }
 func (f *monthlyRetriever) RetrieveSubscription(ctx context.Context, _ string) (*stripe.Subscription, error) {
 	if err := f.database.PingContext(ctx); err != nil {
@@ -50,9 +57,6 @@ func (f *monthlyRetriever) RetrieveInvoice(ctx context.Context, id string) (*str
 func monthlyFixture(t *testing.T) (*EventProcessor, *activation.Service, *monthlyRetriever) {
 	t.Helper()
 	p, service, _ := purchaseFixture(t)
-	if _, err := p.database.Exec(`UPDATE checkout_orders SET plan = 'monthly', stripe_price_id = 'price_monthly'`); err != nil {
-		t.Fatal(err)
-	}
 	session, subscription, invoice := monthlyPurchase()
 	checkout := &monthlyRetriever{session: session, subscription: subscription, invoices: map[string]*stripe.Invoice{invoice.ID: invoice}, database: p.database}
 	p.checkout = checkout
@@ -174,21 +178,49 @@ func TestMonthlyRenewalRecoveryAndCancellationWithPostgreSQL(t *testing.T) {
 func TestMonthlyInitialPaymentAndAttachmentRaceWithPostgreSQL(t *testing.T) {
 	p, _, checkout := monthlyFixture(t)
 	body := eventBody(t, "evt_invoice_first", "invoice.paid")
-	if err := p.Process(context.Background(), body); !errors.Is(err, errBillingSnapshotChanged) {
-		t.Fatalf("unattached invoice: %v", err)
+	if err := p.Process(context.Background(), body); err != nil {
+		t.Fatalf("early invoice: %v", err)
 	}
-	assertFulfillmentCounts(t, p.database, 0, 0)
+	assertFulfillmentCounts(t, p.database, 0, 1)
 	checkout.session.PaymentStatus = stripe.CheckoutSessionPaymentStatusUnpaid
 	checkout.invoices["in_initial"].Status = stripe.InvoiceStatusOpen
 	checkout.subscription.Status = stripe.SubscriptionStatusIncomplete
 	monthlyEvent(t, p, "evt_pending", "checkout.session.completed", "")
-	assertFulfillmentCounts(t, p.database, 0, 1)
+	assertFulfillmentCounts(t, p.database, 0, 2)
 	checkout.session.PaymentStatus = stripe.CheckoutSessionPaymentStatusPaid
 	checkout.invoices["in_initial"].Status = stripe.InvoiceStatusPaid
 	checkout.subscription.Status = stripe.SubscriptionStatusActive
-	if err := p.Process(context.Background(), body); err != nil {
+	monthlyEvent(t, p, "evt_paid", "checkout.session.async_payment_succeeded", "")
+	assertFulfillmentCounts(t, p.database, 1, 3)
+}
+
+func TestMonthlySubscriptionEventFindsPaymentLinkBeforeOrderExistsWithPostgreSQL(t *testing.T) {
+	p, _, checkout := monthlyFixture(t)
+	checkout.findPurchase = true
+	checkout.subscription.Status = stripe.SubscriptionStatusCanceled
+	checkout.subscription.CancellationDetails = &stripe.SubscriptionCancellationDetails{Reason: stripe.SubscriptionCancellationDetailsReasonCancellationRequested}
+	monthlyEvent(t, p, "evt_canceled_first", "customer.subscription.deleted", "")
+	assertFulfillmentCounts(t, p.database, 0, 1)
+	var state, outcome string
+	if err := p.database.QueryRow(`SELECT state FROM checkout_orders WHERE id = 'cs_purchase'`).Scan(&state); err != nil {
 		t.Fatal(err)
 	}
+	if err := p.database.QueryRow(`SELECT outcome FROM stripe_events WHERE stripe_event_id = 'evt_canceled_first'`).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed" || outcome != "failed" {
+		t.Fatalf("early cancellation: order=%s event=%s", state, outcome)
+	}
+	monthlyEvent(t, p, "evt_checkout_later", "checkout.session.completed", "")
+	assertFulfillmentCounts(t, p.database, 0, 2)
+}
+
+func TestMonthlyInvoiceEventFindsPaymentLinkBeforeOrderExistsWithPostgreSQL(t *testing.T) {
+	p, _, checkout := monthlyFixture(t)
+	checkout.findPurchase = true
+	monthlyEvent(t, p, "evt_paid_first", "invoice.paid", "in_initial")
+	assertFulfillmentCounts(t, p.database, 1, 1)
+	monthlyEvent(t, p, "evt_checkout_later", "checkout.session.completed", "")
 	assertFulfillmentCounts(t, p.database, 1, 2)
 }
 
@@ -257,31 +289,22 @@ func TestMonthlyFailedOrderRemainsFailedUntilPaidWithPostgreSQL(t *testing.T) {
 }
 
 func TestMonthlyInitialFulfillmentWithOpenRenewalWithPostgreSQL(t *testing.T) {
-	for _, kind := range []string{"checkout.session.completed", "invoice.updated", "invoice.paid"} {
-		t.Run(kind, func(t *testing.T) {
-			p, _, checkout := monthlyFixture(t)
-			end := testCheckoutNow.AddDate(0, 1, 0)
-			renewal := paidMonthlyInvoice("in_renewal", end, end.AddDate(0, 1, 0))
-			renewal.Status = stripe.InvoiceStatusOpen
-			checkout.invoices[renewal.ID] = renewal
-			checkout.subscription.LatestInvoice = &stripe.Invoice{ID: renewal.ID}
-			p.now = func() time.Time { return end.Add(time.Hour) }
-			if _, err := p.database.Exec(`UPDATE checkout_orders SET stripe_checkout_session_id = 'cs_purchase'`); err != nil {
-				t.Fatal(err)
-			}
-			invoiceID := renewal.ID
-			if kind == "invoice.paid" {
-				invoiceID = "in_initial"
-			}
-			monthlyEvent(t, p, "evt_delayed_fulfillment", kind, invoiceID)
-			assertFulfillmentCounts(t, p.database, 1, 1)
-			assertSubscription(t, p.database, "recovering", "in_initial", end, end.Add(14*24*time.Hour))
-			// A second event must reconcile the same projection without another key.
-			monthlyEvent(t, p, "evt_unpaid_renewal", "invoice.updated", renewal.ID)
-			assertFulfillmentCounts(t, p.database, 1, 2)
-			assertSubscription(t, p.database, "recovering", "in_initial", end, end.Add(14*24*time.Hour))
-		})
-	}
+	t.Run("checkout.session.completed", func(t *testing.T) {
+		p, _, checkout := monthlyFixture(t)
+		end := testCheckoutNow.AddDate(0, 1, 0)
+		renewal := paidMonthlyInvoice("in_renewal", end, end.AddDate(0, 1, 0))
+		renewal.Status = stripe.InvoiceStatusOpen
+		checkout.invoices[renewal.ID] = renewal
+		checkout.subscription.LatestInvoice = &stripe.Invoice{ID: renewal.ID}
+		p.now = func() time.Time { return end.Add(time.Hour) }
+		monthlyEvent(t, p, "evt_delayed_fulfillment", "checkout.session.completed", "")
+		assertFulfillmentCounts(t, p.database, 1, 1)
+		assertSubscription(t, p.database, "recovering", "in_initial", end, end.Add(14*24*time.Hour))
+		// A second event must reconcile the same projection without another key.
+		monthlyEvent(t, p, "evt_unpaid_renewal", "invoice.updated", renewal.ID)
+		assertFulfillmentCounts(t, p.database, 1, 2)
+		assertSubscription(t, p.database, "recovering", "in_initial", end, end.Add(14*24*time.Hour))
+	})
 }
 
 func TestMonthlyTerminalLicenseCannotBeRestoredWithPostgreSQL(t *testing.T) {
@@ -398,28 +421,18 @@ func TestMonthlyUnpaidAndTerminalInitialStatesWithPostgreSQL(t *testing.T) {
 }
 
 func TestMonthlyOwnedMismatchAndUnownedEventsWithPostgreSQL(t *testing.T) {
-	for _, kind := range []string{"metadata", "customer", "price", "invoice", "stored_subscription", "conflicting_order"} {
+	for _, kind := range []string{"link", "customer", "price", "invoice"} {
 		t.Run(kind, func(t *testing.T) {
 			p, _, checkout := monthlyFixture(t)
 			switch kind {
-			case "metadata":
-				checkout.subscription.Metadata = map[string]string{"order_id": testCheckoutOrderID, "plan": "monthly", "policy_version": "other"}
+			case "link":
+				checkout.session.PaymentLink.ID = "plink_perpetual"
 			case "customer":
 				checkout.subscription.Customer = &stripe.Customer{ID: "cus_other"}
 			case "price":
 				checkout.invoices["in_initial"].Lines.Data[0].Pricing.PriceDetails.Price.ID = "price_other"
 			case "invoice":
 				checkout.invoices["in_initial"].Parent.SubscriptionDetails.Subscription.ID = "sub_other"
-			case "stored_subscription":
-				if _, err := p.database.Exec(`UPDATE checkout_orders SET stripe_checkout_session_id = 'cs_purchase', stripe_subscription_id = 'sub_other'`); err != nil {
-					t.Fatal(err)
-				}
-			case "conflicting_order":
-				if _, err := p.database.Exec(`INSERT INTO checkout_orders (id, request_id, plan, policy_version, stripe_price_id, state, created_at)
-					VALUES ('ord_other', '124fdc57-3793-448f-a0c5-11fed7e77e99', 'monthly', 'v1', 'price_monthly', 'pending', $1)`, testCheckoutNow); err != nil {
-					t.Fatal(err)
-				}
-				checkout.session.Metadata["order_id"] = "ord_other"
 			}
 			if err := p.Process(context.Background(), eventBody(t, "evt_invalid", "checkout.session.completed")); err == nil {
 				t.Fatal("owned mismatch acknowledged")
@@ -428,7 +441,6 @@ func TestMonthlyOwnedMismatchAndUnownedEventsWithPostgreSQL(t *testing.T) {
 		})
 	}
 	p, _, checkout := monthlyFixture(t)
-	checkout.subscription.Metadata["order_id"] = "ord_unknown"
 	monthlyEvent(t, p, "evt_foreign_sub", "customer.subscription.updated", "")
 	checkout.invoices["in_initial"].Parent = nil
 	monthlyEvent(t, p, "evt_foreign_invoice", "invoice.paid", "in_initial")

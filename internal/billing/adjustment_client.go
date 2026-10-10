@@ -148,7 +148,13 @@ func (c *CheckoutClient) FindPurchase(ctx context.Context, paymentID, subscripti
 	if err := list.Err(); err != nil {
 		return nil, sanitizeStripeError(ctx, err)
 	}
-	if list.Meta().HasMore || len(list.Data()) != 1 || list.Data()[0] == nil {
+	if list.Meta().HasMore || len(list.Data()) > 1 {
+		return nil, ErrInvalidAdjustment
+	}
+	if len(list.Data()) == 0 {
+		return nil, nil
+	}
+	if list.Data()[0] == nil {
 		return nil, ErrInvalidAdjustment
 	}
 	return c.RetrievePurchase(ctx, list.Data()[0].ID)

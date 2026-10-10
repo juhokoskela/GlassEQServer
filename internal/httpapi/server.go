@@ -45,16 +45,17 @@ type activationService interface {
 type api struct {
 	database    databasePinger
 	activations activationService
-	checkouts   checkoutService
+	events      billingEventProcessor
+	webhookKey  string
 	logger      *slog.Logger
 }
 
 func New(database databasePinger, activations activationService, logger *slog.Logger) http.Handler {
-	return NewWithCheckout(database, activations, nil, logger)
+	return NewWithWebhook(database, activations, nil, "", logger)
 }
 
-func NewWithCheckout(database databasePinger, activations activationService, checkouts checkoutService, logger *slog.Logger) http.Handler {
-	api := &api{database: database, activations: activations, checkouts: checkouts, logger: logger}
+func NewWithWebhook(database databasePinger, activations activationService, events billingEventProcessor, webhookKey string, logger *slog.Logger) http.Handler {
+	api := &api{database: database, activations: activations, events: events, webhookKey: webhookKey, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", api.health)
 	mux.HandleFunc("GET /readyz", api.ready)
@@ -67,9 +68,8 @@ func NewWithCheckout(database databasePinger, activations activationService, che
 	mux.HandleFunc("POST /v1/management/license-key-rotations", api.rotateLicenseKey)
 	mux.HandleFunc("POST /v1/recovery-requests", api.requestRecovery)
 	mux.HandleFunc("POST /v1/recovery-sessions", api.createRecoverySession)
-	if checkouts != nil {
-		mux.HandleFunc("POST /v1/checkout-sessions", api.createCheckoutSession)
-		mux.HandleFunc("OPTIONS /v1/checkout-sessions", api.checkoutPreflight)
+	if events != nil {
+		mux.HandleFunc("POST /v1/stripe/webhook", api.stripeWebhook)
 	}
 	return mux
 }

@@ -60,9 +60,9 @@ func invoiceSubscriptionID(invoice *stripe.Invoice) string {
 	return invoice.Parent.SubscriptionDetails.Subscription.ID
 }
 
-func validateMonthlySession(session *stripe.CheckoutSession, order purchaseOrder, productID string) error {
+func validateMonthlySession(session *stripe.CheckoutSession, order monthlyOrder, productID, linkID string) error {
 	if order.plan != PlanMonthly || session.Object != "checkout.session" || session.Mode != stripe.CheckoutSessionModeSubscription ||
-		session.ClientReferenceID != order.id || !matchingOrderMetadata(session.Metadata, order.checkoutOrder) ||
+		session.PaymentLink == nil || session.PaymentLink.ID != linkID ||
 		(order.sessionID.Valid && order.sessionID.String != session.ID) ||
 		session.ManagedPayments == nil || !session.ManagedPayments.Enabled ||
 		session.LineItems == nil || session.LineItems.HasMore || len(session.LineItems.Data) != 1 {
@@ -95,18 +95,14 @@ func validateMonthlySession(session *stripe.CheckoutSession, order purchaseOrder
 	return nil
 }
 
-func matchingOrderMetadata(metadata map[string]string, order checkoutOrder) bool {
-	return metadata["order_id"] == order.id && metadata["plan"] == string(order.plan) && metadata["policy_version"] == order.policyVersion
-}
-
 func matchingMonthlyPrice(price *stripe.Price, priceID, productID string, liveMode bool) bool {
 	return price != nil && price.ID == priceID && price.Product != nil && price.Product.ID == productID &&
 		price.Product.Object == "product" && price.Product.Livemode == liveMode
 }
 
-func validateMonthlySubscription(subscription *stripe.Subscription, session *stripe.CheckoutSession, order purchaseOrder, productID string) error {
+func validateMonthlySubscription(subscription *stripe.Subscription, session *stripe.CheckoutSession, order monthlyOrder, productID string) error {
 	if subscription == nil || subscription.ID != session.Subscription.ID || subscription.Object != "subscription" ||
-		subscription.Livemode != session.Livemode || !matchingOrderMetadata(subscription.Metadata, order.checkoutOrder) ||
+		subscription.Livemode != session.Livemode ||
 		subscription.Customer == nil || subscription.Customer.ID != session.Customer.ID ||
 		subscription.Items == nil || subscription.Items.HasMore || len(subscription.Items.Data) != 1 || subscription.PauseCollection != nil {
 		return ErrInvalidSubscription
@@ -128,7 +124,7 @@ func validateMonthlySubscription(subscription *stripe.Subscription, session *str
 
 // Invoice line periods describe paid service. The Subscription's current period
 // can already describe the next, unpaid renewal and must not grant access.
-func monthlyInvoicePeriod(invoice *stripe.Invoice, subscription *stripe.Subscription, order purchaseOrder, productID string) (time.Time, error) {
+func monthlyInvoicePeriod(invoice *stripe.Invoice, subscription *stripe.Subscription, order monthlyOrder, productID string) (time.Time, error) {
 	if invoice == nil || !validStripeID(invoice.ID, "in_") || invoice.Object != "invoice" || invoice.Livemode != subscription.Livemode ||
 		invoiceSubscriptionID(invoice) != subscription.ID || invoice.Customer == nil || invoice.Customer.ID != subscription.Customer.ID ||
 		(invoice.BillingReason != stripe.InvoiceBillingReasonSubscriptionCreate && invoice.BillingReason != stripe.InvoiceBillingReasonSubscriptionCycle) ||

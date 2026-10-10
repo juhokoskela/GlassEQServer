@@ -13,7 +13,7 @@ import (
 
 var errBillingSnapshotChanged = errors.New("billing order changed during Stripe hydration")
 
-type purchaseOrder struct {
+type monthlyOrder struct {
 	checkoutOrder
 	state          string
 	licenseID      sql.NullString
@@ -25,39 +25,37 @@ type purchaseOrderReader interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-type purchaseIdentity struct{ sessionID, referenceID, metadataID, subscriptionID, paymentID string }
-
-func readPurchaseOrder(ctx context.Context, database purchaseOrderReader, identity purchaseIdentity, lock bool) (purchaseOrder, bool, error) {
+func readMonthlyOrder(ctx context.Context, database purchaseOrderReader, sessionID, subscriptionID, orderID string, lock bool) (monthlyOrder, bool, error) {
 	query := `SELECT id, plan, policy_version, stripe_price_id, stripe_checkout_session_id, created_at,
-		state, license_id, stripe_subscription_id, stripe_payment_intent_id, billing_revision FROM checkout_orders
-		WHERE stripe_checkout_session_id = $1 OR id = $2 OR id = $3 OR stripe_subscription_id = $4 OR stripe_payment_intent_id = $5 ORDER BY id`
+		state, license_id, stripe_subscription_id, billing_revision FROM checkout_orders
+		WHERE stripe_checkout_session_id = $1 OR stripe_subscription_id = $2 OR id = $3 ORDER BY id`
 	if lock {
 		query += " FOR UPDATE"
 	}
-	rows, err := database.QueryContext(ctx, query, identity.sessionID, identity.referenceID, identity.metadataID, identity.subscriptionID, identity.paymentID)
+	rows, err := database.QueryContext(ctx, query, sessionID, subscriptionID, orderID)
 	if err != nil {
-		return purchaseOrder{}, false, fmt.Errorf("read monthly order: %w", err)
+		return monthlyOrder{}, false, fmt.Errorf("read monthly order: %w", err)
 	}
 	defer rows.Close()
-	var order purchaseOrder
+	var order monthlyOrder
 	found := false
 	for rows.Next() {
 		if found {
-			return purchaseOrder{}, false, ErrInvalidSubscription
+			return monthlyOrder{}, false, ErrInvalidSubscription
 		}
 		found = true
 		if err := rows.Scan(&order.id, &order.plan, &order.policyVersion, &order.priceID, &order.sessionID, &order.createdAt,
-			&order.state, &order.licenseID, &order.subscriptionID, &order.paymentID, &order.revision); err != nil {
-			return purchaseOrder{}, false, fmt.Errorf("scan monthly order: %w", err)
+			&order.state, &order.licenseID, &order.subscriptionID, &order.revision); err != nil {
+			return monthlyOrder{}, false, fmt.Errorf("scan monthly order: %w", err)
 		}
 	}
 	return order, found, rows.Err()
 }
 
 func (p *EventProcessor) processMonthlyEvent(ctx context.Context, event billingEvent, session *stripe.CheckoutSession, now time.Time) error {
-	var sessionID, referenceID, metadataID, subscriptionID string
+	var sessionID, subscriptionID string
 	if session != nil {
-		sessionID, referenceID, metadataID = session.ID, session.ClientReferenceID, session.Metadata["order_id"]
+		sessionID = session.ID
 	} else {
 		subscriptionID = event.Data.Object.ID
 		if event.Data.Object.Object == "invoice" {
@@ -65,38 +63,54 @@ func (p *EventProcessor) processMonthlyEvent(ctx context.Context, event billingE
 			if err != nil {
 				return err
 			}
-			if invoice == nil || invoice.ID != event.Data.Object.ID || invoice.Object != "invoice" || invoice.Livemode != p.destination.LiveMode {
+			if invoice == nil || invoice.ID != event.Data.Object.ID || invoice.Object != "invoice" || invoice.Livemode != p.liveMode {
 				return ErrInvalidSubscription
 			}
 			subscriptionID = invoiceSubscriptionID(invoice)
 			if subscriptionID == "" {
-				return p.commitMonthlyEvent(ctx, event, purchaseOrder{}, nil, nil, nil, nil, now)
+				return p.commitMonthlyEvent(ctx, event, monthlyOrder{}, nil, nil, nil, nil, now)
 			}
 		}
-		// This first read resolves ownership only. A second read below supplies
-		// state after the database revision has been captured.
-		subscription, err := p.checkout.RetrieveSubscription(ctx, subscriptionID)
-		if err != nil {
-			return err
-		}
-		if subscription == nil || subscription.ID != subscriptionID || subscription.Object != "subscription" || subscription.Livemode != p.destination.LiveMode {
-			return ErrInvalidSubscription
-		}
-		metadataID = subscription.Metadata["order_id"]
 	}
-	order, found, err := readPurchaseOrder(ctx, p.database, purchaseIdentity{sessionID: sessionID, referenceID: referenceID, metadataID: metadataID, subscriptionID: subscriptionID}, false)
+	order, found, err := readMonthlyOrder(ctx, p.database, sessionID, subscriptionID, "", false)
 	if err != nil {
 		return err
 	}
+	if !found && subscriptionID != "" {
+		purchase, err := p.checkout.FindPurchaseBySubscription(ctx, subscriptionID)
+		if err != nil {
+			return err
+		}
+		if purchase != nil {
+			if purchase.Subscription == nil || purchase.Subscription.ID != subscriptionID || purchase.Livemode != p.liveMode {
+				return ErrInvalidSubscription
+			}
+			purchase, err = p.checkout.RetrievePurchase(ctx, purchase.ID)
+			if err != nil {
+				return err
+			}
+			if purchase == nil || purchase.Subscription == nil || purchase.Subscription.ID != subscriptionID || purchase.Livemode != p.liveMode {
+				return ErrInvalidSubscription
+			}
+			owned, err := p.ensurePaymentLinkOrder(ctx, purchase, now)
+			if err != nil {
+				return err
+			}
+			if owned {
+				order, found, err = readMonthlyOrder(ctx, p.database, purchase.ID, "", "", false)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if !found {
-		return p.commitMonthlyEvent(ctx, event, purchaseOrder{}, nil, nil, nil, nil, now)
+		return p.commitMonthlyEvent(ctx, event, monthlyOrder{}, nil, nil, nil, nil, now)
 	}
 	if order.plan != PlanMonthly {
 		return ErrInvalidSubscription
 	}
 	if sessionID == "" {
-		// Checkout creation attaches the Session ID, or its event recovers it
-		// through order metadata. Until then this lifecycle event must retry.
 		if !order.sessionID.Valid {
 			return errBillingSnapshotChanged
 		}
@@ -108,10 +122,10 @@ func (p *EventProcessor) processMonthlyEvent(ctx context.Context, event billingE
 	if err != nil {
 		return err
 	}
-	if session == nil || session.ID != sessionID || session.Livemode != p.destination.LiveMode {
+	if session == nil || session.ID != sessionID || session.Livemode != p.liveMode {
 		return ErrInvalidSubscription
 	}
-	if err := validateMonthlySession(session, order, p.products.Monthly); err != nil {
+	if err := validateMonthlySession(session, order, p.products.Monthly, p.products.MonthlyLinkID); err != nil {
 		return err
 	}
 	if session.Status != stripe.CheckoutSessionStatusComplete {
@@ -182,7 +196,7 @@ func (p *EventProcessor) processMonthlyEvent(ctx context.Context, event billingE
 	return p.commitMonthlyEvent(ctx, event, order, session, subscription, initial, latest, now)
 }
 
-func (p *EventProcessor) commitMonthlyEvent(ctx context.Context, event billingEvent, snapshot purchaseOrder, session *stripe.CheckoutSession,
+func (p *EventProcessor) commitMonthlyEvent(ctx context.Context, event billingEvent, snapshot monthlyOrder, session *stripe.CheckoutSession,
 	subscription *stripe.Subscription, initial, latest *stripe.Invoice, now time.Time) error {
 	tx, err := p.database.BeginTx(ctx, nil)
 	if err != nil {
@@ -195,14 +209,14 @@ func (p *EventProcessor) commitMonthlyEvent(ctx context.Context, event billingEv
 	}
 	outcome := "ignored_unowned"
 	if snapshot.id != "" {
-		order, found, err := readPurchaseOrder(ctx, tx, purchaseIdentity{referenceID: snapshot.id}, true)
+		order, found, err := readMonthlyOrder(ctx, tx, "", "", snapshot.id, true)
 		if err != nil {
 			return err
 		}
 		if !found || order.revision != snapshot.revision {
 			return errBillingSnapshotChanged
 		}
-		if err := validateMonthlySession(session, order, p.products.Monthly); err != nil {
+		if err := validateMonthlySession(session, order, p.products.Monthly, p.products.MonthlyLinkID); err != nil {
 			return err
 		}
 		outcome, err = p.applyMonthlyPurchase(ctx, tx, event, order, session, subscription, initial, latest, now)
@@ -222,7 +236,7 @@ func (p *EventProcessor) commitMonthlyEvent(ctx context.Context, event billingEv
 	return nil
 }
 
-func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, event billingEvent, order purchaseOrder, session *stripe.CheckoutSession,
+func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, event billingEvent, order monthlyOrder, session *stripe.CheckoutSession,
 	subscription *stripe.Subscription, initial, latest *stripe.Invoice, now time.Time) (string, error) {
 	blocked, err := billingRestriction(ctx, tx, order.id)
 	if err != nil {
@@ -282,8 +296,21 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 		if err != nil {
 			return "", err
 		}
-		if err := p.issueMonthlyPurchase(ctx, tx, order, session, next, event.ID, now); err != nil {
+		licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
+			Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID,
+			SubscriptionID: subscription.ID, Email: session.CustomerDetails.Email,
+		}, now)
+		if err != nil {
 			return "", err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO subscriptions (license_id, state, billing_period_end, recovery_until,
+			last_paid_invoice_id, last_stripe_event_id, last_reconciled_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
+			licenseID, next.state, next.periodEnd, next.recoveryUntil, next.lastPaidInvoice, event.ID, now); err != nil {
+			return "", fmt.Errorf("create subscription: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
+			stripe_checkout_session_id = $4, stripe_subscription_id = $5 WHERE id = $1`, order.id, licenseID, now, session.ID, subscription.ID); err != nil {
+			return "", fmt.Errorf("fulfill monthly order: %w", err)
 		}
 		return "fulfilled", nil
 	}
@@ -304,24 +331,4 @@ func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, e
 		return "", fmt.Errorf("record unpaid monthly order: %w", err)
 	}
 	return outcome, nil
-}
-
-func (p *EventProcessor) issueMonthlyPurchase(ctx context.Context, tx *sql.Tx, order purchaseOrder, session *stripe.CheckoutSession, next subscriptionProjection, eventID string, now time.Time) error {
-	licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
-		Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID,
-		SubscriptionID: session.Subscription.ID, Email: session.CustomerDetails.Email,
-	}, now)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO subscriptions (license_id, state, billing_period_end, recovery_until,
-		last_paid_invoice_id, last_stripe_event_id, last_reconciled_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)`,
-		licenseID, next.state, next.periodEnd, next.recoveryUntil, next.lastPaidInvoice, eventID, now); err != nil {
-		return fmt.Errorf("create subscription: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET state = 'fulfilled', license_id = $2, fulfilled_at = $3,
-		stripe_checkout_session_id = $4, stripe_subscription_id = $5 WHERE id = $1`, order.id, licenseID, now, session.ID, session.Subscription.ID); err != nil {
-		return fmt.Errorf("fulfill monthly order: %w", err)
-	}
-	return nil
 }

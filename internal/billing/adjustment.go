@@ -2,10 +2,42 @@ package billing
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/stripe/stripe-go/v86"
 )
+
+type purchaseOrder = monthlyOrder
+
+type purchaseIdentity struct{ sessionID, referenceID, metadataID, subscriptionID, paymentID string }
+
+func readPurchaseOrder(ctx context.Context, database purchaseOrderReader, identity purchaseIdentity, lock bool) (purchaseOrder, bool, error) {
+	query := `SELECT id, plan, policy_version, stripe_price_id, stripe_checkout_session_id, created_at,
+		state, license_id, stripe_subscription_id, stripe_payment_intent_id, billing_revision FROM checkout_orders
+		WHERE stripe_checkout_session_id = $1 OR id = $2 OR id = $3 OR stripe_subscription_id = $4 OR stripe_payment_intent_id = $5 ORDER BY id`
+	if lock {
+		query += " FOR UPDATE"
+	}
+	rows, err := database.QueryContext(ctx, query, identity.sessionID, identity.referenceID, identity.metadataID, identity.subscriptionID, identity.paymentID)
+	if err != nil {
+		return purchaseOrder{}, false, fmt.Errorf("read adjustment order: %w", err)
+	}
+	defer rows.Close()
+	var order purchaseOrder
+	found := false
+	for rows.Next() {
+		if found {
+			return purchaseOrder{}, false, ErrInvalidAdjustment
+		}
+		found = true
+		if err := rows.Scan(&order.id, &order.plan, &order.policyVersion, &order.priceID, &order.sessionID, &order.createdAt,
+			&order.state, &order.licenseID, &order.subscriptionID, &order.paymentID, &order.revision); err != nil {
+			return purchaseOrder{}, false, fmt.Errorf("scan adjustment order: %w", err)
+		}
+	}
+	return order, found, rows.Err()
+}
 
 type billingAdjustment struct {
 	id, kind, state, chargeID string
@@ -53,7 +85,7 @@ func (p *EventProcessor) retrieveAdjustment(ctx context.Context, event billingEv
 		if err != nil {
 			return a, err
 		}
-		if dispute == nil || dispute.ID != a.id || dispute.Object != "dispute" || dispute.Livemode != p.destination.LiveMode || dispute.Charge == nil {
+		if dispute == nil || dispute.ID != a.id || dispute.Object != "dispute" || dispute.Livemode != p.liveMode || dispute.Charge == nil {
 			return a, ErrInvalidAdjustment
 		}
 		a.chargeID, created, amount, currency = dispute.Charge.ID, dispute.Created, dispute.Amount, dispute.Currency
@@ -78,7 +110,7 @@ func (p *EventProcessor) retrieveAdjustment(ctx context.Context, event billingEv
 	if err != nil {
 		return a, err
 	}
-	if charge == nil || charge.ID != a.chargeID || charge.Object != "charge" || charge.Livemode != p.destination.LiveMode || charge.Amount <= 0 || charge.Currency != currency ||
+	if charge == nil || charge.ID != a.chargeID || charge.Object != "charge" || charge.Livemode != p.liveMode || charge.Amount <= 0 || charge.Currency != currency ||
 		(paymentID != "" && (charge.PaymentIntent == nil || charge.PaymentIntent.ID != paymentID)) {
 		return a, ErrInvalidAdjustment
 	}
@@ -105,10 +137,10 @@ func (p *EventProcessor) adjustmentIdentity(ctx context.Context, a billingAdjust
 	if intent == nil {
 		return identity, nil, nil, nil
 	}
-	if !validStripeID(intent.ID, "pi_") || intent.Object != "payment_intent" || intent.Livemode != p.destination.LiveMode {
+	if !validStripeID(intent.ID, "pi_") || intent.Object != "payment_intent" || intent.Livemode != p.liveMode {
 		return identity, nil, nil, ErrInvalidAdjustment
 	}
-	identity.paymentID, identity.referenceID = intent.ID, intent.Metadata["order_id"]
+	identity.paymentID = intent.ID
 	payment, err := p.adjustments.FindInvoicePayment(ctx, intent.ID)
 	if err != nil {
 		return identity, nil, nil, err
@@ -116,7 +148,7 @@ func (p *EventProcessor) adjustmentIdentity(ctx context.Context, a billingAdjust
 	if payment == nil {
 		return identity, nil, nil, nil
 	}
-	if payment.Invoice == nil || !validStripeID(payment.Invoice.ID, "in_") || payment.Object != "invoice_payment" || payment.Livemode != p.destination.LiveMode ||
+	if payment.Invoice == nil || !validStripeID(payment.Invoice.ID, "in_") || payment.Object != "invoice_payment" || payment.Livemode != p.liveMode ||
 		payment.Status != "paid" || payment.Payment == nil || payment.Payment.Type != stripe.InvoicePaymentPaymentTypePaymentIntent || payment.Payment.PaymentIntent == nil || payment.Payment.PaymentIntent.ID != intent.ID {
 		return identity, nil, nil, ErrInvalidAdjustment
 	}
@@ -124,7 +156,7 @@ func (p *EventProcessor) adjustmentIdentity(ctx context.Context, a billingAdjust
 	if err != nil {
 		return identity, nil, nil, err
 	}
-	if invoice == nil || invoice.ID != payment.Invoice.ID || invoice.Object != "invoice" || invoice.Livemode != p.destination.LiveMode ||
+	if invoice == nil || invoice.ID != payment.Invoice.ID || invoice.Object != "invoice" || invoice.Livemode != p.liveMode ||
 		invoice.Status != stripe.InvoiceStatusPaid || invoice.AmountPaid != a.charge.Amount || payment.AmountPaid != invoice.AmountPaid ||
 		invoice.Currency != a.charge.Currency || payment.Currency != invoice.Currency {
 		return identity, nil, nil, ErrInvalidAdjustment
@@ -137,10 +169,9 @@ func (p *EventProcessor) adjustmentIdentity(ctx context.Context, a billingAdjust
 	if err != nil {
 		return identity, nil, nil, err
 	}
-	if subscription == nil || subscription.ID != identity.subscriptionID || subscription.Object != "subscription" || subscription.Livemode != p.destination.LiveMode {
+	if subscription == nil || subscription.ID != identity.subscriptionID || subscription.Object != "subscription" || subscription.Livemode != p.liveMode {
 		return identity, nil, nil, ErrInvalidAdjustment
 	}
-	identity.metadataID = subscription.Metadata["order_id"]
 	return identity, invoice, subscription, nil
 }
 
@@ -174,7 +205,7 @@ func (p *EventProcessor) hydrateAdjustment(ctx context.Context, event billingEve
 		return view, err
 	}
 	session := view.session
-	if session == nil || session.Object != "checkout.session" || session.Livemode != p.destination.LiveMode || session.Status != stripe.CheckoutSessionStatusComplete ||
+	if session == nil || session.Object != "checkout.session" || session.Livemode != p.liveMode || session.Status != stripe.CheckoutSessionStatusComplete ||
 		session.Customer == nil || session.Customer.ID != a.charge.Customer.ID {
 		return view, ErrInvalidAdjustment
 	}
@@ -183,7 +214,7 @@ func (p *EventProcessor) hydrateAdjustment(ctx context.Context, event billingEve
 			session.PaymentIntent.LatestCharge == nil || session.PaymentIntent.LatestCharge.ID != a.chargeID {
 			return view, ErrInvalidAdjustment
 		}
-		if err := validatePerpetualPayment(session, order.checkoutOrder, p.products.PerpetualV1); err != nil {
+		if err := validatePerpetualPayment(session, order.checkoutOrder, p.products.PerpetualV1, p.products.PerpetualLinkID); err != nil {
 			return view, err
 		}
 		if session.PaymentStatus != stripe.CheckoutSessionPaymentStatusPaid {
@@ -193,7 +224,7 @@ func (p *EventProcessor) hydrateAdjustment(ctx context.Context, event billingEve
 		if invoice == nil || subscription == nil {
 			return view, ErrInvalidAdjustment
 		}
-		if err := validateMonthlySession(session, order, p.products.Monthly); err != nil {
+		if err := validateMonthlySession(session, order, p.products.Monthly, p.products.MonthlyLinkID); err != nil {
 			return view, err
 		}
 		if err := validateMonthlySubscription(subscription, session, order, p.products.Monthly); err != nil {

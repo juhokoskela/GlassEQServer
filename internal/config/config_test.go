@@ -38,11 +38,21 @@ func TestLoad(t *testing.T) {
 	if len(got.DatabaseEncryptionKey) != 32 {
 		t.Errorf("database encryption key length = %d", len(got.DatabaseEncryptionKey))
 	}
-	if got.RecoveryQueueURL != values["GLASSEQ_RECOVERY_QUEUE_URL"] {
-		t.Errorf("recovery queue URL = %q", got.RecoveryQueueURL)
+	if got.EmailFrom != values["GLASSEQ_EMAIL_FROM"] {
+		t.Errorf("email sender = %q", got.EmailFrom)
 	}
 	if got.Stripe != nil {
 		t.Error("Stripe configuration was enabled without Stripe variables")
+	}
+}
+
+func TestLoadRejectsInvalidEmailSender(t *testing.T) {
+	values := validValues()
+	for _, sender := range []string{"", "GlassEQ <licenses@glasseq.app>", "not-an-address"} {
+		values["GLASSEQ_EMAIL_FROM"] = sender
+		if _, err := load(mapLookup(values)); err == nil {
+			t.Errorf("accepted email sender %q", sender)
+		}
 	}
 }
 
@@ -73,6 +83,8 @@ func TestLoadStripeCatalog(t *testing.T) {
 		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID":     "price_monthly",
 		"GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID": "prod_perpetual",
 		"GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID":   "prod_monthly",
+		"GLASSEQ_STRIPE_PERPETUAL_LINK_ID":    "plink_perpetual",
+		"GLASSEQ_STRIPE_MONTHLY_LINK_ID":      "plink_monthly",
 	}
 
 	got, err := loadStripeCatalog(mapLookup(values))
@@ -83,7 +95,9 @@ func TestLoadStripeCatalog(t *testing.T) {
 		got.PerpetualPriceID != values["GLASSEQ_STRIPE_PERPETUAL_PRICE_ID"] ||
 		got.MonthlyPriceID != values["GLASSEQ_STRIPE_MONTHLY_PRICE_ID"] ||
 		got.PerpetualProductID != values["GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID"] ||
-		got.MonthlyProductID != values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] {
+		got.MonthlyProductID != values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] ||
+		got.PerpetualLinkID != values["GLASSEQ_STRIPE_PERPETUAL_LINK_ID"] ||
+		got.MonthlyLinkID != values["GLASSEQ_STRIPE_MONTHLY_LINK_ID"] {
 		t.Errorf("Stripe catalog configuration = %+v", got)
 	}
 }
@@ -206,7 +220,7 @@ func validValues() map[string]string {
 		"GLASSEQ_RATE_LIMIT_HMAC_KEY":        testSecretKey(2),
 		"GLASSEQ_EMAIL_LOOKUP_HMAC_KEY":      testSecretKey(3),
 		"GLASSEQ_DATABASE_ENCRYPTION_KEY":    testSecretKey(4),
-		"GLASSEQ_RECOVERY_QUEUE_URL":         "https://sqs.eu-north-1.amazonaws.com/123456789012/recovery.fifo",
+		"GLASSEQ_EMAIL_FROM":                 "licenses@glasseq.app",
 	}
 }
 

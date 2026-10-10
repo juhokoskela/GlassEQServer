@@ -4,7 +4,7 @@
 -- ordinary fulfillment/reconciliation until the external outcome is confirmed.
 CREATE TABLE billing_adjustments (
     stripe_object_id text PRIMARY KEY,
-    order_id text NOT NULL REFERENCES checkout_orders (id) ON DELETE CASCADE,
+    order_id text NOT NULL REFERENCES checkout_orders (id),
     kind text NOT NULL CHECK (kind IN ('refund', 'dispute')),
     stripe_charge_id text NOT NULL,
     state text NOT NULL CHECK (state IN ('blocking', 'resolved')),
