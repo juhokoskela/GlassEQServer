@@ -125,7 +125,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("create Stripe client: %w", err)
 		}
-		eventProcessor, err = billing.NewEventProcessor(database, checkoutClient, activationService,
+		eventProcessor, err = billing.NewEventProcessor(database, checkoutClient, checkoutClient, activationService,
 			checkoutClient.LiveMode(),
 			billing.BillingCatalog{
 				PerpetualV1: settings.Billing.PerpetualProductID, Monthly: settings.Billing.MonthlyProductID,
@@ -168,10 +168,35 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	background.Go(func() { runActivationCleanup(backgroundCtx, activationService, logger) })
 	background.Go(func() { runRecoveryEmailDispatch(backgroundCtx, activationService, logger) })
 	background.Go(func() { runLicenseEmailDispatch(backgroundCtx, activationService, logger) })
+	if eventProcessor != nil {
+		background.Go(func() { runAdjustmentRepair(backgroundCtx, eventProcessor, logger) })
+	}
 	serveErr := serve(ctx, server, listener)
 	stopBackground()
 	background.Wait()
 	return serveErr
+}
+
+func runAdjustmentRepair(ctx context.Context, processor *billing.EventProcessor, logger *slog.Logger) {
+	const interval = time.Minute
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		repairCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		worked, err := processor.RepairPendingAdjustment(repairCtx, time.Now())
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			logger.WarnContext(ctx, "billing adjustment repair failed", "error", err)
+		}
+		if err == nil && worked {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 type activationCleaner interface {

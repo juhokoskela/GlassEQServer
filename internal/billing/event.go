@@ -51,16 +51,17 @@ type checkoutOrderQuerier interface {
 }
 
 type EventProcessor struct {
-	database *sql.DB
-	checkout purchaseRetriever
-	licenses purchasedLicenseIssuer
-	liveMode bool
-	products BillingCatalog
-	now      func() time.Time
+	database    *sql.DB
+	checkout    purchaseRetriever
+	adjustments adjustmentClient
+	licenses    purchasedLicenseIssuer
+	liveMode    bool
+	products    BillingCatalog
+	now         func() time.Time
 }
 
-func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses purchasedLicenseIssuer, liveMode bool, products BillingCatalog) (*EventProcessor, error) {
-	if database == nil || checkout == nil || licenses == nil {
+func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, adjustments adjustmentClient, licenses purchasedLicenseIssuer, liveMode bool, products BillingCatalog) (*EventProcessor, error) {
+	if database == nil || checkout == nil || adjustments == nil || licenses == nil {
 		return nil, errors.New("billing event database, Checkout client, and license issuer are required")
 	}
 	if !validProductID(products.PerpetualV1) || !validProductID(products.Monthly) ||
@@ -68,7 +69,7 @@ func NewEventProcessor(database *sql.DB, checkout purchaseRetriever, licenses pu
 		!validStripeID(products.PerpetualLinkID, "plink_") || !validStripeID(products.MonthlyLinkID, "plink_") {
 		return nil, errors.New("Stripe product, price, and payment link IDs are required for fulfillment")
 	}
-	return &EventProcessor{database: database, checkout: checkout, licenses: licenses,
+	return &EventProcessor{database: database, checkout: checkout, adjustments: adjustments, licenses: licenses,
 		liveMode: liveMode, products: products, now: time.Now}, nil
 }
 
@@ -109,6 +110,10 @@ func decodeBillingEvent(body []byte, liveMode bool, now time.Time) (billingEvent
 		prefix, object = "in_", "invoice"
 	case "customer.subscription.updated", "customer.subscription.deleted":
 		prefix, object = "sub_", "subscription"
+	case "refund.created", "refund.updated", "refund.failed":
+		prefix, object = "re_", "refund"
+	case "charge.dispute.created", "charge.dispute.updated", "charge.dispute.funds_withdrawn", "charge.dispute.closed":
+		prefix, object = "du_", "dispute"
 	default:
 		return billingEvent{}, ErrInvalidBillingEvent
 	}
@@ -135,6 +140,9 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	processed, err := matchingBillingEvent(ctx, p.database, event, false)
 	if err != nil || processed {
 		return err
+	}
+	if event.Data.Object.Object == "refund" || event.Data.Object.Object == "dispute" {
+		return p.processAdjustment(ctx, event, now)
 	}
 	if event.Data.Object.Object != "checkout.session" {
 		return p.processMonthlyEvent(ctx, event, nil, now)
@@ -172,11 +180,17 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	}
 	outcome := "ignored_unowned"
 	if found {
-		if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1, p.products.PerpetualLinkID); err != nil {
+		blocked, err := billingRestriction(ctx, tx, order.id)
+		if err != nil {
 			return err
 		}
 		outcome = "no_change"
-		if state != "fulfilled" {
+		if !blocked {
+			if err := validatePerpetualPurchase(session, order, p.products.PerpetualV1, p.products.PerpetualLinkID); err != nil {
+				return err
+			}
+		}
+		if !blocked && state != "fulfilled" {
 			if session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid {
 				licenseID, err := p.licenses.IssuePurchasedLicense(ctx, tx, activation.PurchasedLicense{
 					Plan: string(order.plan), PolicyVersion: order.policyVersion, CustomerID: session.Customer.ID, Email: session.CustomerDetails.Email,
@@ -209,6 +223,9 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 					}
 				}
 			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE checkout_orders SET billing_revision = billing_revision + 1 WHERE id = $1`, order.id); err != nil {
+			return fmt.Errorf("advance billing revision: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE stripe_events SET processed_at = $2, outcome = $3

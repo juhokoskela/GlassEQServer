@@ -227,7 +227,7 @@ func purchaseFixture(t *testing.T) (*EventProcessor, *activation.Service, *fakeP
 		t.Fatal(err)
 	}
 	checkout := &fakePurchaseRetriever{session: paidPurchase()}
-	processor, err := NewEventProcessor(database, checkout, licenses, testLiveMode, BillingCatalog{
+	processor, err := NewEventProcessor(database, checkout, unsupportedAdjustments{}, licenses, testLiveMode, BillingCatalog{
 		PerpetualV1: "prod_perpetual", Monthly: "prod_monthly", PerpetualPriceID: "price_perpetual", MonthlyPriceID: "price_monthly",
 		PerpetualLinkID: "plink_perpetual", MonthlyLinkID: "plink_monthly",
 	})
@@ -239,6 +239,7 @@ func purchaseFixture(t *testing.T) (*EventProcessor, *activation.Service, *fakeP
 }
 
 type fakePurchaseRetriever struct {
+	unsupportedAdjustments
 	session  *stripe.CheckoutSession
 	database *sql.DB
 	err      error

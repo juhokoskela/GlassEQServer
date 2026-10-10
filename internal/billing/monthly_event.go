@@ -238,6 +238,13 @@ func (p *EventProcessor) commitMonthlyEvent(ctx context.Context, event billingEv
 
 func (p *EventProcessor) applyMonthlyPurchase(ctx context.Context, tx *sql.Tx, event billingEvent, order monthlyOrder, session *stripe.CheckoutSession,
 	subscription *stripe.Subscription, initial, latest *stripe.Invoice, now time.Time) (string, error) {
+	blocked, err := billingRestriction(ctx, tx, order.id)
+	if err != nil {
+		return "", err
+	}
+	if blocked {
+		return "no_change", nil
+	}
 	if order.licenseID.Valid {
 		var licenseState, customerID, subscriptionID string
 		if err := tx.QueryRowContext(ctx, `SELECT state, stripe_customer_id, stripe_subscription_id FROM licenses WHERE id = $1 FOR UPDATE`, order.licenseID.String).

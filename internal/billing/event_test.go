@@ -28,6 +28,12 @@ func eventBody(t testing.TB, id, eventType string) []byte {
 	if strings.HasPrefix(eventType, "customer.subscription.") {
 		objectID, object = "sub_purchase", "subscription"
 	}
+	if strings.HasPrefix(eventType, "refund.") {
+		objectID, object = "re_purchase", "refund"
+	}
+	if strings.HasPrefix(eventType, "charge.dispute.") {
+		objectID, object = "du_purchase", "dispute"
+	}
 	body := map[string]any{
 		"id": id, "object": "event", "api_version": StripeAPIVersion,
 		"type": eventType, "livemode": false, "created": testCheckoutNow.Unix(),
@@ -112,7 +118,6 @@ func TestPerpetualPurchaseValidation(t *testing.T) {
 		},
 		"not complete":             func(s *stripe.CheckoutSession) { s.Status = stripe.CheckoutSessionStatusOpen },
 		"refunded":                 func(s *stripe.CheckoutSession) { s.PaymentIntent.LatestCharge.Refunded = true },
-		"disputed":                 func(s *stripe.CheckoutSession) { s.PaymentIntent.LatestCharge.Disputed = true },
 		"wrong intent mode":        func(s *stripe.CheckoutSession) { s.PaymentIntent.Livemode = true },
 		"missing intent expansion": func(s *stripe.CheckoutSession) { s.PaymentIntent.Object = "" },
 	} {
@@ -125,6 +130,11 @@ func TestPerpetualPurchaseValidation(t *testing.T) {
 		})
 	}
 	session := paidPurchase()
+	session.PaymentIntent.LatestCharge.Disputed = true
+	if err := validatePerpetualPurchase(session, order, "prod_perpetual", "plink_perpetual"); err != nil {
+		t.Fatalf("inquiry before fulfillment rejected: %v", err)
+	}
+	session = paidPurchase()
 	session.Currency = stripe.CurrencyUSD
 	if err := validatePerpetualPurchase(session, order, "prod_perpetual", "plink_perpetual"); err != nil {
 		t.Fatalf("local currency purchase rejected: %v", err)
