@@ -216,7 +216,7 @@ func runEmailDispatch(ctx context.Context, dispatch func(context.Context, time.T
 	for {
 		worked, err := dispatch(ctx, time.Now())
 		if err != nil && ctx.Err() == nil {
-			logger.WarnContext(ctx, failureMessage)
+			logger.WarnContext(ctx, failureMessage, "error", err)
 		}
 		if err == nil && worked {
 			continue

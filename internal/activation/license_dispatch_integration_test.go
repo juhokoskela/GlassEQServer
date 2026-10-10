@@ -12,6 +12,7 @@ type recordingLicenseEmailSender struct {
 	message LicenseEmail
 	calls   int
 	err     error
+	onSend  func()
 }
 
 func (*recordingLicenseEmailSender) SendRecoveryEmail(context.Context, RecoveryEmail) error {
@@ -21,6 +22,9 @@ func (*recordingLicenseEmailSender) SendRecoveryEmail(context.Context, RecoveryE
 func (s *recordingLicenseEmailSender) SendLicenseEmail(_ context.Context, message LicenseEmail) error {
 	s.calls++
 	s.message = message
+	if s.onSend != nil {
+		s.onSend()
+	}
 	return s.err
 }
 
@@ -51,8 +55,13 @@ func TestPurchasedLicenseEmailDispatchWithPostgreSQL(t *testing.T) {
 		t.Fatalf("failed delivery lost outbox: count=%d error=%v", pending, err)
 	}
 	sender.err = nil
-	if worked, err := service.DispatchLicenseEmail(context.Background(), now.Add(time.Minute)); err != nil || !worked {
+	ctx, cancel := context.WithCancel(context.Background())
+	sender.onSend = cancel
+	if worked, err := service.DispatchLicenseEmail(ctx, now.Add(time.Minute)); err != nil || !worked {
 		t.Fatalf("retry delivery: worked=%t error=%v", worked, err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("sender did not cancel dispatch context after SES acceptance")
 	}
 	if sender.calls != 2 || sender.message.Email != "buyer@example.com" || sender.message.LicenseKey == "" {
 		t.Fatalf("delivered email: calls=%d email=%q key present=%t", sender.calls, sender.message.Email, sender.message.LicenseKey != "")
