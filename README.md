@@ -2,7 +2,7 @@
 
 GlassEQ Server issues signed entitlements and controls access to official GlassEQ downloads. It does not process audio, profiles, device data, or diagnostics.
 
-The project is under active development. The service exposes liveness, database readiness, license activation, entitlement refresh, license management, and email recovery. When Stripe is configured, a signed webhook fulfills purchases from the two configured Payment Links and reconciles monthly renewals, payment recovery, cancellation, refunds, and disputes. GlassEQ sends license keys and recovery tokens through Amazon SES; Stripe sends receipts and billing emails. Daily billing reconciliation, billing retention, and download endpoints are not implemented. The billing contract and rollout gaps are documented in [Docs/Billing.md](Docs/Billing.md).
+The project is under active development. The service exposes liveness, database readiness, license activation, entitlement refresh, license management, and email recovery. When Stripe is configured, a signed webhook fulfills purchases from the two configured Payment Links and reconciles monthly renewals, payment recovery, cancellation, refunds, and disputes. A daily Payment Link scan recovers missed paid Sessions and refreshes monthly subscriptions. GlassEQ sends license keys and recovery tokens through Amazon SES; Stripe sends receipts and billing emails. Billing retention and download endpoints are not implemented. The billing contract and rollout gaps are documented in [Docs/Billing.md](Docs/Billing.md).
 
 ## Trust boundaries
 
@@ -95,7 +95,7 @@ Monthly events retrieve the current Checkout, Subscription, and relevant Invoice
 
 Duplicate and concurrent webhook events are safe to retry. Invalid owned purchases return a retryable response and require investigation. Valid events for unowned objects are recorded as `ignored_unowned`. A full successful refund or formal dispute restricts the affected license after confirming that a monthly subscription can no longer bill. Persisted adjustment intents are retried by a background worker after webhook delivery stops.
 
-Apply migrations before enabling the webhook. Keep production purchases disabled until daily reconciliation, retention, and the documented rollout checks are complete. SES acceptance and sender verification remain deployment checks.
+Apply migrations before enabling the webhook. Keep production purchases disabled until reconciliation is exercised against the intended Stripe environment, billing retention and failure alerting are in place, and the documented rollout checks are complete. SES acceptance and sender verification remain deployment checks.
 
 The KMS key must have key spec `ECC_NIST_EDWARDS25519`, usage `SIGN_VERIFY`, and signing algorithm `ED25519_SHA_512`. The runtime AWS identity needs only `kms:GetPublicKey` and `kms:Sign` for that key.
 

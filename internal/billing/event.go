@@ -131,6 +131,10 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 	if err != nil {
 		return err
 	}
+	return p.processEvent(ctx, event, now)
+}
+
+func (p *EventProcessor) processEvent(ctx context.Context, event billingEvent, now time.Time) error {
 	if _, err := p.database.ExecContext(ctx, `
 		INSERT INTO stripe_events (stripe_event_id, event_type, object_id, stripe_created_at)
 		VALUES ($1, $2, $3, $4) ON CONFLICT (stripe_event_id) DO NOTHING`,
