@@ -18,6 +18,7 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -33,7 +34,7 @@ const (
 	shutdownTimeout           = 10 * time.Second
 	activationCleanupTimeout  = 5 * time.Second
 	activationCleanupInterval = time.Minute
-	recoveryDispatchInterval  = time.Second
+	emailDispatchInterval     = time.Second
 )
 
 func main() {
@@ -106,16 +107,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := database.PingContext(startupCtx); err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
-	recoveryEmails, err := activation.NewSQSRecoveryEmailQueue(sqs.NewFromConfig(awsSettings), settings.RecoveryQueueURL)
+	emails, err := activation.NewSESEmailSender(sesv2.NewFromConfig(awsSettings), settings.EmailFrom)
 	if err != nil {
-		return fmt.Errorf("create recovery email queue: %w", err)
+		return fmt.Errorf("create email sender: %w", err)
 	}
 	activationService, err := activation.NewService(database, issuer, activation.Secrets{
 		IdempotencyKey:        settings.IdempotencyKey,
 		RateLimitHMACKey:      settings.RateLimitHMACKey,
 		EmailLookupHMACKey:    settings.EmailLookupHMACKey,
 		DatabaseEncryptionKey: settings.DatabaseEncryptionKey,
-	}, recoveryEmails)
+	}, emails)
 	if err != nil {
 		return fmt.Errorf("create activation service: %w", err)
 	}
@@ -177,6 +178,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	var background sync.WaitGroup
 	background.Go(func() { runActivationCleanup(backgroundCtx, activationService, logger) })
 	background.Go(func() { runRecoveryEmailDispatch(backgroundCtx, activationService, logger) })
+	background.Go(func() {
+		runEmailDispatch(backgroundCtx, activationService.DispatchLicenseEmail, "license email dispatch failed", logger)
+	})
 	if eventProcessor != nil {
 		background.Go(func() {
 			queue := sqs.NewFromConfig(awsSettings, func(options *sqs.Options) { options.Region = "eu-north-1" })
@@ -216,16 +220,20 @@ type recoveryEmailDispatcher interface {
 }
 
 func runRecoveryEmailDispatch(ctx context.Context, dispatcher recoveryEmailDispatcher, logger *slog.Logger) {
+	runEmailDispatch(ctx, dispatcher.DispatchRecoveryEmail, "recovery email dispatch failed", logger)
+}
+
+func runEmailDispatch(ctx context.Context, dispatch func(context.Context, time.Time) (bool, error), failureMessage string, logger *slog.Logger) {
 	for {
-		worked, err := dispatcher.DispatchRecoveryEmail(ctx, time.Now())
+		worked, err := dispatch(ctx, time.Now())
 		if err != nil && ctx.Err() == nil {
-			logger.WarnContext(ctx, "recovery email dispatch failed", "error", err)
+			logger.WarnContext(ctx, failureMessage, "error", err)
 		}
 		if err == nil && worked {
 			continue
 		}
 
-		timer := time.NewTimer(recoveryDispatchInterval)
+		timer := time.NewTimer(emailDispatchInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

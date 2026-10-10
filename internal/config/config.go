@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/mail"
 	"net/url"
 	"os"
 	"strings"
@@ -22,7 +23,7 @@ type Config struct {
 	RateLimitHMACKey        []byte
 	EmailLookupHMACKey      []byte
 	DatabaseEncryptionKey   []byte
-	RecoveryQueueURL        string
+	EmailFrom               string
 	Stripe                  *StripeConfig
 	Billing                 *BillingConfig
 }
@@ -84,9 +85,13 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	recoveryQueueURL, err := required(lookup, "GLASSEQ_RECOVERY_QUEUE_URL")
+	emailFrom, err := required(lookup, "GLASSEQ_EMAIL_FROM")
 	if err != nil {
 		return Config{}, err
+	}
+	parsedFrom, err := mail.ParseAddress(emailFrom)
+	if err != nil || parsedFrom.Address != emailFrom {
+		return Config{}, errors.New("GLASSEQ_EMAIL_FROM must be an email address without a display name")
 	}
 	stripeConfig, err := loadStripe(lookup)
 	if err != nil {
@@ -106,7 +111,7 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		RateLimitHMACKey:        rateLimitHMACKey,
 		EmailLookupHMACKey:      emailLookupHMACKey,
 		DatabaseEncryptionKey:   databaseEncryptionKey,
-		RecoveryQueueURL:        recoveryQueueURL,
+		EmailFrom:               emailFrom,
 		Stripe:                  stripeConfig,
 		Billing:                 billingConfig,
 	}, nil

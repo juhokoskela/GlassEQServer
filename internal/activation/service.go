@@ -44,7 +44,7 @@ type Service struct {
 	issuer             entitlementIssuer
 	responses          *secretCipher
 	databaseValues     *secretCipher
-	recoveryEmails     RecoveryEmailQueue
+	emails             EmailSender
 	rateLimitHMACKey   []byte
 	emailLookupHMACKey []byte
 	random             io.Reader
@@ -73,15 +73,15 @@ type Response struct {
 	RetryAfterSeconds int
 }
 
-func NewService(database *sql.DB, issuer entitlementIssuer, secrets Secrets, recoveryEmails RecoveryEmailQueue) (*Service, error) {
+func NewService(database *sql.DB, issuer entitlementIssuer, secrets Secrets, emails EmailSender) (*Service, error) {
 	if database == nil {
 		return nil, errors.New("activation database is required")
 	}
 	if issuer == nil {
 		return nil, errors.New("entitlement issuer is required")
 	}
-	if recoveryEmails == nil {
-		return nil, errors.New("recovery email queue is required")
+	if emails == nil {
+		return nil, errors.New("email sender is required")
 	}
 	responses, err := newSecretCipher(secrets.IdempotencyKey, rand.Reader)
 	if err != nil {
@@ -102,7 +102,7 @@ func NewService(database *sql.DB, issuer entitlementIssuer, secrets Secrets, rec
 		issuer:             issuer,
 		responses:          responses,
 		databaseValues:     databaseValues,
-		recoveryEmails:     recoveryEmails,
+		emails:             emails,
 		rateLimitHMACKey:   append([]byte(nil), secrets.RateLimitHMACKey...),
 		emailLookupHMACKey: append([]byte(nil), secrets.EmailLookupHMACKey...),
 		random:             rand.Reader,

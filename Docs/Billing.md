@@ -12,7 +12,7 @@ The optional worker implements bounded EventBridge validation, current Stripe hy
 
 Both purchase paths go directly to `fulfilled` in the transaction that records the processed event and creates the license and outbox. They leave no committed `paid` gap: transaction failure retries through SQS. The paid-order sweep below applies to any future path that persists an intermediate `paid` state. Dead-letter redrive and daily reconciliation remain necessary operational repair paths.
 
-Refund/dispute processing, daily reconciliation, billing retention, and email dispatch/consumption remain planned. Production purchases remain disabled until these and the rollout checks are complete. The remaining sections describe the complete target contract unless explicitly identified as implemented.
+Refund/dispute processing, daily reconciliation, and billing retention remain planned. Direct SES delivery for license keys and recovery tokens is implemented. Production purchases remain disabled until the remaining work and rollout checks are complete. The remaining sections describe the complete target contract unless explicitly identified as implemented.
 
 ## Fixed product decisions
 
@@ -193,7 +193,7 @@ Fulfillment uses one database transaction to:
 
 The Checkout Session email is the recovery and delivery address. It wins if it differs from the email currently stored on the Stripe Customer. The service does not silently fall back to the Customer email because fulfillment already requires the Session email.
 
-The transaction contains no Stripe, KMS, SQS, or SES call. A separate dispatcher publishes a `license_delivery` message to the same encrypted FIFO queue used by recovery email. The email consumer distinguishes the message type and deduplicates the stable delivery ID before sending through SES. Stripe remains responsible for receipts and billing emails; GlassEQ sends only the license credential and product-specific recovery messages.
+The transaction contains no Stripe, KMS, SQS, or SES call. A background dispatcher claims encrypted license and recovery outbox records, sends the credentials directly through SES, then removes the delivered record. A crash after SES acceptance but before database acknowledgement can resend the same credential. Stripe remains responsible for receipts and billing emails; GlassEQ sends only license keys and recovery tokens.
 
 Fulfillment stores the minimum Stripe identifiers needed to resolve later invoices, refunds, and disputes. It does not store card data, billing addresses, Stripe payloads, or tax details. Migration `00004_checkout_billing.sql` already adds the request ID and payment references, permits a null `stripe_checkout_session_id` while an order is reserved, and adds the license-delivery outbox.
 

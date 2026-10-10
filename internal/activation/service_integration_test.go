@@ -447,17 +447,17 @@ func seedMonthlyLicense(t *testing.T, database *sql.DB, licenseID, licenseKey st
 }
 
 func newTestService(t *testing.T, database *sql.DB, issuer entitlementIssuer) *Service {
-	return newTestServiceWithRecoveryQueue(t, database, issuer, discardRecoveryEmailQueue{})
+	return newTestServiceWithEmailSender(t, database, issuer, discardEmailSender{})
 }
 
-func newTestServiceWithRecoveryQueue(t *testing.T, database *sql.DB, issuer entitlementIssuer, queue RecoveryEmailQueue) *Service {
+func newTestServiceWithEmailSender(t *testing.T, database *sql.DB, issuer entitlementIssuer, sender EmailSender) *Service {
 	t.Helper()
 	service, err := NewService(database, issuer, Secrets{
 		IdempotencyKey:        make([]byte, 32),
 		RateLimitHMACKey:      bytesOf(1, 32),
 		EmailLookupHMACKey:    bytesOf(2, 32),
 		DatabaseEncryptionKey: bytesOf(3, 32),
-	}, queue)
+	}, sender)
 	if err != nil {
 		t.Fatalf("create activation service: %v", err)
 	}
@@ -465,9 +465,13 @@ func newTestServiceWithRecoveryQueue(t *testing.T, database *sql.DB, issuer enti
 	return service
 }
 
-type discardRecoveryEmailQueue struct{}
+type discardEmailSender struct{}
 
-func (discardRecoveryEmailQueue) SendRecoveryEmail(context.Context, RecoveryEmail) error {
+func (discardEmailSender) SendRecoveryEmail(context.Context, RecoveryEmail) error {
+	return nil
+}
+
+func (discardEmailSender) SendLicenseEmail(context.Context, LicenseEmail) error {
 	return nil
 }
 
