@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	StripeAPIVersion     = stripe.APIVersion
+	StripeAPIVersion     = "2026-07-29.preview"
 	PolicyVersion        = "v1"
 	stripeRequestTimeout = 15 * time.Second
 	stripeResponseLimit  = 1 << 20

@@ -13,6 +13,12 @@ import (
 
 const testLiveMode = false
 
+func TestPinnedStripeAPIVersionMatchesSDK(t *testing.T) {
+	if StripeAPIVersion != stripe.APIVersion {
+		t.Fatalf("webhook API version %q differs from Stripe SDK %q; update the endpoint and pin deliberately", StripeAPIVersion, stripe.APIVersion)
+	}
+}
+
 func eventBody(t testing.TB, id, eventType string) []byte {
 	t.Helper()
 	objectID, object := "cs_purchase", "checkout.session"
