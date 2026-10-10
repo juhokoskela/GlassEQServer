@@ -22,6 +22,7 @@ type CatalogSpec struct {
 type CatalogPrice struct {
 	PriceID   string
 	ProductID string
+	LinkID    string
 }
 
 type catalogPriceExpectation struct {
@@ -42,6 +43,9 @@ func (c *CheckoutClient) CheckCatalog(ctx context.Context, catalog CatalogSpec) 
 		if !validProductID(expected.configured.ProductID) {
 			return fmt.Errorf("%s Stripe Product ID must start with prod_", expected.plan)
 		}
+		if !validStripeID(expected.configured.LinkID, "plink_") {
+			return fmt.Errorf("%s Stripe Payment Link ID must start with plink_", expected.plan)
+		}
 	}
 
 	requestCtx, cancel := context.WithTimeout(ctx, stripeRequestTimeout)
@@ -56,6 +60,39 @@ func (c *CheckoutClient) CheckCatalog(ctx context.Context, catalog CatalogSpec) 
 		if err := validateCatalogPrice(price, expected, c.liveMode); err != nil {
 			return err
 		}
+		linkParams := &stripe.PaymentLinkRetrieveParams{}
+		linkParams.AddExpand("line_items.data.price.product")
+		link, err := c.links.Retrieve(requestCtx, expected.configured.LinkID, linkParams)
+		if err != nil {
+			return fmt.Errorf("retrieve %s Stripe Payment Link: %w", expected.plan, sanitizeStripeError(requestCtx, err))
+		}
+		if err := validateCatalogLink(link, expected, c.liveMode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCatalogLink(link *stripe.PaymentLink, expected catalogPriceExpectation, liveMode bool) error {
+	name := fmt.Sprintf("%s Stripe Payment Link", expected.plan)
+	if link == nil || link.ID != expected.configured.LinkID || link.Object != "payment_link" ||
+		!link.Active || link.Livemode != liveMode || link.ManagedPayments == nil || !link.ManagedPayments.Enabled {
+		return errors.New(name + " is inactive, has the wrong identity or environment, or has Managed Payments disabled")
+	}
+	if link.Currency != stripe.CurrencyEUR || link.AllowPromotionCodes ||
+		link.CustomerCreation != stripe.PaymentLinkCustomerCreationAlways ||
+		link.ConsentCollection == nil || link.ConsentCollection.TermsOfService != stripe.PaymentLinkConsentCollectionTermsOfServiceRequired ||
+		len(link.OptionalItems) != 0 {
+		return errors.New(name + " must use EUR, require terms and customer creation, and disable promo and optional items")
+	}
+	if link.LineItems == nil || link.LineItems.HasMore || len(link.LineItems.Data) != 1 {
+		return errors.New(name + " must have exactly one line item")
+	}
+	item := link.LineItems.Data[0]
+	if item == nil || item.Quantity != 1 || item.AdjustableQuantity != nil && item.AdjustableQuantity.Enabled ||
+		item.Price == nil || item.Price.ID != expected.configured.PriceID ||
+		item.Price.Product == nil || item.Price.Product.ID != expected.configured.ProductID {
+		return errors.New(name + " must sell one fixed unit of the configured Price and Product")
 	}
 	return nil
 }

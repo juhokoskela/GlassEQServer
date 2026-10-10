@@ -18,6 +18,7 @@ var ErrInvalidBillingEvent = errors.New("invalid or unsupported Stripe webhook e
 
 type purchaseRetriever interface {
 	RetrievePurchase(context.Context, string) (*stripe.CheckoutSession, error)
+	FindPurchaseBySubscription(context.Context, string) (*stripe.CheckoutSession, error)
 	RetrieveSubscription(context.Context, string) (*stripe.Subscription, error)
 	RetrieveInvoice(context.Context, string) (*stripe.Invoice, error)
 }
@@ -102,7 +103,7 @@ func decodeBillingEvent(body []byte, liveMode bool, now time.Time) (billingEvent
 	}
 	var prefix, object string
 	switch event.Type {
-	case "checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed", "checkout.session.expired":
+	case "checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed":
 		prefix, object = "cs_", "checkout.session"
 	case "invoice.paid", "invoice.payment_failed", "invoice.updated":
 		prefix, object = "in_", "invoice"
@@ -194,8 +195,6 @@ func (p *EventProcessor) Process(ctx context.Context, body []byte) error {
 				outcome = "fulfilled"
 			} else {
 				switch session.Status {
-				case stripe.CheckoutSessionStatusExpired:
-					outcome = "failed"
 				case stripe.CheckoutSessionStatusOpen, stripe.CheckoutSessionStatusComplete:
 					if event.Type == "checkout.session.async_payment_failed" {
 						outcome = "failed"
@@ -285,28 +284,17 @@ func (p *EventProcessor) ensurePaymentLinkOrder(ctx context.Context, session *st
 }
 
 func lockPurchaseOrder(ctx context.Context, tx *sql.Tx, session *stripe.CheckoutSession) (checkoutOrder, string, bool, error) {
-	rows, err := tx.QueryContext(ctx, `
+	var order checkoutOrder
+	var state string
+	err := tx.QueryRowContext(ctx, `
 		SELECT id, plan, policy_version, stripe_price_id, stripe_checkout_session_id, stripe_payment_intent_id, created_at, state
 		FROM checkout_orders WHERE stripe_checkout_session_id = $1
-		FOR UPDATE`, session.ID)
+		FOR UPDATE`, session.ID).Scan(&order.id, &order.plan, &order.policyVersion, &order.priceID, &order.sessionID, &order.paymentID, &order.createdAt, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return checkoutOrder{}, "", false, nil
+	}
 	if err != nil {
 		return checkoutOrder{}, "", false, fmt.Errorf("lock purchase order: %w", err)
 	}
-	defer rows.Close()
-	var order checkoutOrder
-	var state string
-	count := 0
-	for rows.Next() {
-		count++
-		if count > 1 {
-			return checkoutOrder{}, "", false, ErrInvalidCheckoutSession
-		}
-		if err := rows.Scan(&order.id, &order.plan, &order.policyVersion, &order.priceID, &order.sessionID, &order.paymentID, &order.createdAt, &state); err != nil {
-			return checkoutOrder{}, "", false, fmt.Errorf("read purchase order: %w", err)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return checkoutOrder{}, "", false, fmt.Errorf("read purchase orders: %w", err)
-	}
-	return order, state, count == 1, nil
+	return order, state, true, nil
 }

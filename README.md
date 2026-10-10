@@ -64,6 +64,8 @@ Before enabling billing or changing its Stripe catalog, add these variables to t
 | --- | --- |
 | `GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID` | Environment-specific perpetual Product ID |
 | `GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID` | Environment-specific monthly Product ID |
+| `GLASSEQ_STRIPE_PERPETUAL_LINK_ID` | Environment-specific perpetual Payment Link ID |
+| `GLASSEQ_STRIPE_MONTHLY_LINK_ID` | Environment-specific monthly Payment Link ID |
 
 The preflight task also needs the three Stripe API variables above. Run it with the same server image:
 
@@ -71,7 +73,7 @@ The preflight task also needs the three Stripe API variables above. Run it with 
 glasseqserver check-stripe-catalog
 ```
 
-The command retrieves both configured Prices and their Products. It returns a nonzero status unless their environment, active Products, `txcd_10202001` tax code, tax-exclusive EUR amounts, and one-time or monthly billing shapes match GlassEQ's fixed catalog. It does not validate the Payment Links.
+The command retrieves both configured Prices, Products, and Payment Links. It returns a nonzero status unless their environment, active Products and links, `txcd_10202001` tax code, tax-exclusive EUR amounts, one-time or monthly billing shapes, Managed Payments, terms consent, customer creation, fixed quantity, and promotion settings match GlassEQ's catalog. Check the public terms/privacy URLs and Checkout consent in the Dashboard and in a sandbox purchase.
 
 ### Stripe webhook
 

@@ -61,7 +61,7 @@ func (s *Service) DispatchLicenseEmail(ctx context.Context, now time.Time) (bool
 	if err != nil {
 		return false, fmt.Errorf("send license email: %w", err)
 	}
-	ackCtx, cancel := context.WithTimeout(ctx, recoveryDatabaseTimeout)
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryDatabaseTimeout)
 	defer cancel()
 	tx, err := s.database.BeginTx(ackCtx, nil)
 	if err != nil {

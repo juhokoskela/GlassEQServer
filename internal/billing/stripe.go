@@ -39,7 +39,9 @@ const (
 
 type CheckoutClient struct {
 	sessions      checkoutSessionBackend
+	sessionList   checkoutSessionListBackend
 	prices        stripePriceBackend
+	links         stripePaymentLinkBackend
 	subscriptions stripeSubscriptionBackend
 	invoices      stripeInvoiceBackend
 	liveMode      bool
@@ -49,8 +51,16 @@ type checkoutSessionBackend interface {
 	Retrieve(context.Context, string, *stripe.CheckoutSessionRetrieveParams) (*stripe.CheckoutSession, error)
 }
 
+type checkoutSessionListBackend interface {
+	List(context.Context, *stripe.CheckoutSessionListParams) *stripe.V1List[*stripe.CheckoutSession]
+}
+
 type stripePriceBackend interface {
 	Retrieve(context.Context, string, *stripe.PriceRetrieveParams) (*stripe.Price, error)
+}
+
+type stripePaymentLinkBackend interface {
+	Retrieve(context.Context, string, *stripe.PaymentLinkRetrieveParams) (*stripe.PaymentLink, error)
 }
 
 func (c *CheckoutClient) LiveMode() bool { return c.liveMode }
@@ -70,9 +80,30 @@ func NewCheckoutClient(secretKey string) (*CheckoutClient, error) {
 	})
 	client := stripe.NewClient(secretKey, stripe.WithBackends(backends))
 	return &CheckoutClient{
-		sessions: client.V1CheckoutSessions, prices: client.V1Prices,
-		subscriptions: client.V1Subscriptions, invoices: client.V1Invoices, liveMode: liveMode,
+		sessions: client.V1CheckoutSessions, sessionList: client.V1CheckoutSessions, prices: client.V1Prices,
+		subscriptions: client.V1Subscriptions, invoices: client.V1Invoices, links: client.V1PaymentLinks, liveMode: liveMode,
 	}, nil
+}
+
+func (c *CheckoutClient) FindPurchaseBySubscription(ctx context.Context, subscriptionID string) (*stripe.CheckoutSession, error) {
+	if !validStripeID(subscriptionID, "sub_") {
+		return nil, ErrInvalidCheckoutSession
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, stripeRequestTimeout)
+	defer cancel()
+	params := &stripe.CheckoutSessionListParams{Subscription: stripe.String(subscriptionID)}
+	params.Limit = stripe.Int64(2)
+	sessions := c.sessionList.List(requestCtx, params)
+	if err := sessions.Err(); err != nil {
+		return nil, sanitizeStripeError(requestCtx, err)
+	}
+	if len(sessions.Data()) > 1 || sessions.Meta().HasMore {
+		return nil, ErrInvalidCheckoutSession
+	}
+	if len(sessions.Data()) == 0 {
+		return nil, nil
+	}
+	return sessions.Data()[0], nil
 }
 
 func sanitizeStripeError(ctx context.Context, err error) error {

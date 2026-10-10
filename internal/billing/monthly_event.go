@@ -76,6 +76,34 @@ func (p *EventProcessor) processMonthlyEvent(ctx context.Context, event billingE
 	if err != nil {
 		return err
 	}
+	if !found && subscriptionID != "" {
+		purchase, err := p.checkout.FindPurchaseBySubscription(ctx, subscriptionID)
+		if err != nil {
+			return err
+		}
+		if purchase != nil {
+			if purchase.Subscription == nil || purchase.Subscription.ID != subscriptionID || purchase.Livemode != p.liveMode {
+				return ErrInvalidSubscription
+			}
+			purchase, err = p.checkout.RetrievePurchase(ctx, purchase.ID)
+			if err != nil {
+				return err
+			}
+			if purchase == nil || purchase.Subscription == nil || purchase.Subscription.ID != subscriptionID || purchase.Livemode != p.liveMode {
+				return ErrInvalidSubscription
+			}
+			owned, err := p.ensurePaymentLinkOrder(ctx, purchase, now)
+			if err != nil {
+				return err
+			}
+			if owned {
+				order, found, err = readMonthlyOrder(ctx, p.database, purchase.ID, "", "", false)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if !found {
 		return p.commitMonthlyEvent(ctx, event, monthlyOrder{}, nil, nil, nil, nil, now)
 	}

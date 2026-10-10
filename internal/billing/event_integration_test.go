@@ -187,6 +187,9 @@ type purchaseRetrieverFunc func(context.Context, string) (*stripe.CheckoutSessio
 func (f purchaseRetrieverFunc) RetrievePurchase(ctx context.Context, id string) (*stripe.CheckoutSession, error) {
 	return f(ctx, id)
 }
+func (f purchaseRetrieverFunc) FindPurchaseBySubscription(ctx context.Context, _ string) (*stripe.CheckoutSession, error) {
+	return nil, nil
+}
 
 func TestUnownedPurchaseAndEventCollisionWithPostgreSQL(t *testing.T) {
 	p, _, checkout := purchaseFixture(t)
@@ -250,6 +253,9 @@ func (c *fakePurchaseRetriever) RetrievePurchase(ctx context.Context, _ string) 
 		}
 	}
 	return c.session, c.err
+}
+func (c *fakePurchaseRetriever) FindPurchaseBySubscription(ctx context.Context, _ string) (*stripe.CheckoutSession, error) {
+	return nil, nil
 }
 
 type failingPurchaseIssuer struct{ service *activation.Service }

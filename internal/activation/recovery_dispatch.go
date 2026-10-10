@@ -205,7 +205,7 @@ func (s *Service) dispatchRecoveryEmail(ctx context.Context, now time.Time) (boo
 	if err != nil {
 		return false, fmt.Errorf("send recovery email: %w", err)
 	}
-	ackCtx, cancel := context.WithTimeout(ctx, recoveryDatabaseTimeout)
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryDatabaseTimeout)
 	result, err := s.database.ExecContext(ackCtx, `
 		DELETE FROM recovery_email_outbox
 		WHERE id = $1`, deliveryID)

@@ -21,6 +21,7 @@ type monthlyRetriever struct {
 	invoices           map[string]*stripe.Invoice
 	database           *sql.DB
 	beforeSubscription func(context.Context) error
+	findPurchase       bool
 }
 
 func (f *monthlyRetriever) RetrievePurchase(ctx context.Context, _ string) (*stripe.CheckoutSession, error) {
@@ -28,6 +29,12 @@ func (f *monthlyRetriever) RetrievePurchase(ctx context.Context, _ string) (*str
 		return nil, err
 	}
 	return f.session, nil
+}
+func (f *monthlyRetriever) FindPurchaseBySubscription(ctx context.Context, _ string) (*stripe.CheckoutSession, error) {
+	if !f.findPurchase {
+		return nil, nil
+	}
+	return f.RetrievePurchase(ctx, f.session.ID)
 }
 func (f *monthlyRetriever) RetrieveSubscription(ctx context.Context, _ string) (*stripe.Subscription, error) {
 	if err := f.database.PingContext(ctx); err != nil {
@@ -185,6 +192,36 @@ func TestMonthlyInitialPaymentAndAttachmentRaceWithPostgreSQL(t *testing.T) {
 	checkout.subscription.Status = stripe.SubscriptionStatusActive
 	monthlyEvent(t, p, "evt_paid", "checkout.session.async_payment_succeeded", "")
 	assertFulfillmentCounts(t, p.database, 1, 3)
+}
+
+func TestMonthlySubscriptionEventFindsPaymentLinkBeforeOrderExistsWithPostgreSQL(t *testing.T) {
+	p, _, checkout := monthlyFixture(t)
+	checkout.findPurchase = true
+	checkout.subscription.Status = stripe.SubscriptionStatusCanceled
+	checkout.subscription.CancellationDetails = &stripe.SubscriptionCancellationDetails{Reason: stripe.SubscriptionCancellationDetailsReasonCancellationRequested}
+	monthlyEvent(t, p, "evt_canceled_first", "customer.subscription.deleted", "")
+	assertFulfillmentCounts(t, p.database, 0, 1)
+	var state, outcome string
+	if err := p.database.QueryRow(`SELECT state FROM checkout_orders WHERE id = 'cs_purchase'`).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.database.QueryRow(`SELECT outcome FROM stripe_events WHERE stripe_event_id = 'evt_canceled_first'`).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed" || outcome != "failed" {
+		t.Fatalf("early cancellation: order=%s event=%s", state, outcome)
+	}
+	monthlyEvent(t, p, "evt_checkout_later", "checkout.session.completed", "")
+	assertFulfillmentCounts(t, p.database, 0, 2)
+}
+
+func TestMonthlyInvoiceEventFindsPaymentLinkBeforeOrderExistsWithPostgreSQL(t *testing.T) {
+	p, _, checkout := monthlyFixture(t)
+	checkout.findPurchase = true
+	monthlyEvent(t, p, "evt_paid_first", "invoice.paid", "in_initial")
+	assertFulfillmentCounts(t, p.database, 1, 1)
+	monthlyEvent(t, p, "evt_checkout_later", "checkout.session.completed", "")
+	assertFulfillmentCounts(t, p.database, 1, 2)
 }
 
 func TestMonthlyAsyncPaymentFailureWithPostgreSQL(t *testing.T) {

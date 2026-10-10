@@ -17,11 +17,11 @@ The webhook accepts these snapshot event types:
 | Event | Use |
 | --- | --- |
 | `checkout.session.completed`, `checkout.session.async_payment_succeeded` | Establish a Payment Link purchase and fulfill when current Stripe state proves payment |
-| `checkout.session.async_payment_failed`, `checkout.session.expired` | Record an unpaid purchase failure without revoking a later successful payment |
-| `invoice.paid`, `invoice.payment_failed`, `invoice.updated` | Reconcile a known monthly subscription against current Stripe state |
-| `customer.subscription.updated`, `customer.subscription.deleted` | Reconcile a known monthly subscription, cancellation, or retry exhaustion |
+| `checkout.session.async_payment_failed` | Record an unpaid purchase failure without revoking a later successful payment |
+| `invoice.paid`, `invoice.payment_failed`, `invoice.updated` | Reconcile a monthly subscription against current Stripe state |
+| `customer.subscription.updated`, `customer.subscription.deleted` | Reconcile a monthly subscription, cancellation, or retry exhaustion |
 
-Events are notifications, not authoritative snapshots. The processor retrieves the current Checkout Session and, for monthly events, its Subscription and relevant Invoices. It accepts a Checkout Session only when its `payment_link`, mode, single line item, quantity, configured Price and Product, and Managed Payments state match the selected plan. A Payment Link purchase has no server-created order or caller-supplied metadata. The first accepted Session event inserts a local purchase row keyed by the Stripe Session ID. An unrelated Payment Link or API-created Checkout Session is ignored.
+Events are notifications, not authoritative snapshots. The processor retrieves the current Checkout Session and, for monthly events, its Subscription and relevant Invoices. It accepts a Checkout Session only when its `payment_link`, mode, single line item, quantity, configured Price and Product, and Managed Payments state match the selected plan. A Payment Link purchase has no server-created order or caller-supplied metadata. The first accepted paid or payment-failed Session event inserts a local purchase row keyed by the Stripe Session ID. Subscription and Invoice events can also find that Session through its Subscription ID before the order is bound locally. An unrelated Payment Link or API-created Checkout Session is ignored. Expired visits are not stored.
 
 For a paid perpetual purchase, the Session must be complete, contain an accepted terms consent and purchase email, identify a Customer, and have a succeeded PaymentIntent with a paid, undisputed, unrefunded Charge. For a paid monthly purchase, the Session must identify a Customer and Subscription, and the initial Invoice must be paid. Subscription and Invoice line items must match the fixed monthly Price, Product, quantity, and Subscription item. A payment can be delayed; an unpaid Session does not issue a license.
 
@@ -29,7 +29,7 @@ Fulfillment happens in one PostgreSQL transaction. It records the event outcome,
 
 The purchase email from `customer_details.email` is the license-delivery and recovery address. The service does not silently substitute the Stripe Customer email. It stores the address encrypted and an HMAC for recovery lookup. The license key and recovery token are encrypted while waiting for SES delivery. The service sends only these two product emails; Stripe sends receipts and billing email. SES acceptance removes the outbox row, and successful license delivery also clears the encrypted key copy. A crash after SES accepts an email but before the database acknowledgement can send the same credential twice. Expired delivery copies are removed in bounded cleanup batches.
 
-An Invoice or Subscription event that arrives before its Session is recorded as unowned. When the Session event arrives, the processor retrieves current state and can fulfill the purchase or apply cancellation. This still depends on receiving the Session event; daily reconciliation is required before production rollout to repair events missed beyond Stripe's retry window.
+When an Invoice or Subscription event arrives before the Session is stored locally, the processor looks up the Session by Subscription ID and checks its Payment Link before creating an order. Daily reconciliation is still required before production rollout to repair events missed beyond Stripe's retry window.
 
 ## Monthly entitlement projection
 
@@ -55,7 +55,7 @@ The service also needs a bounded daily reconciliation of monthly subscriptions, 
 
 Before switching production links on:
 
-1. Verify Managed Payments terms, public terms/privacy links, tax code, Price/Product IDs, Payment Link settings, and the pinned webhook API version in the production Stripe account. Run `glasseqserver check-stripe-catalog`; it checks Prices and Products but does not inspect Payment Links.
+1. Verify Managed Payments terms, public terms/privacy links, tax code, Price/Product IDs, Payment Link settings, and the pinned webhook API version in the production Stripe account. Run `glasseqserver check-stripe-catalog`; it checks both Prices, Products, and Payment Links against the fixed catalog. Confirm the public terms/privacy links and Checkout consent in the Dashboard and in a sandbox purchase.
 2. Verify the SES domain identity and production sending access in `eu-north-1`. Give the ECS task role only the required `ses:SendEmail` permission for the verified sender, plus its existing KMS permissions.
 3. Deploy the public webhook through the Application Load Balancer with TLS. Store the Stripe API key, webhook signing secret, encryption keys, and HMAC keys in the secret manager. Do not log Stripe payloads, email addresses, license keys, or recovery tokens.
 4. Verify sandbox and production separately: one-time and monthly purchases, delayed payment, renewal failure and recovery, cancellation, refund, dispute, duplicate and out-of-order events, SES delivery, and recovery-token exchange. Confirm that retries after database or SES failure neither lose a purchase nor issue a second license.
