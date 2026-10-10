@@ -28,13 +28,12 @@ func (c *CheckoutClient) RetrievePurchase(ctx context.Context, sessionID string)
 	return session, nil
 }
 
-func validatePerpetualPurchase(session *stripe.CheckoutSession, order checkoutOrder, productID string) error {
+func validatePerpetualPurchase(session *stripe.CheckoutSession, order checkoutOrder, productID, linkID string) error {
 	if order.plan != PlanPerpetualV1 {
 		return ErrUnsupportedPurchase
 	}
-	if session.Mode != stripe.CheckoutSessionModePayment || session.ClientReferenceID != order.id ||
-		session.Metadata["order_id"] != order.id || session.Metadata["plan"] != string(order.plan) ||
-		session.Metadata["policy_version"] != order.policyVersion ||
+	if session.Mode != stripe.CheckoutSessionModePayment || session.PaymentLink == nil ||
+		session.PaymentLink.ID != linkID ||
 		(order.sessionID.Valid && order.sessionID.String != session.ID) ||
 		session.ManagedPayments == nil || !session.ManagedPayments.Enabled {
 		return ErrInvalidCheckoutSession
@@ -67,8 +66,7 @@ func validatePerpetualPurchase(session *stripe.CheckoutSession, order checkoutOr
 	}
 	intent := session.PaymentIntent
 	if !validStripeID(intent.ID, "pi_") || intent.Object != "payment_intent" || intent.Livemode != session.Livemode ||
-		intent.Status != stripe.PaymentIntentStatusSucceeded || intent.Metadata["order_id"] != order.id ||
-		intent.Metadata["plan"] != string(order.plan) || intent.Metadata["policy_version"] != order.policyVersion ||
+		intent.Status != stripe.PaymentIntentStatusSucceeded ||
 		intent.LatestCharge == nil || !intent.LatestCharge.Paid || intent.LatestCharge.Refunded || intent.LatestCharge.Disputed {
 		return ErrInvalidCheckoutSession
 	}

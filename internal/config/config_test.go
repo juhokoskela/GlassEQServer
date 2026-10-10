@@ -46,6 +46,16 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidEmailSender(t *testing.T) {
+	values := validValues()
+	for _, sender := range []string{"", "GlassEQ <licenses@glasseq.app>", "not-an-address"} {
+		values["GLASSEQ_EMAIL_FROM"] = sender
+		if _, err := load(mapLookup(values)); err == nil {
+			t.Errorf("accepted email sender %q", sender)
+		}
+	}
+}
+
 func TestLoadStripeConfiguration(t *testing.T) {
 	values := validValues()
 	values["GLASSEQ_STRIPE_SECRET_KEY"] = "sk_test_secret"
@@ -73,6 +83,8 @@ func TestLoadStripeCatalog(t *testing.T) {
 		"GLASSEQ_STRIPE_MONTHLY_PRICE_ID":     "price_monthly",
 		"GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID": "prod_perpetual",
 		"GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID":   "prod_monthly",
+		"GLASSEQ_STRIPE_PERPETUAL_LINK_ID":    "plink_perpetual",
+		"GLASSEQ_STRIPE_MONTHLY_LINK_ID":      "plink_monthly",
 	}
 
 	got, err := loadStripeCatalog(mapLookup(values))
@@ -83,7 +95,9 @@ func TestLoadStripeCatalog(t *testing.T) {
 		got.PerpetualPriceID != values["GLASSEQ_STRIPE_PERPETUAL_PRICE_ID"] ||
 		got.MonthlyPriceID != values["GLASSEQ_STRIPE_MONTHLY_PRICE_ID"] ||
 		got.PerpetualProductID != values["GLASSEQ_STRIPE_PERPETUAL_PRODUCT_ID"] ||
-		got.MonthlyProductID != values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] {
+		got.MonthlyProductID != values["GLASSEQ_STRIPE_MONTHLY_PRODUCT_ID"] ||
+		got.PerpetualLinkID != values["GLASSEQ_STRIPE_PERPETUAL_LINK_ID"] ||
+		got.MonthlyLinkID != values["GLASSEQ_STRIPE_MONTHLY_LINK_ID"] {
 		t.Errorf("Stripe catalog configuration = %+v", got)
 	}
 }

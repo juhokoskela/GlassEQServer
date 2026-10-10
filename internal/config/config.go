@@ -38,6 +38,8 @@ type StripeCatalogConfig struct {
 	StripeConfig
 	PerpetualProductID string
 	MonthlyProductID   string
+	PerpetualLinkID    string
+	MonthlyLinkID      string
 }
 
 func Load() (Config, error) {
@@ -166,10 +168,20 @@ func loadStripeCatalog(lookup func(string) (string, bool)) (StripeCatalogConfig,
 	if err != nil {
 		return StripeCatalogConfig{}, err
 	}
+	perpetualLinkID, err := stripeID(lookup, "GLASSEQ_STRIPE_PERPETUAL_LINK_ID", "plink_")
+	if err != nil {
+		return StripeCatalogConfig{}, err
+	}
+	monthlyLinkID, err := stripeID(lookup, "GLASSEQ_STRIPE_MONTHLY_LINK_ID", "plink_")
+	if err != nil {
+		return StripeCatalogConfig{}, err
+	}
 	return StripeCatalogConfig{
 		StripeConfig:       stripeConfig,
 		PerpetualProductID: perpetualProductID,
 		MonthlyProductID:   monthlyProductID,
+		PerpetualLinkID:    perpetualLinkID,
+		MonthlyLinkID:      monthlyLinkID,
 	}, nil
 }
 

@@ -22,10 +22,12 @@ func checkStripeCatalog(ctx context.Context, logger *slog.Logger) error {
 		Perpetual: billing.CatalogPrice{
 			PriceID:   settings.PerpetualPriceID,
 			ProductID: settings.PerpetualProductID,
+			LinkID:    settings.PerpetualLinkID,
 		},
 		Monthly: billing.CatalogPrice{
 			PriceID:   settings.MonthlyPriceID,
 			ProductID: settings.MonthlyProductID,
+			LinkID:    settings.MonthlyLinkID,
 		},
 	}
 	if err := client.CheckCatalog(ctx, catalog); err != nil {

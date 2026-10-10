@@ -17,7 +17,11 @@ func TestCheckoutClientChecksCatalog(t *testing.T) {
 		catalog.Perpetual.PriceID: testCatalogPrice(catalog.Perpetual, 2_999, false),
 		catalog.Monthly.PriceID:   testCatalogPrice(catalog.Monthly, 299, true),
 	}}
-	client := &CheckoutClient{prices: prices}
+	links := &fakeStripeLinks{responses: map[string]*stripe.PaymentLink{
+		catalog.Perpetual.LinkID: testCatalogLink(catalog.Perpetual),
+		catalog.Monthly.LinkID:   testCatalogLink(catalog.Monthly),
+	}}
+	client := &CheckoutClient{prices: prices, links: links}
 
 	if err := client.CheckCatalog(context.Background(), catalog); err != nil {
 		t.Fatalf("check catalog: %v", err)
@@ -33,6 +37,9 @@ func TestCheckoutClientChecksCatalog(t *testing.T) {
 	if !prices.hasDeadline {
 		t.Error("Stripe catalog requests have no deadline")
 	}
+	if !slices.Equal(links.ids, []string{catalog.Perpetual.LinkID, catalog.Monthly.LinkID}) {
+		t.Errorf("retrieved Payment Link IDs = %v", links.ids)
+	}
 }
 
 func TestCheckoutClientRejectsInvalidCatalogBeforeStripe(t *testing.T) {
@@ -44,6 +51,7 @@ func TestCheckoutClientRejectsInvalidCatalogBeforeStripe(t *testing.T) {
 		{name: "perpetual Product", mutate: func(catalog *CatalogSpec) { catalog.Perpetual.ProductID = "invalid" }},
 		{name: "monthly Price", mutate: func(catalog *CatalogSpec) { catalog.Monthly.PriceID = "invalid" }},
 		{name: "monthly Product", mutate: func(catalog *CatalogSpec) { catalog.Monthly.ProductID = "invalid" }},
+		{name: "monthly Payment Link", mutate: func(catalog *CatalogSpec) { catalog.Monthly.LinkID = "invalid" }},
 	}
 
 	for _, test := range tests {
@@ -123,6 +131,38 @@ func TestCatalogPriceValidationAcceptsPerpetualPrice(t *testing.T) {
 	}
 }
 
+func TestCatalogLinkValidation(t *testing.T) {
+	configured := testCatalogSpec().Perpetual
+	expected := catalogPriceExpectation{plan: PlanPerpetualV1, configured: configured}
+	if err := validateCatalogLink(testCatalogLink(configured), expected, false); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*stripe.PaymentLink){
+		"inactive":          func(link *stripe.PaymentLink) { link.Active = false },
+		"wrong environment": func(link *stripe.PaymentLink) { link.Livemode = true },
+		"not managed":       func(link *stripe.PaymentLink) { link.ManagedPayments.Enabled = false },
+		"wrong currency":    func(link *stripe.PaymentLink) { link.Currency = stripe.CurrencyUSD },
+		"promotion codes":   func(link *stripe.PaymentLink) { link.AllowPromotionCodes = true },
+		"no customer":       func(link *stripe.PaymentLink) { link.CustomerCreation = stripe.PaymentLinkCustomerCreationIfRequired },
+		"no terms consent":  func(link *stripe.PaymentLink) { link.ConsentCollection = nil },
+		"optional item":     func(link *stripe.PaymentLink) { link.OptionalItems = []*stripe.PaymentLinkOptionalItem{{}} },
+		"adjustable quantity": func(link *stripe.PaymentLink) {
+			link.LineItems.Data[0].AdjustableQuantity = &stripe.LineItemAdjustableQuantity{Enabled: true}
+		},
+		"wrong quantity": func(link *stripe.PaymentLink) { link.LineItems.Data[0].Quantity = 2 },
+		"wrong price":    func(link *stripe.PaymentLink) { link.LineItems.Data[0].Price.ID = "price_other" },
+		"extra item":     func(link *stripe.PaymentLink) { link.LineItems.Data = append(link.LineItems.Data, &stripe.LineItem{}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			link := testCatalogLink(configured)
+			mutate(link)
+			if err := validateCatalogLink(link, expected, false); err == nil {
+				t.Fatal("drifted link was accepted")
+			}
+		})
+	}
+}
+
 func TestCheckoutClientSanitizesCatalogStripeError(t *testing.T) {
 	prices := &fakeStripePrices{err: &stripe.Error{
 		HTTPStatusCode: http.StatusForbidden,
@@ -147,8 +187,20 @@ func TestCheckoutClientSanitizesCatalogStripeError(t *testing.T) {
 
 func testCatalogSpec() CatalogSpec {
 	return CatalogSpec{
-		Perpetual: CatalogPrice{PriceID: "price_perpetual", ProductID: "prod_perpetual"},
-		Monthly:   CatalogPrice{PriceID: "price_monthly", ProductID: "prod_monthly"},
+		Perpetual: CatalogPrice{PriceID: "price_perpetual", ProductID: "prod_perpetual", LinkID: "plink_perpetual"},
+		Monthly:   CatalogPrice{PriceID: "price_monthly", ProductID: "prod_monthly", LinkID: "plink_monthly"},
+	}
+}
+
+func testCatalogLink(configured CatalogPrice) *stripe.PaymentLink {
+	return &stripe.PaymentLink{
+		ID: configured.LinkID, Object: "payment_link", Active: true, Currency: stripe.CurrencyEUR,
+		CustomerCreation:  stripe.PaymentLinkCustomerCreationAlways,
+		ConsentCollection: &stripe.PaymentLinkConsentCollection{TermsOfService: stripe.PaymentLinkConsentCollectionTermsOfServiceRequired},
+		ManagedPayments:   &stripe.PaymentLinkManagedPayments{Enabled: true},
+		LineItems: &stripe.LineItemList{Data: []*stripe.LineItem{{Quantity: 1, Price: &stripe.Price{
+			ID: configured.PriceID, Product: &stripe.Product{ID: configured.ProductID},
+		}}}},
 	}
 }
 
@@ -186,6 +238,16 @@ type fakeStripePrices struct {
 	ids         []string
 	params      []*stripe.PriceRetrieveParams
 	hasDeadline bool
+}
+
+type fakeStripeLinks struct {
+	responses map[string]*stripe.PaymentLink
+	ids       []string
+}
+
+func (f *fakeStripeLinks) Retrieve(_ context.Context, id string, _ *stripe.PaymentLinkRetrieveParams) (*stripe.PaymentLink, error) {
+	f.ids = append(f.ids, id)
+	return f.responses[id], nil
 }
 
 func (f *fakeStripePrices) Retrieve(ctx context.Context, id string, params *stripe.PriceRetrieveParams) (*stripe.Price, error) {
